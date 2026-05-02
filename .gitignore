@@ -1,0 +1,42 @@
+# Build output
+x64/
+Debug/
+Release/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.log
+*.tlog/
+*.exe
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.opendb
+*.db
+ipch/
+*.aps
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Temp
+*.tmp
+*.bak
+
+# ImGui runtime layout
+imgui.ini
+
+# Vendored deps fetched by setup.ps1
+thirdparty/imgui/
+
+# Track Dokan vendored libs (override *.lib)
+!thirdparty/dokan/lib/**
