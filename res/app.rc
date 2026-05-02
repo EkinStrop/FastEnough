@@ -1,0 +1,7 @@
+// App icon resource
+#define IDI_APPICON 101
+IDI_APPICON ICON "app.ico"
+
+// Embedded AFM server binary (Android ARM64)
+#define IDR_AFM_SERVER 200
+IDR_AFM_SERVER RCDATA "..\\server\\afm-server"
