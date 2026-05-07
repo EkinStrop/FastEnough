@@ -731,31 +731,28 @@ void DeviceClient::stopServer() {
     m_serial.clear();
 }
 
-bool DeviceClient::connectTcp(const std::string& host, int port, const std::string& bindLocalIp) {
-    LOG_DEBUG("TCP", "Connecting to " + host + ":" + std::to_string(port) + "...");
+uintptr_t DeviceClient::openServerSocket(const std::string& host, int port,
+                                         const std::string& bindLocalIp) {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) { LOG_ERROR("TCP", "socket() failed: WSA " + std::to_string(WSAGetLastError())); return false; }
-
-    // Socket buffers — match chunk size for smooth flow
-    int bufsize = 4 * 1024 * 1024; // 4MB = one full chunk
+    if (sock == INVALID_SOCKET) {
+        LOG_ERROR("TCP", "socket() failed: WSA " + std::to_string(WSAGetLastError()));
+        return (uintptr_t)INVALID_SOCKET;
+    }
+    int bufsize = 4 * 1024 * 1024;
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
-    // TCP_NODELAY — prevents Nagle's algorithm from holding data, reduces burst pattern
     BOOL nodelay = TRUE;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
 
-    // Bind to specific local NIC if requested (for multi-NIC parallel transfers)
     if (!bindLocalIp.empty()) {
         sockaddr_in bindAddr{};
         bindAddr.sin_family = AF_INET;
-        bindAddr.sin_port = 0;  // OS picks ephemeral port
+        bindAddr.sin_port = 0;
         inet_pton(AF_INET, bindLocalIp.c_str(), &bindAddr.sin_addr);
         if (bind(sock, (sockaddr*)&bindAddr, sizeof(bindAddr)) != 0) {
-            LOG_WARN("TCP", "bind() to " + bindLocalIp + " failed: WSA " + std::to_string(WSAGetLastError()));
             closesocket(sock);
-            return false;
+            return (uintptr_t)INVALID_SOCKET;
         }
-        LOG_INFO("TCP", "Bound to local NIC: " + bindLocalIp);
     }
 
     sockaddr_in addr{};
@@ -763,65 +760,151 @@ bool DeviceClient::connectTcp(const std::string& host, int port, const std::stri
     addr.sin_port = htons((u_short)port);
     inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
 
-    // Non-blocking connect with select() for proper 2s timeout on Windows
     u_long nonBlocking = 1;
     ioctlsocket(sock, FIONBIO, &nonBlocking);
-
     int ret = connect(sock, (sockaddr*)&addr, sizeof(addr));
     if (ret != 0) {
         int err = WSAGetLastError();
-        if (err != WSAEWOULDBLOCK) {
-            LOG_WARN("TCP", "connect() immediate fail: WSA " + std::to_string(err));
-            closesocket(sock);
-            return false;
-        }
-        // Wait for connect to complete (5 second timeout — rndis interfaces need time)
+        if (err != WSAEWOULDBLOCK) { closesocket(sock); return (uintptr_t)INVALID_SOCKET; }
         fd_set writeSet, exceptSet;
         FD_ZERO(&writeSet); FD_SET(sock, &writeSet);
         FD_ZERO(&exceptSet); FD_SET(sock, &exceptSet);
-        timeval tv = { 5, 0 }; // 5 seconds
+        timeval tv = { 5, 0 };
         int selRet = select(0, nullptr, &writeSet, &exceptSet, &tv);
         if (selRet <= 0 || FD_ISSET(sock, &exceptSet)) {
-            int selErr = WSAGetLastError();
-            LOG_WARN("TCP", "select() failed or exception: selRet=" + std::to_string(selRet) +
-                     " except=" + std::to_string(FD_ISSET(sock, &exceptSet)) + " WSA " + std::to_string(selErr));
-            closesocket(sock);
-            return false;
+            closesocket(sock); return (uintptr_t)INVALID_SOCKET;
         }
-        // Check for connect error
         int sockErr = 0; int optLen = sizeof(sockErr);
         getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&sockErr, &optLen);
-        if (sockErr != 0) {
-            LOG_WARN("TCP", "SO_ERROR after connect: " + std::to_string(sockErr));
-            closesocket(sock);
-            return false;
-        }
+        if (sockErr != 0) { closesocket(sock); return (uintptr_t)INVALID_SOCKET; }
     }
-
-    LOG_INFO("TCP", "Connected to " + host + ":" + std::to_string(port));
-    m_connected = true; // mark connected so sendAll/recvAll work
-
-    // Switch back to blocking mode
     u_long blocking = 0;
     ioctlsocket(sock, FIONBIO, &blocking);
 
-    // I/O timeouts - critical for detecting cable disconnects
-    DWORD sndTimeout = 30000; // 30s - generous for large chunk sends
-    DWORD rcvTimeout = 10000; // 10s - if no data for 10s, connection is dead
+    DWORD sndTimeout = 30000;
+    DWORD rcvTimeout = 10000;
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTimeout, sizeof(sndTimeout));
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTimeout, sizeof(rcvTimeout));
 
-    // TCP keepalive - detect dead connections within seconds
     BOOL keepAlive = TRUE;
     setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepAlive, sizeof(keepAlive));
-    // Set keepalive interval: probe after 5s idle, retry every 1s, 3 retries = dead in 8s
     DWORD keepIdle = 5000, keepInterval = 1000, keepCount = 3;
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, (const char*)&keepIdle, sizeof(keepIdle));
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, (const char*)&keepInterval, sizeof(keepInterval));
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, (const char*)&keepCount, sizeof(keepCount));
 
-    m_socket = (uintptr_t)sock;
+    return (uintptr_t)sock;
+}
+
+bool DeviceClient::connectTcp(const std::string& host, int port, const std::string& bindLocalIp) {
+    LOG_DEBUG("TCP", "Connecting to " + host + ":" + std::to_string(port) + "...");
+    uintptr_t sockU = openServerSocket(host, port, bindLocalIp);
+    if (sockU == (uintptr_t)INVALID_SOCKET) {
+        LOG_WARN("TCP", "openServerSocket failed for " + host + ":" + std::to_string(port));
+        return false;
+    }
+    LOG_INFO("TCP", "Connected to " + host + ":" + std::to_string(port));
+    m_connected = true;
+    m_socket = sockU;
+    m_lastConnectHost = host;
+    m_lastConnectPort = port;
+    m_lastConnectBindIp = bindLocalIp;
     return true;
+}
+
+// Static send/recv helpers operating on an arbitrary socket.
+bool DeviceClient::sendAllOn(uintptr_t sockU, const void* data, size_t len) {
+    SOCKET sock = (SOCKET)sockU;
+    if (sock == INVALID_SOCKET) return false;
+    const char* p = (const char*)data;
+    while (len > 0) {
+        int n = send(sock, p, (int)std::min(len, (size_t)INT_MAX), 0);
+        if (n <= 0) return false;
+        p += n; len -= n;
+    }
+    return true;
+}
+bool DeviceClient::recvAllOn(uintptr_t sockU, void* data, size_t len) {
+    SOCKET sock = (SOCKET)sockU;
+    if (sock == INVALID_SOCKET) return false;
+    char* p = (char*)data;
+    while (len > 0) {
+        int n = recv(sock, p, (int)std::min(len, (size_t)INT_MAX), 0);
+        if (n <= 0) return false;
+        p += n; len -= n;
+    }
+    return true;
+}
+bool DeviceClient::sendMsgOn(uintptr_t sock, uint32_t cmd, const void* payload, uint32_t len) {
+    MsgHeader hdr = { cmd, len };
+    if (!sendAllOn(sock, &hdr, sizeof(hdr))) return false;
+    if (len > 0 && !sendAllOn(sock, payload, len)) return false;
+    return true;
+}
+bool DeviceClient::recvMsgOn(uintptr_t sock, MsgHeader& hdr, std::vector<char>& payload) {
+    if (!recvAllOn(sock, &hdr, sizeof(hdr))) return false;
+    const uint32_t maxPayload = AFM_CHUNK_SIZE + 65536;
+    if (hdr.length > maxPayload) return false;
+    payload.resize(hdr.length);
+    if (hdr.length > 0 && !recvAllOn(sock, payload.data(), hdr.length)) return false;
+    return true;
+}
+
+bool DeviceClient::ensureControlChannelLocked() {
+    if (m_ctlConnected && m_ctlSocket != (uintptr_t)INVALID_SOCKET) return true;
+    if (!m_connected || m_lastConnectHost.empty()) return false;
+    uintptr_t sockU = openServerSocket(m_lastConnectHost, m_lastConnectPort, m_lastConnectBindIp);
+    if (sockU == (uintptr_t)INVALID_SOCKET) return false;
+    m_ctlSocket = sockU;
+    m_ctlConnected = true;
+    LOG_INFO("TCP", "Control channel connected");
+    return true;
+}
+
+void DeviceClient::closeControlChannelLocked() {
+    if (m_ctlSocket != (uintptr_t)INVALID_SOCKET) {
+        closesocket((SOCKET)m_ctlSocket);
+        m_ctlSocket = (uintptr_t)INVALID_SOCKET;
+    }
+    m_ctlConnected = false;
+}
+
+bool DeviceClient::runSmallOp(uint32_t cmd, const void* payload, uint32_t plen,
+                              MsgHeader& outHdr, std::vector<char>& outPayload,
+                              uint32_t recvTimeoutMs) {
+    // Try control channel first.
+    {
+        std::lock_guard<std::mutex> lk(m_ctlMutex);
+        if (ensureControlChannelLocked()) {
+            SOCKET sock = (SOCKET)m_ctlSocket;
+            DWORD origTimeout = 10000;
+            if (recvTimeoutMs) {
+                DWORD t = recvTimeoutMs;
+                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof(t));
+            }
+            bool ok = sendMsgOn(m_ctlSocket, cmd, payload, plen) &&
+                      recvMsgOn(m_ctlSocket, outHdr, outPayload);
+            if (recvTimeoutMs) {
+                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+            }
+            if (ok) return true;
+            // Channel died — close it; we'll fall back to primary.
+            closeControlChannelLocked();
+        }
+    }
+    // Fall back to primary channel.
+    std::lock_guard<std::mutex> lk(m_mutex);
+    SOCKET sock = (SOCKET)m_socket;
+    DWORD origTimeout = 10000;
+    if (recvTimeoutMs) {
+        DWORD t = recvTimeoutMs;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof(t));
+    }
+    bool ok = sendMsg(cmd, payload, plen) && recvMsg(outHdr, outPayload);
+    if (recvTimeoutMs) {
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+    }
+    return ok;
 }
 
 void DeviceClient::flushStaleData() {
@@ -870,6 +953,10 @@ void DeviceClient::disconnectTcp() {
     }
     m_connected = false;
     m_directConnection = false;
+    {
+        std::lock_guard<std::mutex> lk(m_ctlMutex);
+        closeControlChannelLocked();
+    }
 }
 
 bool DeviceClient::sendAll(const void* data, size_t len) {
@@ -931,10 +1018,8 @@ bool DeviceClient::recvMsg(MsgHeader& hdr, std::vector<char>& payload) {
 
 std::string DeviceClient::detectStoragePath() {
     if (!m_connected) return "/storage/emulated/0";
-    std::lock_guard<std::mutex> lk(m_mutex);
-    if (!sendMsg(CMD_STORAGE)) return "/storage/emulated/0";
     MsgHeader hdr; std::vector<char> payload;
-    if (!recvMsg(hdr, payload)) return "/storage/emulated/0";
+    if (!runSmallOp(CMD_STORAGE, nullptr, 0, hdr, payload)) return "/storage/emulated/0";
     if (hdr.cmd == RSP_OK && !payload.empty())
         return std::string(payload.data(), payload.size());
     return "/storage/emulated/0";
@@ -943,12 +1028,9 @@ std::string DeviceClient::detectStoragePath() {
 std::vector<DeviceFileEntry> DeviceClient::listDirectory(const std::string& path) {
     std::vector<DeviceFileEntry> entries;
     if (!m_connected) return entries;
-    std::lock_guard<std::mutex> lk(m_mutex);
-
-    if (!sendMsg(CMD_LIST, path.data(), (uint32_t)path.size())) return entries;
 
     MsgHeader hdr; std::vector<char> payload;
-    if (!recvMsg(hdr, payload)) return entries;
+    if (!runSmallOp(CMD_LIST, path.data(), (uint32_t)path.size(), hdr, payload)) return entries;
     if (hdr.cmd == RSP_ERROR) {
         m_lastError = std::string(payload.data(), payload.size());
         return entries;
@@ -987,30 +1069,13 @@ std::vector<DeviceFileEntry> DeviceClient::listDirectory(const std::string& path
 std::vector<DeviceFileEntry> DeviceClient::listMcraw(const std::string& mcrawPath) {
     std::vector<DeviceFileEntry> entries;
     if (!m_connected) return entries;
-    std::lock_guard<std::mutex> lk(m_mutex);
-
-    // Use a longer recv timeout — server needs to open the MCRAW decoder
-    SOCKET sock = (SOCKET)m_socket;
-    DWORD longTimeout = 30000; // 30s for MCRAW decoder init
-    DWORD origTimeout = 10000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&longTimeout, sizeof(longTimeout));
-
-    if (!sendMsg(CMD_MCRAW_LIST, mcrawPath.data(), (uint32_t)mcrawPath.size())) {
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
-        return entries;
-    }
 
     MsgHeader hdr; std::vector<char> payload;
-    if (!recvMsg(hdr, payload)) {
-        // Recv failed — disconnect to prevent TCP stream desync
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
-        LOG_ERROR("MCRAW", "listMcraw recv failed, disconnecting to prevent desync");
-        m_connected = false;
-        closesocket(sock);
-        m_socket = INVALID_SOCKET;
+    if (!runSmallOp(CMD_MCRAW_LIST, mcrawPath.data(), (uint32_t)mcrawPath.size(),
+                    hdr, payload, 30000)) {
+        LOG_ERROR("MCRAW", "listMcraw failed");
         return entries;
     }
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
     if (hdr.cmd == RSP_ERROR) {
         m_lastError = std::string(payload.data(), payload.size());
         return entries;
@@ -1546,18 +1611,13 @@ bool DeviceClient::relayFile(DeviceClient& src, DeviceClient& dst,
 
 bool DeviceClient::getDiskSpace(uint64_t& totalBytes, uint64_t& freeBytes) {
     if (!m_connected) { m_lastError = "Not connected"; return false; }
-    std::lock_guard<std::mutex> lk(m_mutex);
-
-    if (!sendMsg(CMD_DISK_SPACE)) return false;
-
     MsgHeader hdr; std::vector<char> payload;
-    if (!recvMsg(hdr, payload)) return false;
+    if (!runSmallOp(CMD_DISK_SPACE, nullptr, 0, hdr, payload)) return false;
     if (hdr.cmd == RSP_ERROR) {
         m_lastError = std::string(payload.data(), payload.size());
         return false;
     }
     if (hdr.cmd != RSP_OK || payload.size() < 16) return false;
-
     memcpy(&totalBytes, payload.data(), 8);
     memcpy(&freeBytes, payload.data() + 8, 8);
     return true;
@@ -2208,10 +2268,8 @@ bool DeviceClient::verifyFileCrc(const std::string& remotePath, const std::strin
 
 bool DeviceClient::deleteFile(const std::string& path) {
     if (!m_connected) { m_lastError = "Not connected"; return false; }
-    std::lock_guard<std::mutex> lk(m_mutex);
-    if (!sendMsg(CMD_DELETE, path.data(), (uint32_t)path.size())) return false;
     MsgHeader hdr; std::vector<char> payload;
-    if (!recvMsg(hdr, payload)) return false;
+    if (!runSmallOp(CMD_DELETE, path.data(), (uint32_t)path.size(), hdr, payload)) return false;
     if (hdr.cmd == RSP_ERROR) {
         m_lastError = std::string(payload.data(), payload.size());
         return false;
@@ -2221,36 +2279,29 @@ bool DeviceClient::deleteFile(const std::string& path) {
 
 bool DeviceClient::createDirectory(const std::string& path) {
     if (!m_connected) { m_lastError = "Not connected"; return false; }
-    std::lock_guard<std::mutex> lk(m_mutex);
-    if (!sendMsg(CMD_MKDIR, path.data(), (uint32_t)path.size())) return false;
     MsgHeader hdr; std::vector<char> payload;
-    if (!recvMsg(hdr, payload)) return false;
+    if (!runSmallOp(CMD_MKDIR, path.data(), (uint32_t)path.size(), hdr, payload)) return false;
     if (hdr.cmd == RSP_ERROR) { m_lastError = std::string(payload.data(), payload.size()); return false; }
     return hdr.cmd == RSP_OK;
 }
 
 bool DeviceClient::renameFile(const std::string& oldPath, const std::string& newPath) {
     if (!m_connected) { m_lastError = "Not connected"; return false; }
-    std::lock_guard<std::mutex> lk(m_mutex);
-    // Payload: [4B old_len][old_path][new_path]
     uint32_t oldLen = (uint32_t)oldPath.size();
     std::vector<char> payload(4 + oldPath.size() + newPath.size());
     memcpy(payload.data(), &oldLen, 4);
     memcpy(payload.data() + 4, oldPath.data(), oldPath.size());
     memcpy(payload.data() + 4 + oldPath.size(), newPath.data(), newPath.size());
-    if (!sendMsg(CMD_RENAME, payload.data(), (uint32_t)payload.size())) return false;
     MsgHeader hdr; std::vector<char> resp;
-    if (!recvMsg(hdr, resp)) return false;
+    if (!runSmallOp(CMD_RENAME, payload.data(), (uint32_t)payload.size(), hdr, resp)) return false;
     if (hdr.cmd == RSP_ERROR) { m_lastError = std::string(resp.data(), resp.size()); return false; }
     return hdr.cmd == RSP_OK;
 }
 
 uint64_t DeviceClient::getFileSize(const std::string& path) {
     if (!m_connected) return 0;
-    std::lock_guard<std::mutex> lk(m_mutex);
-    if (!sendMsg(CMD_STAT, path.data(), (uint32_t)path.size())) return 0;
     MsgHeader hdr; std::vector<char> payload;
-    if (!recvMsg(hdr, payload)) return 0;
+    if (!runSmallOp(CMD_STAT, path.data(), (uint32_t)path.size(), hdr, payload)) return 0;
     if (hdr.cmd == RSP_OK && payload.size() >= sizeof(StatResponse)) {
         StatResponse sr;
         memcpy(&sr, payload.data(), sizeof(sr));

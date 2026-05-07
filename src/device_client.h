@@ -148,6 +148,28 @@ private:
 
     std::string runProcess(const std::string& command);
 
+    // Low-level socket open. Returns INVALID_SOCKET on failure.
+    static uintptr_t openServerSocket(const std::string& host, int port,
+                                      const std::string& bindLocalIp);
+
+    // Send/recv helpers for an arbitrary socket (used by both primary and
+    // control channels). Do not touch m_connected.
+    static bool sendAllOn(uintptr_t sock, const void* data, size_t len);
+    static bool recvAllOn(uintptr_t sock, void* data, size_t len);
+    static bool sendMsgOn(uintptr_t sock, uint32_t cmd, const void* payload, uint32_t len);
+    static bool recvMsgOn(uintptr_t sock, MsgHeader& hdr, std::vector<char>& payload);
+
+    // Lazy-open the control channel. Caller must hold m_controlMutex.
+    bool ensureControlChannelLocked();
+    void closeControlChannelLocked();
+
+    // Run a single request/response on the control channel if available, falling
+    // back to the primary channel otherwise. Used for small browsing ops so they
+    // don't block waiting for an in-progress transfer.
+    bool runSmallOp(uint32_t cmd, const void* payload, uint32_t plen,
+                    MsgHeader& outHdr, std::vector<char>& outPayload,
+                    uint32_t recvTimeoutMs = 0);
+
     std::string m_adbPath;
     std::string m_serial;
     uintptr_t m_socket = ~(uintptr_t)0; // INVALID_SOCKET
@@ -158,6 +180,15 @@ private:
     std::string m_statusText;
     std::mutex m_mutex; // protects TCP socket access
     std::mutex m_serverMutex; // protects startServer/stopServer from concurrent calls
+
+    // Independent control channel — second TCP connection used for small
+    // browsing ops so they aren't serialized behind in-progress transfers.
+    uintptr_t m_ctlSocket = ~(uintptr_t)0;
+    bool m_ctlConnected = false;
+    std::mutex m_ctlMutex;
+    std::string m_lastConnectHost;
+    int m_lastConnectPort = 0;
+    std::string m_lastConnectBindIp;
 
     // Reusable transfer buffer — avoids per-chunk heap allocation
     std::vector<char> m_transferBuf;

@@ -17,9 +17,18 @@
 #include <cctype>
 #include <fstream>
 #include <set>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
+#include <deque>
 #include <ole2.h>
+#include <shlobj.h>
+#include <shlwapi.h>
 #include <iphlpapi.h>
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "gdi32.lib")
 
 // Safe UTF-8 path-to-string helper (avoids ANSI code page issues with .string())
 static std::string pathToUtf8(const std::filesystem::path& p) {
@@ -107,42 +116,33 @@ public:
     HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
 };
 
-class SimpleEnumFORMATETC : public IEnumFORMATETC {
-    LONG m_ref = 1;
-    FORMATETC m_fmt;
-    ULONG m_index = 0;
-public:
-    SimpleEnumFORMATETC(const FORMATETC& fmt) : m_fmt(fmt) {}
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
-        if (riid == IID_IUnknown || riid == IID_IEnumFORMATETC) { *ppv = this; AddRef(); return S_OK; }
-        *ppv = nullptr; return E_NOINTERFACE;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&m_ref); }
-    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&m_ref); if (!r) delete this; return r; }
-    HRESULT STDMETHODCALLTYPE Next(ULONG celt, FORMATETC* rgelt, ULONG* pceltFetched) override {
-        if (m_index == 0 && celt > 0) { rgelt[0] = m_fmt; m_index++; if (pceltFetched) *pceltFetched = 1; return (celt == 1) ? S_OK : S_FALSE; }
-        if (pceltFetched) *pceltFetched = 0; return S_FALSE;
-    }
-    HRESULT STDMETHODCALLTYPE Skip(ULONG celt) override { m_index += celt; return (m_index <= 1) ? S_OK : S_FALSE; }
-    HRESULT STDMETHODCALLTYPE Reset() override { m_index = 0; return S_OK; }
-    HRESULT STDMETHODCALLTYPE Clone(IEnumFORMATETC** ppEnum) override {
-        auto* c = new SimpleEnumFORMATETC(m_fmt); c->m_index = m_index; *ppEnum = c; return S_OK;
-    }
-};
-
 class SimpleDataObject : public IDataObject {
     LONG m_ref = 1;
-    STGMEDIUM m_stg = {};
-    FORMATETC m_fmt = {};
-    bool m_hasData = false;
+    struct Entry { FORMATETC fmt; STGMEDIUM stg; };
+    std::vector<Entry> m_entries;
+
+    static HGLOBAL dupGlobal(HGLOBAL src) {
+        if (!src) return nullptr;
+        SIZE_T sz = GlobalSize(src);
+        HGLOBAL dst = GlobalAlloc(GHND, sz);
+        if (!dst) return nullptr;
+        void* s = GlobalLock(src); void* d = GlobalLock(dst);
+        memcpy(d, s, sz);
+        GlobalUnlock(dst); GlobalUnlock(src);
+        return dst;
+    }
+    static bool fmtMatch(const FORMATETC& a, const FORMATETC& b) {
+        return a.cfFormat == b.cfFormat && a.dwAspect == b.dwAspect && a.lindex == b.lindex;
+    }
 public:
-    ~SimpleDataObject() { if (m_hasData) ReleaseStgMedium(&m_stg); }
+    ~SimpleDataObject() {
+        for (auto& e : m_entries) ReleaseStgMedium(&e.stg);
+    }
 
     void setHDrop(const std::vector<std::wstring>& files) {
-        // Calculate DROPFILES buffer size
         size_t totalChars = 0;
-        for (auto& f : files) totalChars += f.size() + 1; // null-terminated
-        totalChars += 1; // double-null terminator
+        for (auto& f : files) totalChars += f.size() + 1;
+        totalChars += 1;
         size_t bufSize = sizeof(DROPFILES) + totalChars * sizeof(wchar_t);
 
         HGLOBAL hGlobal = GlobalAlloc(GHND, bufSize);
@@ -155,16 +155,17 @@ public:
             memcpy(dst, f.c_str(), (f.size() + 1) * sizeof(wchar_t));
             dst += f.size() + 1;
         }
-        *dst = L'\0'; // double-null
+        *dst = L'\0';
         GlobalUnlock(hGlobal);
 
-        m_stg.tymed = TYMED_HGLOBAL;
-        m_stg.hGlobal = hGlobal;
-        m_fmt.cfFormat = CF_HDROP;
-        m_fmt.dwAspect = DVASPECT_CONTENT;
-        m_fmt.lindex = -1;
-        m_fmt.tymed = TYMED_HGLOBAL;
-        m_hasData = true;
+        Entry e{};
+        e.fmt.cfFormat = CF_HDROP;
+        e.fmt.dwAspect = DVASPECT_CONTENT;
+        e.fmt.lindex = -1;
+        e.fmt.tymed = TYMED_HGLOBAL;
+        e.stg.tymed = TYMED_HGLOBAL;
+        e.stg.hGlobal = hGlobal;
+        m_entries.push_back(e);
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
@@ -174,35 +175,450 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&m_ref); }
     ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&m_ref); if (!r) delete this; return r; }
     HRESULT STDMETHODCALLTYPE GetData(FORMATETC* fmt, STGMEDIUM* stg) override {
-        if (!m_hasData || fmt->cfFormat != CF_HDROP) return DV_E_FORMATETC;
-        stg->tymed = TYMED_HGLOBAL;
-        stg->pUnkForRelease = nullptr;
-        // Duplicate the HGLOBAL
-        SIZE_T sz = GlobalSize(m_stg.hGlobal);
-        stg->hGlobal = GlobalAlloc(GHND, sz);
-        if (!stg->hGlobal) return E_OUTOFMEMORY;
-        memcpy(GlobalLock(stg->hGlobal), GlobalLock(m_stg.hGlobal), sz);
-        GlobalUnlock(stg->hGlobal); GlobalUnlock(m_stg.hGlobal);
-        return S_OK;
+        for (auto& e : m_entries) {
+            if (fmtMatch(e.fmt, *fmt) && (e.fmt.tymed & fmt->tymed)) {
+                stg->tymed = e.stg.tymed;
+                stg->pUnkForRelease = nullptr;
+                if (e.stg.tymed == TYMED_HGLOBAL) {
+                    stg->hGlobal = dupGlobal(e.stg.hGlobal);
+                    if (!stg->hGlobal) return E_OUTOFMEMORY;
+                    return S_OK;
+                } else if (e.stg.tymed == TYMED_ISTREAM) {
+                    stg->pstm = e.stg.pstm;
+                    if (stg->pstm) stg->pstm->AddRef();
+                    return S_OK;
+                } else if (e.stg.tymed == TYMED_GDI) {
+                    stg->hBitmap = e.stg.hBitmap;
+                    return S_OK;
+                }
+                return DV_E_TYMED;
+            }
+        }
+        return DV_E_FORMATETC;
     }
     HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* fmt) override {
-        if (m_hasData && fmt->cfFormat == CF_HDROP && (fmt->tymed & TYMED_HGLOBAL)) return S_OK;
+        for (auto& e : m_entries) {
+            if (fmtMatch(e.fmt, *fmt) && (e.fmt.tymed & fmt->tymed)) return S_OK;
+        }
         return DV_E_FORMATETC;
     }
     HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*, FORMATETC* out) override {
         out->ptd = nullptr; return DATA_S_SAMEFORMATETC;
     }
-    HRESULT STDMETHODCALLTYPE SetData(FORMATETC*, STGMEDIUM*, BOOL) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD dir, IEnumFORMATETC** ppEnum) override {
-        if (dir != DATADIR_GET || !m_hasData) { *ppEnum = nullptr; return E_NOTIMPL; }
-        *ppEnum = new SimpleEnumFORMATETC(m_fmt);
+    HRESULT STDMETHODCALLTYPE SetData(FORMATETC* fmt, STGMEDIUM* stg, BOOL fRelease) override {
+        if (!fmt || !stg) return E_INVALIDARG;
+        // Replace existing entry of same format
+        for (auto it = m_entries.begin(); it != m_entries.end(); ++it) {
+            if (fmtMatch(it->fmt, *fmt)) {
+                ReleaseStgMedium(&it->stg);
+                m_entries.erase(it);
+                break;
+            }
+        }
+        Entry e{};
+        e.fmt = *fmt;
+        if (fRelease) {
+            e.stg = *stg;
+        } else {
+            // Copy the medium
+            e.stg.tymed = stg->tymed;
+            e.stg.pUnkForRelease = nullptr;
+            if (stg->tymed == TYMED_HGLOBAL) {
+                e.stg.hGlobal = dupGlobal(stg->hGlobal);
+                if (!e.stg.hGlobal) return E_OUTOFMEMORY;
+            } else if (stg->tymed == TYMED_ISTREAM) {
+                e.stg.pstm = stg->pstm;
+                if (e.stg.pstm) e.stg.pstm->AddRef();
+            } else {
+                e.stg = *stg;
+            }
+        }
+        m_entries.push_back(e);
         return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD dir, IEnumFORMATETC** ppEnum) override {
+        if (dir != DATADIR_GET) { *ppEnum = nullptr; return E_NOTIMPL; }
+        std::vector<FORMATETC> fmts;
+        for (auto& e : m_entries) fmts.push_back(e.fmt);
+        return SHCreateStdEnumFmtEtc((UINT)fmts.size(), fmts.empty() ? nullptr : fmts.data(), ppEnum);
     }
     HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override { return OLE_E_ADVISENOTSUPPORTED; }
     HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override { return OLE_E_ADVISENOTSUPPORTED; }
     HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA**) override { return OLE_E_ADVISENOTSUPPORTED; }
 };
+
+// Shared state for AdbPullStream — held via shared_ptr so the producer thread
+// can outlive the IStream object on cancel without us blocking IStream::Release.
+struct AdbStreamState {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::deque<std::vector<char>> queue;
+    size_t queueBytes = 0;
+    size_t frontConsumed = 0;
+    uint64_t pos = 0;
+    bool eof = false;
+    bool aborted = false;
+};
+
+// IStream that streams a remote file via a producer thread running
+// DeviceClient::readRangeStreaming. State is shared with the producer so
+// destruction is non-blocking — abort flag is set, the producer is detached,
+// and it cleans up when the device finishes draining.
+class AdbPullStream : public IStream {
+    LONG m_ref = 1;
+    std::string m_remotePath;
+    DeviceClient* m_dev = nullptr;
+    uint64_t m_size = 0;
+    std::wstring m_name;
+    std::shared_ptr<AdbStreamState> m_state;
+    bool m_producerStarted = false;
+    std::atomic<int>* m_inflightCounter = nullptr;
+
+    static constexpr size_t kMaxQueue = 128 * 1024 * 1024; // 128 MiB read-ahead cap
+
+    // Caller holds m_state->mtx. Aborts any prior producer (detached) and starts
+    // a new one at startOffset. The new producer captures a fresh shared_ptr to
+    // its own state — restarting effectively replaces m_state.
+    void restartProducerLocked(std::unique_lock<std::mutex>& lk, uint64_t startOffset) {
+        // Signal the current producer to abort and detach it; it will finish
+        // draining on its own and then drop its shared_ptr<State>.
+        m_state->aborted = true;
+        m_state->cv.notify_all();
+        lk.unlock();
+
+        // New, independent state for the new producer / consumer pair.
+        auto fresh = std::make_shared<AdbStreamState>();
+        fresh->pos = startOffset;
+        m_state = fresh;
+        lk = std::unique_lock<std::mutex>(m_state->mtx);
+        m_producerStarted = true;
+        if (startOffset >= m_size) { m_state->eof = true; return; }
+
+        std::shared_ptr<AdbStreamState> stateRef = m_state;
+        DeviceClient* dev = m_dev;
+        std::string remote = m_remotePath;
+        uint64_t length = m_size - startOffset;
+        std::atomic<int>* inflight = m_inflightCounter;
+        std::thread([stateRef, dev, remote, startOffset, length, inflight]() {
+            if (inflight) inflight->fetch_add(1);
+            dev->readRangeStreaming(remote, startOffset, length,
+                [stateRef](const void* data, uint32_t len, uint64_t /*offset*/) -> bool {
+                    // Apply backpressure first (mutex briefly held).
+                    {
+                        std::unique_lock<std::mutex> lk(stateRef->mtx);
+                        stateRef->cv.wait(lk, [&] {
+                            return stateRef->aborted || stateRef->queueBytes < kMaxQueue;
+                        });
+                        if (stateRef->aborted) return false;
+                    }
+                    // Copy out of the device's reusable buffer outside the lock so
+                    // the consumer is not blocked during the per-chunk memcpy.
+                    std::vector<char> chunk((const char*)data, (const char*)data + len);
+                    {
+                        std::lock_guard<std::mutex> lk(stateRef->mtx);
+                        if (stateRef->aborted) return false;
+                        stateRef->queue.push_back(std::move(chunk));
+                        stateRef->queueBytes += len;
+                        stateRef->cv.notify_all();
+                    }
+                    return true;
+                });
+            {
+                std::lock_guard<std::mutex> lk(stateRef->mtx);
+                stateRef->eof = true;
+                stateRef->cv.notify_all();
+            }
+            if (inflight) inflight->fetch_sub(1);
+        }).detach();
+    }
+
+public:
+    AdbPullStream(std::string remotePath, DeviceClient* dev, uint64_t size, std::wstring name,
+                  std::atomic<int>* inflight)
+        : m_remotePath(std::move(remotePath)), m_dev(dev), m_size(size), m_name(std::move(name)),
+          m_state(std::make_shared<AdbStreamState>()), m_inflightCounter(inflight) {}
+    ~AdbPullStream() {
+        // Tell the (possibly running) producer to abort; do NOT join — we want
+        // IStream::Release to return immediately so Explorer's cancel is fast.
+        std::lock_guard<std::mutex> lk(m_state->mtx);
+        m_state->aborted = true;
+        m_state->cv.notify_all();
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_ISequentialStream || riid == IID_IStream) {
+            *ppv = this; AddRef(); return S_OK;
+        }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&m_ref); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = InterlockedDecrement(&m_ref);
+        if (!r) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE Read(void* pv, ULONG cb, ULONG* pcbRead) override {
+        if (pcbRead) *pcbRead = 0;
+        std::unique_lock<std::mutex> lk(m_state->mtx);
+        if (!m_producerStarted) restartProducerLocked(lk, m_state->pos);
+        auto* st = m_state.get();
+        if (st->pos >= m_size) return S_FALSE;
+        ULONG written = 0;
+        while (written < cb && st->pos < m_size) {
+            if (st->queue.empty()) {
+                if (st->eof) break;
+                st->cv.wait(lk, [&] { return !st->queue.empty() || st->eof || st->aborted; });
+                if (st->aborted) return E_FAIL;
+                continue;
+            }
+            auto& front = st->queue.front();
+            size_t avail = front.size() - st->frontConsumed;
+            size_t want = cb - written;
+            size_t take = (avail < want) ? avail : want;
+            memcpy((char*)pv + written, front.data() + st->frontConsumed, take);
+            written += (ULONG)take;
+            st->frontConsumed += take;
+            st->pos += take;
+            st->queueBytes -= take;
+            if (st->frontConsumed == front.size()) {
+                st->queue.pop_front();
+                st->frontConsumed = 0;
+            }
+            st->cv.notify_all();
+        }
+        if (pcbRead) *pcbRead = written;
+        if (written == 0) return S_FALSE;
+        return (written < cb) ? S_FALSE : S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Write(const void*, ULONG, ULONG*) override { return STG_E_ACCESSDENIED; }
+    HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER off, DWORD origin, ULARGE_INTEGER* newPos) override {
+        std::unique_lock<std::mutex> lk(m_state->mtx);
+        auto* st = m_state.get();
+        int64_t base = 0;
+        if (origin == STREAM_SEEK_SET) base = 0;
+        else if (origin == STREAM_SEEK_CUR) base = (int64_t)st->pos;
+        else if (origin == STREAM_SEEK_END) base = (int64_t)m_size;
+        else return STG_E_INVALIDFUNCTION;
+        int64_t np = base + off.QuadPart;
+        if (np < 0) return STG_E_INVALIDFUNCTION;
+        uint64_t want = (uint64_t)np;
+        if (want == st->pos) {
+            if (newPos) newPos->QuadPart = st->pos;
+            return S_OK;
+        }
+        if (want > st->pos && (want - st->pos) <= st->queueBytes) {
+            uint64_t skip = want - st->pos;
+            while (skip > 0 && !st->queue.empty()) {
+                auto& front = st->queue.front();
+                size_t avail = front.size() - st->frontConsumed;
+                size_t take = (size_t)((skip < avail) ? skip : avail);
+                st->frontConsumed += take;
+                st->queueBytes -= take;
+                skip -= take;
+                st->pos += take;
+                if (st->frontConsumed == front.size()) {
+                    st->queue.pop_front();
+                    st->frontConsumed = 0;
+                }
+            }
+            st->cv.notify_all();
+            if (newPos) newPos->QuadPart = st->pos;
+            return S_OK;
+        }
+        // Restart producer at new offset (replaces m_state).
+        restartProducerLocked(lk, want);
+        if (newPos) newPos->QuadPart = m_state->pos;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER) override { return STG_E_ACCESSDENIED; }
+    HRESULT STDMETHODCALLTYPE CopyTo(IStream* dst, ULARGE_INTEGER cb,
+                                     ULARGE_INTEGER* read, ULARGE_INTEGER* written) override {
+        ULARGE_INTEGER tot{}; ULARGE_INTEGER w{};
+        std::vector<char> buf(1 << 20); // 1 MiB
+        while (cb.QuadPart > 0) {
+            ULONG to = (ULONG)((cb.QuadPart < buf.size()) ? cb.QuadPart : buf.size());
+            ULONG got = 0;
+            HRESULT hr = Read(buf.data(), to, &got);
+            if (FAILED(hr)) return hr;
+            if (got == 0) break;
+            tot.QuadPart += got;
+            ULONG ww = 0;
+            if (dst) dst->Write(buf.data(), got, &ww);
+            w.QuadPart += ww;
+            cb.QuadPart -= got;
+            if (got < to) break;
+        }
+        if (read) *read = tot;
+        if (written) *written = w;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Commit(DWORD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Revert() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
+    HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
+    HRESULT STDMETHODCALLTYPE Stat(STATSTG* p, DWORD flags) override {
+        if (!p) return E_POINTER;
+        memset(p, 0, sizeof(*p));
+        if (!(flags & STATFLAG_NONAME)) {
+            size_t nb = (m_name.size() + 1) * sizeof(wchar_t);
+            p->pwcsName = (LPOLESTR)CoTaskMemAlloc(nb);
+            if (p->pwcsName) memcpy(p->pwcsName, m_name.c_str(), nb);
+        }
+        p->type = STGTY_STREAM;
+        p->cbSize.QuadPart = m_size;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Clone(IStream**) override { return E_NOTIMPL; }
+};
+
+// Register virtual files (FILEGROUPDESCRIPTORW + per-index FILECONTENTS streams)
+// on the data object. Streams ownership is transferred (refcount stays at the
+// caller's, we AddRef when we store).
+static void setVirtualFilesOnDataObject(SimpleDataObject* obj,
+                                        const std::vector<std::wstring>& names,
+                                        const std::vector<uint64_t>& sizes,
+                                        const std::vector<IStream*>& streams) {
+    UINT cfDesc = RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
+    UINT cfCont = RegisterClipboardFormatW(CFSTR_FILECONTENTS);
+
+    // Build FILEGROUPDESCRIPTORW
+    size_t n = names.size();
+    size_t bufSize = sizeof(FILEGROUPDESCRIPTORW) + (n - 1) * sizeof(FILEDESCRIPTORW);
+    HGLOBAL hg = GlobalAlloc(GHND, bufSize);
+    if (hg) {
+        auto* fgd = (FILEGROUPDESCRIPTORW*)GlobalLock(hg);
+        fgd->cItems = (UINT)n;
+        for (size_t i = 0; i < n; i++) {
+            FILEDESCRIPTORW& fd = fgd->fgd[i];
+            fd.dwFlags = FD_FILESIZE | FD_PROGRESSUI;
+            fd.nFileSizeLow = (DWORD)(sizes[i] & 0xFFFFFFFF);
+            fd.nFileSizeHigh = (DWORD)(sizes[i] >> 32);
+            const std::wstring& nm = names[i];
+            size_t copy = nm.size() < (MAX_PATH - 1) ? nm.size() : (MAX_PATH - 1);
+            memcpy(fd.cFileName, nm.c_str(), copy * sizeof(wchar_t));
+            fd.cFileName[copy] = L'\0';
+        }
+        GlobalUnlock(hg);
+
+        FORMATETC fmt{};
+        fmt.cfFormat = (CLIPFORMAT)cfDesc;
+        fmt.dwAspect = DVASPECT_CONTENT;
+        fmt.lindex = -1;
+        fmt.tymed = TYMED_HGLOBAL;
+        STGMEDIUM stg{};
+        stg.tymed = TYMED_HGLOBAL;
+        stg.hGlobal = hg;
+        obj->SetData(&fmt, &stg, TRUE);
+    }
+
+    // Per-index FILECONTENTS
+    for (size_t i = 0; i < n; i++) {
+        FORMATETC fmt{};
+        fmt.cfFormat = (CLIPFORMAT)cfCont;
+        fmt.dwAspect = DVASPECT_CONTENT;
+        fmt.lindex = (LONG)i;
+        fmt.tymed = TYMED_ISTREAM;
+        STGMEDIUM stg{};
+        stg.tymed = TYMED_ISTREAM;
+        stg.pstm = streams[i];
+        if (stg.pstm) stg.pstm->AddRef();
+        obj->SetData(&fmt, &stg, TRUE);
+    }
+}
+
+// Build a small RGB bitmap with drag label text. Caller owns the returned HBITMAP.
+static HBITMAP createDragLabelBitmap(const std::wstring& label, COLORREF& outColorKey) {
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    LOGFONTW lf{};
+    GetObjectW(font, sizeof(lf), &lf);
+    lf.lfHeight = -16;
+    HFONT bigFont = CreateFontIndirectW(&lf);
+
+    HFONT oldFont = (HFONT)SelectObject(mem, bigFont);
+    RECT measure{0,0,0,0};
+    DrawTextW(mem, label.c_str(), -1, &measure, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    int w = measure.right + 16;
+    int h = measure.bottom + 8;
+    if (w < 64) w = 64;
+    if (h < 24) h = 24;
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+
+    // Magenta color key background
+    outColorKey = RGB(255, 0, 255);
+    HBRUSH bgBrush = CreateSolidBrush(outColorKey);
+    RECT full{0,0,w,h};
+    FillRect(mem, &full, bgBrush);
+    DeleteObject(bgBrush);
+
+    // Rounded panel
+    HBRUSH panelBrush = CreateSolidBrush(RGB(30, 50, 80));
+    HPEN panelPen = CreatePen(PS_SOLID, 1, RGB(80, 130, 200));
+    HBRUSH oldBrush = (HBRUSH)SelectObject(mem, panelBrush);
+    HPEN oldPen = (HPEN)SelectObject(mem, panelPen);
+    RoundRect(mem, 0, 0, w, h, 8, 8);
+    SelectObject(mem, oldBrush);
+    SelectObject(mem, oldPen);
+    DeleteObject(panelBrush);
+    DeleteObject(panelPen);
+
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, RGB(220, 235, 255));
+    RECT textRect{8, 4, w - 8, h - 4};
+    DrawTextW(mem, label.c_str(), -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+
+    SelectObject(mem, oldFont);
+    SelectObject(mem, oldBmp);
+    DeleteObject(bigFont);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    return bmp;
+}
+
+// Attach a label drag image to the data object via IDragSourceHelper2.
+static void attachDragImage(IDataObject* dataObj, const std::wstring& label) {
+    IDragSourceHelper2* dsh2 = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_DragDropHelper, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dsh2)))) return;
+    SHDRAGIMAGE img{};
+    COLORREF key = 0;
+    img.hbmpDragImage = createDragLabelBitmap(label, key);
+    if (img.hbmpDragImage) {
+        BITMAP bm{};
+        GetObject(img.hbmpDragImage, sizeof(bm), &bm);
+        img.sizeDragImage.cx = bm.bmWidth;
+        img.sizeDragImage.cy = bm.bmHeight;
+        img.ptOffset.x = bm.bmWidth / 2;
+        img.ptOffset.y = bm.bmHeight / 2;
+        img.crColorKey = key;
+        if (FAILED(dsh2->InitializeFromBitmap(&img, dataObj))) {
+            DeleteObject(img.hbmpDragImage);
+        }
+    }
+    dsh2->Release();
+}
+
+static std::wstring buildDragLabel(const std::vector<std::wstring>& items) {
+    if (items.size() == 1) {
+        const std::wstring& p = items[0];
+        size_t slash = p.find_last_of(L"\\/");
+        return (slash == std::wstring::npos) ? p : p.substr(slash + 1);
+    }
+    return std::to_wstring(items.size()) + L" files";
+}
 
 void App::performOleDragDrop(const std::vector<std::string>& filePaths) {
     std::vector<std::wstring> wPaths;
@@ -216,6 +632,8 @@ void App::performOleDragDrop(const std::vector<std::string>& filePaths) {
     dataObj->setHDrop(wPaths);
     auto* dropSrc = new SimpleDropSource();
 
+    attachDragImage(dataObj, buildDragLabel(wPaths));
+
     DWORD effect = 0;
     DoDragDrop(dataObj, dropSrc, DROPEFFECT_COPY | DROPEFFECT_MOVE, &effect);
 
@@ -225,6 +643,13 @@ void App::performOleDragDrop(const std::vector<std::string>& filePaths) {
             try { std::filesystem::remove(toFsPath(p)); } catch (...) {}
         }
     }
+
+    // Clear selection on the source panel so it doesn't look stuck after the drop.
+    if (m_dragSourcePanel) {
+        m_dragSourcePanel->selectedIndices.clear();
+        m_dragSourcePanel->focusedIndex = -1;
+    }
+    m_dragSourcePanel = nullptr;
 
     // Refresh panels after any drag-out (file may have been moved/copied)
     m_leftPanel.needsRefresh = true;
@@ -236,55 +661,69 @@ void App::performOleDragDrop(const std::vector<std::string>& filePaths) {
 
 void App::performAndroidDragOut(FilePanel* src) {
     if (!src || !src->isAndroid) return;
-    DeviceClient& dev = deviceFor(*src);
-    if (!dev.isServerRunning()) return;
-
-    // Create temp staging directory
-    char tmpDir[MAX_PATH];
-    GetTempPathA(MAX_PATH, tmpDir);
-    std::string stagingDir = std::string(tmpDir) + "FastEnough\\drag_staging";
-    try { std::filesystem::create_directories(stagingDir); } catch (...) {}
+    DeviceClient* dev = &deviceFor(*src);
+    if (!dev->isServerRunning()) return;
 
     std::vector<std::string> remotePaths;
-    std::vector<std::string> localPaths;
+    std::vector<std::wstring> wNames;
+    std::vector<uint64_t> sizes;
     for (int idx : src->selectedIndices) {
         if (!src->validIndex(idx)) continue;
+        if (src->entryIsDir(idx)) continue;
         std::string name = src->entryName(idx);
         std::string remotePath = src->currentPath;
         if (remotePath.back() != '/') remotePath += "/";
         remotePath += name;
-        std::string localPath = stagingDir + "\\" + name;
         remotePaths.push_back(remotePath);
-        localPaths.push_back(localPath);
+        wNames.push_back(toWide(name));
+        sizes.push_back(src->entrySize(idx));
     }
-
     if (remotePaths.empty()) return;
 
-    m_statusMessage = "Pulling files for drag...";
-    m_statusTime = std::chrono::steady_clock::now();
+    std::string serial = dev->connectedSerial();
+    FilePanel* srcPanel = src;
+    DWORD uiThreadId = GetCurrentThreadId();
 
-    std::string serial = dev.connectedSerial();
-    bool allOk = true;
-    for (size_t i = 0; i < remotePaths.size(); i++) {
-        std::string result = dev.runAdbCommand("-s " + serial +
-            " pull \"" + remotePaths[i] + "\" \"" + localPaths[i] + "\"");
-        if (result.find("error") != std::string::npos ||
-            result.find("does not exist") != std::string::npos) {
-            allOk = false;
-            break;
+    // Run DoDragDrop on a dedicated STA thread so Explorer's IStream::Read calls
+    // (which may pull large files via ADB) don't block the UI thread.
+    std::thread worker([this, dev, serial, remotePaths, wNames, sizes, srcPanel, uiThreadId]() {
+        OleInitialize(nullptr);
+        // Share input state with the UI thread so DoDragDrop sees the live mouse
+        // button state and can render the drag image as the user moves the cursor.
+        AttachThreadInput(GetCurrentThreadId(), uiThreadId, TRUE);
+
+        auto* dataObj = new SimpleDataObject();
+        auto* dropSrc = new SimpleDropSource();
+
+        std::vector<IStream*> streams;
+        streams.reserve(remotePaths.size());
+        for (size_t i = 0; i < remotePaths.size(); i++) {
+            streams.push_back(new AdbPullStream(remotePaths[i], dev, sizes[i], wNames[i],
+                                                &m_androidDragInflight));
         }
-    }
+        setVirtualFilesOnDataObject(dataObj, wNames, sizes, streams);
+        for (auto* s : streams) s->Release();
 
-    if (allOk) {
-        m_statusMessage = "";
-        performOleDragDrop(localPaths);
-    } else {
-        m_statusMessage = "Failed to pull files for drag";
-        m_statusTime = std::chrono::steady_clock::now();
-    }
+        attachDragImage(dataObj, buildDragLabel(wNames));
 
-    // Clean up temp files
-    try { std::filesystem::remove_all(stagingDir); } catch (...) {}
+        DWORD effect = 0;
+        DoDragDrop(dataObj, dropSrc, DROPEFFECT_COPY | DROPEFFECT_MOVE, &effect);
+
+        dropSrc->Release();
+        dataObj->Release();
+
+        if (srcPanel) {
+            srcPanel->selectedIndices.clear();
+            srcPanel->focusedIndex = -1;
+        }
+        m_leftPanel.needsRefresh = true;
+        m_rightPanel.needsRefresh = true;
+        m_dragSourcePanel = nullptr;
+
+        AttachThreadInput(GetCurrentThreadId(), uiThreadId, FALSE);
+        OleUninitialize();
+    });
+    worker.detach();
 }
 
 // Check if a serial is a WiFi ADB connection (IP:port format like "192.168.x.x:5555")
@@ -815,16 +1254,9 @@ void App::render() {
         if (!panel.needsRefresh) return;
         if (panel.isAndroid) {
             if (m_selectedDevice < 0) return;
-            // Don't refresh while a transfer is active — listDirectory locks m_mutex
-            bool transferBusy = false;
-            {
-                std::lock_guard<std::mutex> lk(m_batchMutex);
-                for (auto& b : m_batchQueue) {
-                    auto s = b->state.load();
-                    if (s == BatchState::Running || s == BatchState::Paused || s == BatchState::Verifying) { transferBusy = true; break; }
-                }
-            }
-            if (!transferBusy) { refreshAndroidPanel(panel); panel.needsRefresh = false; }
+            // listDirectory uses the device's control channel, so it does not
+            // block on transfers or drag-out drains. Refresh freely.
+            refreshAndroidPanel(panel); panel.needsRefresh = false;
         } else {
             refreshWindowsPanel(panel);
             panel.needsRefresh = false;
@@ -3529,7 +3961,7 @@ void App::renderAboutPopup() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        ImGui::Text("Version: 1.0.11");
+        ImGui::Text("Version: 1.0.12");
         ImGui::Text("Build date: %s", __DATE__);
         ImGui::Spacing();
         ImGui::Text("Made by: JohnTheFarmer");

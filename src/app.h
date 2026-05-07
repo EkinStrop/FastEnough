@@ -10,6 +10,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 #include <filesystem>
 #include <chrono>
 #include <ctime>
@@ -333,6 +334,11 @@ public:
     std::vector<std::string> m_oleDragPaths;
     bool m_isDragging = false;
     FilePanel* m_dragSourcePanel = nullptr;
+    // Number of in-flight Android drag streams that may currently hold the
+    // device mutex via readRangeStreaming. Used to skip panel refresh so the
+    // UI thread does not block waiting for a still-draining producer after
+    // the user cancels an Explorer copy.
+    std::atomic<int> m_androidDragInflight{0};
     bool m_showCloseConfirm = false;  // close confirmation dialog
 
 private:
