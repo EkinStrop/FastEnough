@@ -296,6 +296,7 @@ struct AppPreferences {
     std::vector<NicBinding> multiNicBindings;
     int usbPipeCount = 2;   // 1 = single, 2 = dual ADB forward pipes (2x USB throughput)
     int wifiPipeCount = 1;  // 1 = single, 2 = dual WiFi TCP connections
+    bool useRoot = false;   // launch the on-device server via `su -c` for restricted-path access
 
     void save();
     void load();

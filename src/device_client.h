@@ -48,7 +48,14 @@ public:
     void closeTrackDevices(uintptr_t sock);
 
     // Server lifecycle
-    bool startServer(const std::string& serial, bool preferAdbForward = false);
+    bool startServer(const std::string& serial, bool preferAdbForward = false, bool useRoot = false);
+
+    // Set/get whether the server should be launched and killed via `su -c`.
+    // Caller should restart the server after changing this.
+    void setUseRoot(bool on) { m_useRoot = on; }
+    bool useRoot() const { return m_useRoot; }
+    // Probe whether `su -c id` returns uid=0 on the given device.
+    bool isRootAvailable(const std::string& serial);
     void stopServer();
     bool isServerRunning() const { return m_connected; }
     const std::string& connectedSerial() const { return m_serial; }
@@ -189,6 +196,10 @@ private:
     std::string m_lastConnectHost;
     int m_lastConnectPort = 0;
     std::string m_lastConnectBindIp;
+
+    // When true, the server is launched and killed via `su -c` so it runs as
+    // root and can access paths the shell user can't reach.
+    bool m_useRoot = false;
 
     // Reusable transfer buffer — avoids per-chunk heap allocation
     std::vector<char> m_transferBuf;

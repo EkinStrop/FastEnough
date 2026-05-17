@@ -371,9 +371,22 @@ bool DeviceClient::verifyConnection() {
     return true;
 }
 
-bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward) {
+bool DeviceClient::isRootAvailable(const std::string& serial) {
+    std::string out = runAdbCommand("-s " + serial + " shell \"su -c id 2>/dev/null\"");
+    return out.find("uid=0") != std::string::npos;
+}
+
+// Wrap a shell command in `su -c '...'` when root mode is on. Uses single
+// quotes inside the outer double-quoted adb shell string.
+static std::string wrapSu(const std::string& innerCmd, bool useRoot) {
+    if (!useRoot) return innerCmd;
+    return "su -c '" + innerCmd + "'";
+}
+
+bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward, bool useRoot) {
     std::lock_guard<std::mutex> serverLk(m_serverMutex);
-    LOG_INFO("Server", std::string("startServer(serial=") + serial + " prefer=" + (preferAdbForward ? "ADBForward" : "DirectTCP") + ") begin");
+    m_useRoot = useRoot;
+    LOG_INFO("Server", std::string("startServer(serial=") + serial + " prefer=" + (preferAdbForward ? "ADBForward" : "DirectTCP") + " root=" + (useRoot ? "Y" : "N") + ") begin");
     if (m_connected && m_serial == serial) { LOG_INFO("Server", "Already connected to " + serial); return true; }
 
     // If we previously had a connection to this device that died, kill the old server
@@ -389,15 +402,18 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward)
 
     if (wasConnectedToSameDevice) {
         LOG_INFO("Server", "Reconnecting to same device - killing old server to clear dead sockets");
-        runAdbCommand("-s " + serial + " shell killall afm-server 2>/dev/null");
+        // Kill both shell-user and root server instances regardless of mode.
+        runAdbCommand("-s " + serial + " shell \"killall afm-server 2>/dev/null; su -c 'killall afm-server' 2>/dev/null\"");
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         // Restart server immediately
         std::string serverBin = getServerBinaryPath();
         if (std::filesystem::exists(serverBin)) {
             runAdbCommand("-s " + serial + " push \"" + serverBin + "\" /data/local/tmp/afm-server");
             runAdbCommand("-s " + serial + " shell chmod 755 /data/local/tmp/afm-server");
+            std::string launchInner = wrapSu("nohup /data/local/tmp/afm-server " +
+                std::to_string(AFM_PORT) + " > /dev/null 2>&1 &", m_useRoot);
             std::string cmd = "\"" + m_adbPath + "\" -s " + serial +
-                " shell \"nohup /data/local/tmp/afm-server " + std::to_string(AFM_PORT) + " > /dev/null 2>&1 &\"";
+                " shell \"" + launchInner + "\"";
             std::string cmdBuf = cmd;
             STARTUPINFOA si2{}; si2.cb = sizeof(si2);
             si2.dwFlags = STARTF_USESHOWWINDOW; si2.wShowWindow = SW_HIDE;
@@ -467,12 +483,15 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward)
     LOG_INFO("Server", "Step 3: Starting server process...");
     m_statusText = "Starting server on device...";
     runAdbCommand("-s " + serial + " shell chmod 755 /data/local/tmp/afm-server");
-    runAdbCommand("-s " + serial + " shell killall afm-server 2>/dev/null");
+    // Kill any prior server, whether it was started as shell or root.
+    runAdbCommand("-s " + serial + " shell \"killall afm-server 2>/dev/null; su -c 'killall afm-server' 2>/dev/null\"");
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     // Start server in background - use runProcess directly to avoid ADB shell hanging
+    std::string launchInner = wrapSu("nohup /data/local/tmp/afm-server " +
+        std::to_string(AFM_PORT) + " > /dev/null 2>&1 &", m_useRoot);
     std::string cmd = "\"" + m_adbPath + "\" -s " + serial +
-        " shell \"nohup /data/local/tmp/afm-server " + std::to_string(AFM_PORT) + " > /dev/null 2>&1 &\"";
+        " shell \"" + launchInner + "\"";
     LOG_DEBUG("Server", "Launch cmd: " + cmd);
     STARTUPINFOA si{}; si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;

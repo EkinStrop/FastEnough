@@ -766,6 +766,7 @@ void AppPreferences::save() {
     f << "enableMultiNic=" << (enableMultiNic ? 1 : 0) << "\n";
     f << "usbPipeCount=" << usbPipeCount << "\n";
     f << "wifiPipeCount=" << wifiPipeCount << "\n";
+    f << "useRoot=" << (useRoot ? 1 : 0) << "\n";
     for (auto& nb : multiNicBindings) {
         f << "nicBinding=" << nb.adapterName << "|" << nb.localIp << "|" << (nb.enabled ? 1 : 0) << "\n";
     }
@@ -814,6 +815,8 @@ void AppPreferences::load() {
             usbPipeCount = std::clamp(std::stoi(line.substr(13)), 1, 2);
         else if (line.find("wifiPipeCount=") == 0)
             wifiPipeCount = std::clamp(std::stoi(line.substr(14)), 1, 2);
+        else if (line.find("useRoot=") == 0)
+            useRoot = (line.substr(8) == "1");
         else if (line.find("nicBinding=") == 0) {
             std::string val = line.substr(11);
             NicBinding nb;
@@ -1976,6 +1979,55 @@ void App::renderDeviceBar() {
                     }
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("WiFi dual-pipe: two parallel TCP connections\nfor ~2x WiFi throughput (WiFi 6/7 recommended).\nApplies on next device reconnect.");
+                }
+
+                // Root mode toggle — relaunches the on-device server via `su -c`
+                ImGui::SameLine(0, 16);
+                {
+                    bool rootOn = m_prefs.useRoot;
+                    if (ImGui::Checkbox("Root##devbar", &rootOn)) {
+                        std::string ser = devSnap[selSnap].serial;
+                        if (rootOn) {
+                            // Probe root availability before committing.
+                            postAsync("Checking root access...", [this, ser]() {
+                                bool hasRoot = m_device.isRootAvailable(ser);
+                                if (!hasRoot) {
+                                    m_statusMessage = "Root not available on this device (no su, or denied)";
+                                    m_statusTime = std::chrono::steady_clock::now();
+                                    return;
+                                }
+                                m_prefs.useRoot = true;
+                                m_prefs.save();
+                                m_device.disconnectTcp();
+                                if (m_device.startServer(ser, m_preferAdbForward, true)) {
+                                    m_statusMessage = "Root access enabled";
+                                    m_leftPanel.needsRefresh = true;
+                                    m_rightPanel.needsRefresh = true;
+                                } else {
+                                    m_statusMessage = "Root server start failed: " + m_device.lastError();
+                                    m_prefs.useRoot = false;
+                                    m_prefs.save();
+                                }
+                                m_statusTime = std::chrono::steady_clock::now();
+                            });
+                        } else {
+                            m_prefs.useRoot = false;
+                            m_prefs.save();
+                            postAsync("Disabling root...", [this, ser]() {
+                                m_device.disconnectTcp();
+                                if (m_device.startServer(ser, m_preferAdbForward, false)) {
+                                    m_statusMessage = "Root access disabled";
+                                    m_leftPanel.needsRefresh = true;
+                                    m_rightPanel.needsRefresh = true;
+                                } else {
+                                    m_statusMessage = "Restart failed: " + m_device.lastError();
+                                }
+                                m_statusTime = std::chrono::steady_clock::now();
+                            });
+                        }
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Run the on-device server as root via `su -c`.\nLets you access /root and other restricted paths\non rooted devices (Magisk/KernelSU).\nRestarts the server when toggled.");
                 }
 
                 // WiFi auto-connect toggle
@@ -3961,7 +4013,7 @@ void App::renderAboutPopup() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        ImGui::Text("Version: 1.0.12");
+        ImGui::Text("Version: 1.0.13");
         ImGui::Text("Build date: %s", __DATE__);
         ImGui::Spacing();
         ImGui::Text("Made by: JohnTheFarmer");
@@ -6000,7 +6052,7 @@ void App::onDeviceChanged() {
     }
 
     // Start the TCP server on the device (status updates come from m_device.statusText())
-    if (!m_device.startServer(serial, m_preferAdbForward)) {
+    if (!m_device.startServer(serial, m_preferAdbForward, m_prefs.useRoot)) {
         LOG_ERROR("Poll", "startServer failed: " + m_device.lastError());
         m_statusMessage = "Server failed: " + m_device.lastError();
         m_statusTime = std::chrono::steady_clock::now();
