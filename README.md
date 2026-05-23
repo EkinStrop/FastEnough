@@ -4,10 +4,6 @@ A Windows desktop app for high-speed file management on Android devices over USB
 
 Pre-built signed releases are published on the [Releases page](https://github.com/EkinStrop/FastEnough/releases) of this repository.
 
-> **A note before you read on.** This is a hobby project, built with significant help from AI tooling. It started as a personal answer to how painfully slow MTP is on Android, and most of the design decisions reflect a workflow I actually use, not a generic blueprint. The code is offered as-is. Bugs, rough edges, and missing features are part of the deal, and I make no promises about fixing them on any schedule.
->
-> You are welcome to take it, modify it, and adapt it to your own needs under the GPL-3.0 license. If you build on top of it, please be fair and credit the project. As far as I can tell, nobody else has put in the work to actually replace MTP on Android, and that took some real thought to get right.
-
 ![Main window](docs/screenshots/main-window.png)
 
 ## What it does
@@ -16,7 +12,7 @@ Pre-built signed releases are published on the [Releases page](https://github.co
 * Push, pull, delete, rename, mkdir, stat, CRC32 verify, and storage info.
 * Mounts an Android device as a Windows drive letter via the Dokan user-mode filesystem.
 * On-device streaming preview of MCRAW video files via the Windows Projected File System (ProjFS).
-* Multi-pipe transfers: up to 4 parallel TCP streams (2 over USB and 2 over WiFi simultaneously) for higher sustained throughput on capable devices.
+* Multi-pipe transfers: configurable USB and WiFi streams for higher sustained throughput on capable devices.
 * Connects via ADB forward by default, with an optional Direct TCP path over USB tethering.
 
 ## Architecture
