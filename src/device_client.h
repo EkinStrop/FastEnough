@@ -78,6 +78,23 @@ public:
     static bool relayFile(DeviceClient& src, DeviceClient& dst,
                           const std::string& srcPath, const std::string& dstPath,
                           uint64_t fileSize, ProgressCallback progress = nullptr);
+
+    // Pipelined range relay: reads a byte range from one device and immediately
+    // forwards the incoming chunks to another device at the matching offset.
+    struct RelayRangeStats {
+        uint64_t bytes = 0;
+        double srcRecvSec = 0.0;
+        double dstSendSec = 0.0;
+        uint32_t srcCrc = 0;
+        uint32_t dstCrc = 0;
+        bool hasSrcCrc = false;
+        bool hasDstCrc = false;
+    };
+    static bool relayRange(DeviceClient& src, DeviceClient& dst,
+                           const std::string& srcPath, const std::string& dstPath,
+                           uint64_t srcOffset, uint64_t dstOffset, uint64_t length,
+                           ProgressCallback progress = nullptr,
+                           RelayRangeStats* stats = nullptr);
     // Resume-capable transfers: pick up where a disconnected transfer left off
     bool resumePullFile(const std::string& remotePath, const std::string& localPath,
                         uint64_t& outFileSize, ProgressCallback progress = nullptr);
@@ -129,6 +146,8 @@ public:
     bool verifyFileCrc(const std::string& remotePath, const std::string& localPath, std::string& detail,
                        std::atomic<float>* crcProgress = nullptr, std::atomic<int>* crcPhase = nullptr,
                        double* remoteMs = nullptr, double* localMs = nullptr);
+    bool getRemoteCrc32(const std::string& remotePath, uint32_t& outCrc, std::string& detail,
+                        uint64_t fileSize = 0, double* remoteMs = nullptr);
 
     std::string lastError() const { return m_lastError; }
     std::string statusText() const { return m_statusText; } // current activity for UI display

@@ -13,6 +13,10 @@
 #include <chrono>
 #include <future>
 #include <cstdlib>
+#include <condition_variable>
+#include <deque>
+#include <atomic>
+#include <mutex>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -1628,6 +1632,196 @@ bool DeviceClient::relayFile(DeviceClient& src, DeviceClient& dst,
     return success;
 }
 
+bool DeviceClient::relayRange(DeviceClient& src, DeviceClient& dst,
+                              const std::string& srcPath, const std::string& dstPath,
+                              uint64_t srcOffset, uint64_t dstOffset, uint64_t length,
+                              ProgressCallback progress,
+                              RelayRangeStats* stats) {
+    if (!src.m_connected) { src.m_lastError = "Source not connected"; return false; }
+    if (!dst.m_connected) { dst.m_lastError = "Destination not connected"; return false; }
+    if (length == 0) return true;
+
+    DeviceClient* first = &src < &dst ? &src : &dst;
+    DeviceClient* second = &src < &dst ? &dst : &src;
+    std::lock_guard<std::mutex> lk1(first->m_mutex);
+    std::lock_guard<std::mutex> lk2(second->m_mutex);
+
+    std::vector<char> readPayload(16 + srcPath.size());
+    memcpy(readPayload.data(), &srcOffset, 8);
+    memcpy(readPayload.data() + 8, &length, 8);
+    memcpy(readPayload.data() + 16, srcPath.data(), srcPath.size());
+
+    if (!src.sendMsg(CMD_READ_RANGE, readPayload.data(), (uint32_t)readPayload.size())) {
+        src.m_lastError = "Failed to send CMD_READ_RANGE";
+        return false;
+    }
+
+    MsgHeader srcHdr; std::vector<char> srcResp;
+    if (!src.recvMsg(srcHdr, srcResp)) { src.m_lastError = "No response to CMD_READ_RANGE"; return false; }
+    if (srcHdr.cmd == RSP_ERROR) {
+        src.m_lastError = std::string(srcResp.data(), srcResp.size());
+        return false;
+    }
+    if (srcHdr.cmd != RSP_OK || srcResp.size() < 8) {
+        src.m_lastError = "Unexpected response to CMD_READ_RANGE";
+        return false;
+    }
+
+    uint64_t actualLen = 0;
+    memcpy(&actualLen, srcResp.data(), 8);
+    actualLen = std::min(actualLen, length);
+    if (actualLen == 0) return true;
+
+    std::vector<char> writePayload(16 + dstPath.size());
+    memcpy(writePayload.data(), &dstOffset, 8);
+    memcpy(writePayload.data() + 8, &actualLen, 8);
+    memcpy(writePayload.data() + 16, dstPath.data(), dstPath.size());
+
+    if (!dst.sendMsg(CMD_WRITE_RANGE, writePayload.data(), (uint32_t)writePayload.size())) {
+        dst.m_lastError = "Failed to send CMD_WRITE_RANGE";
+        while (src.recvAll(&srcHdr, sizeof(srcHdr))) {
+            if (srcHdr.cmd == RSP_DONE) break;
+            if (srcHdr.cmd != RSP_DATA || srcHdr.length == 0) break;
+            std::vector<char> drain(srcHdr.length);
+            if (!src.recvAll(drain.data(), srcHdr.length)) break;
+        }
+        return false;
+    }
+
+    MsgHeader dstHdr; std::vector<char> dstResp;
+    if (!dst.recvMsg(dstHdr, dstResp)) {
+        dst.m_lastError = "No response to CMD_WRITE_RANGE";
+        return false;
+    }
+    if (dstHdr.cmd == RSP_ERROR) {
+        dst.m_lastError = std::string(dstResp.data(), dstResp.size());
+        return false;
+    }
+    if (dstHdr.cmd != RSP_OK) {
+        dst.m_lastError = "Destination rejected CMD_WRITE_RANGE";
+        return false;
+    }
+
+    const size_t bufSize = AFM_CHUNK_SIZE + sizeof(MsgHeader);
+    std::vector<char> bufA(bufSize), bufB(bufSize);
+    char* recvBuf = bufA.data();
+    std::future<std::pair<bool, double>> sendFut;
+    uint32_t inFlightLen = 0;
+    bool success = true;
+    uint64_t relayed = 0;
+    uint64_t sentToDst = 0;
+    uint32_t srcRangeCrc = ~(uint32_t)0;
+
+    auto finishSend = [&]() -> bool {
+        if (!sendFut.valid()) return true;
+        auto result = sendFut.get();
+        if (stats) stats->dstSendSec += result.second;
+        if (!result.first) {
+            dst.m_lastError = "send range data failed";
+            return false;
+        }
+        sentToDst += inFlightLen;
+        if (progress && !progress(sentToDst, actualLen)) {
+            src.m_lastError = "Cancelled";
+            return false;
+        }
+        inFlightLen = 0;
+        return true;
+    };
+
+    while (success) {
+        auto recvStart = std::chrono::steady_clock::now();
+        if (!src.recvAll(&srcHdr, sizeof(srcHdr))) {
+            success = false;
+            src.m_lastError = "recv range header failed";
+            break;
+        }
+
+        if (srcHdr.cmd == RSP_DONE) break;
+        if (srcHdr.cmd != RSP_DATA || srcHdr.length == 0 || srcHdr.length > AFM_CHUNK_SIZE) {
+            success = false;
+            src.m_lastError = "unexpected response in range relay";
+            break;
+        }
+
+        if (!src.recvAll(recvBuf + sizeof(MsgHeader), srcHdr.length)) {
+            success = false;
+            src.m_lastError = "recv range data failed";
+            break;
+        }
+        if (stats) {
+            stats->srcRecvSec += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - recvStart).count();
+        }
+        crc32Update(srcRangeCrc, recvBuf + sizeof(MsgHeader), srcHdr.length);
+
+        if (!finishSend()) {
+            success = false;
+            break;
+        }
+
+        MsgHeader* fwdHdr = (MsgHeader*)recvBuf;
+        fwdHdr->cmd = RSP_DATA;
+        fwdHdr->length = srcHdr.length;
+        relayed += srcHdr.length;
+
+        char* sendBuf = recvBuf;
+        uint32_t sendLen = sizeof(MsgHeader) + srcHdr.length;
+        inFlightLen = srcHdr.length;
+        sendFut = std::async(std::launch::async, [&dst, sendBuf, sendLen]() {
+            auto sendStart = std::chrono::steady_clock::now();
+            bool ok = dst.sendAll(sendBuf, sendLen);
+            double sendSec = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - sendStart).count();
+            return std::make_pair(ok, sendSec);
+        });
+        recvBuf = (recvBuf == bufA.data()) ? bufB.data() : bufA.data();
+    }
+
+    if (!finishSend())
+        success = false;
+
+    dst.sendMsg(RSP_DONE);
+
+    if (dst.recvMsg(dstHdr, dstResp)) {
+        if (success && dstHdr.cmd == RSP_ERROR) {
+            dst.m_lastError = std::string(dstResp.data(), dstResp.size());
+            success = false;
+        } else if (success && dstHdr.cmd == RSP_OK && dstResp.size() >= 12 && stats) {
+            uint64_t dstWritten = 0;
+            uint32_t dstCrc = 0;
+            memcpy(&dstWritten, dstResp.data(), 8);
+            memcpy(&dstCrc, dstResp.data() + 8, 4);
+            if (dstWritten >= actualLen) {
+                stats->dstCrc = dstCrc;
+                stats->hasDstCrc = true;
+            }
+        }
+    } else if (success) {
+        dst.m_lastError = "No write confirmation";
+        success = false;
+    }
+
+    if (!success && src.m_connected) {
+        while (src.recvAll(&srcHdr, sizeof(srcHdr))) {
+            if (srcHdr.cmd == RSP_DONE) break;
+            if (srcHdr.cmd != RSP_DATA || srcHdr.length == 0) break;
+            std::vector<char> drain(srcHdr.length);
+            if (!src.recvAll(drain.data(), srcHdr.length)) break;
+        }
+    }
+
+    if (stats) {
+        stats->bytes += sentToDst;
+        if (success && sentToDst >= actualLen && relayed >= actualLen) {
+            stats->srcCrc = ~srcRangeCrc;
+            stats->hasSrcCrc = true;
+        }
+    }
+
+    return success && sentToDst >= actualLen && relayed >= actualLen;
+}
+
 bool DeviceClient::getDiskSpace(uint64_t& totalBytes, uint64_t& freeBytes) {
     if (!m_connected) { m_lastError = "Not connected"; return false; }
     MsgHeader hdr; std::vector<char> payload;
@@ -1665,10 +1859,17 @@ uint64_t DeviceClient::writeRange(const std::string& remotePath, uint64_t offset
     }
     if (hdr.cmd != RSP_OK) return 0;
 
-    // Send data as RSP_DATA
-    MsgHeader dataHdr = { RSP_DATA, length };
-    if (!sendAll(&dataHdr, sizeof(dataHdr))) return 0;
-    if (!sendAll(data, length)) return 0;
+    // Send data as protocol-sized RSP_DATA chunks. Some servers close the
+    // connection when a single data frame is much larger than AFM_CHUNK_SIZE.
+    const char* p = (const char*)data;
+    uint64_t sent = 0;
+    while (sent < len64) {
+        uint32_t chunkLen = (uint32_t)std::min<uint64_t>(AFM_CHUNK_SIZE, len64 - sent);
+        MsgHeader dataHdr = { RSP_DATA, chunkLen };
+        if (!sendAll(&dataHdr, sizeof(dataHdr))) return 0;
+        if (!sendAll(p + sent, chunkLen)) return 0;
+        sent += chunkLen;
+    }
 
     // Send RSP_DONE
     if (!sendMsg(RSP_DONE)) return 0;
@@ -2081,26 +2282,26 @@ bool DeviceClient::resumePushFile(const std::string& localPath, const std::strin
 
 // CRC32 — slicing-by-8 for ~4-8x speedup over byte-by-byte
 static uint32_t g_crc32Table[8][256];
-static bool g_crc32Init = false;
+static std::once_flag g_crc32InitFlag;
 
 static void initCrc32Table() {
-    if (g_crc32Init) return;
-    // Build base table (slice 0)
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int j = 0; j < 8; j++)
-            c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
-        g_crc32Table[0][i] = c;
-    }
-    // Build extended tables (slices 1-7)
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = g_crc32Table[0][i];
-        for (int s = 1; s < 8; s++) {
-            c = g_crc32Table[0][c & 0xFF] ^ (c >> 8);
-            g_crc32Table[s][i] = c;
+    std::call_once(g_crc32InitFlag, []() {
+        // Build base table (slice 0)
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; j++)
+                c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+            g_crc32Table[0][i] = c;
         }
-    }
-    g_crc32Init = true;
+        // Build extended tables (slices 1-7)
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = g_crc32Table[0][i];
+            for (int s = 1; s < 8; s++) {
+                c = g_crc32Table[0][c & 0xFF] ^ (c >> 8);
+                g_crc32Table[s][i] = c;
+            }
+        }
+    });
 }
 
 // Slicing-by-8: processes 8 bytes per iteration
@@ -2283,6 +2484,58 @@ bool DeviceClient::verifyFileCrc(const std::string& remotePath, const std::strin
              " (remote=" + std::to_string((int)remoteDur) + "ms local=" + std::to_string((int)localDur) + "ms)");
 
     return localCrc == remoteCrc;
+}
+
+bool DeviceClient::getRemoteCrc32(const std::string& remotePath, uint32_t& outCrc, std::string& detail,
+                                  uint64_t fileSize, double* remoteMs) {
+    if (!m_connected) { detail = "Not connected"; return false; }
+
+    DWORD crcTimeout = 30000 + (DWORD)(fileSize / (100ULL * 1024 * 1024)) * 1000;
+    if (crcTimeout > 300000) crcTimeout = 300000;
+    LOG_INFO("CRC", "getRemoteCrc32: " + remotePath + " (size=" + std::to_string(fileSize) +
+             " timeout=" + std::to_string(crcTimeout) + "ms)");
+
+    auto remoteStart = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        SOCKET sock = (SOCKET)m_socket;
+        DWORD origTimeout = 10000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&crcTimeout, sizeof(crcTimeout));
+
+        if (!sendMsg(CMD_CRC32, remotePath.data(), (uint32_t)remotePath.size())) {
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+            detail = "Failed to request remote CRC";
+            LOG_ERROR("CRC", detail);
+            return false;
+        }
+
+        MsgHeader hdr; std::vector<char> payload;
+        if (!recvMsg(hdr, payload)) {
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+            detail = "Failed to receive remote CRC";
+            LOG_ERROR("CRC", detail + " (timeout was " + std::to_string(crcTimeout) + "ms)");
+            return false;
+        }
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+
+        if (hdr.cmd == RSP_ERROR) {
+            detail = "Server error: " + std::string(payload.data(), payload.size());
+            LOG_ERROR("CRC", detail);
+            return false;
+        }
+        if (hdr.cmd != RSP_OK || payload.size() < 4) {
+            detail = "Invalid CRC response";
+            return false;
+        }
+        memcpy(&outCrc, payload.data(), 4);
+    }
+
+    auto remoteEnd = std::chrono::steady_clock::now();
+    double remoteDur = std::chrono::duration<double, std::milli>(remoteEnd - remoteStart).count();
+    if (remoteMs) *remoteMs = remoteDur;
+    detail = "Remote: " + std::to_string(outCrc);
+    LOG_INFO("CRC", "Remote CRC: " + std::to_string(outCrc) + " (" + std::to_string((int)remoteDur) + "ms)");
+    return true;
 }
 
 bool DeviceClient::deleteFile(const std::string& path) {

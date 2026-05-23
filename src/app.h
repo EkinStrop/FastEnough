@@ -114,6 +114,8 @@ struct TransferBatch {
         std::string channelName;
         std::string currentFile;
         std::atomic<double> elapsedSec{0.0};
+        std::atomic<double> relayReadSec{0.0};
+        std::atomic<double> relaySendSec{0.0};
         std::atomic<uint64_t> curBlockSize{0};        // size of current block being transferred
         std::atomic<uint64_t> curBlockTransferred{0}; // bytes done in current block
     };
@@ -294,8 +296,8 @@ struct AppPreferences {
     std::vector<SavedWifiDevice> savedWifiDevices;
     bool enableMultiNic = false;
     std::vector<NicBinding> multiNicBindings;
-    int usbPipeCount = 2;   // 1 = single, 2 = dual ADB forward pipes (2x USB throughput)
-    int wifiPipeCount = 1;  // 1 = single, 2 = dual WiFi TCP connections
+    int usbPipeCount = 4;   // 1-4 ADB forward pipes
+    int wifiPipeCount = 4;  // 1-4 WiFi TCP connections
     bool useRoot = false;   // launch the on-device server via `su -c` for restricted-path access
 
     void save();
@@ -544,6 +546,10 @@ private:
     std::string m_asyncStatus; // shown in status bar while async action runs
     void asyncWorkerLoop();
     void postAsync(const std::string& statusMsg, std::function<void()> action);
+    bool selectDeviceBySerial(const std::string& serial, const std::vector<DeviceInfo>* refreshedDevices = nullptr);
+    bool refreshDeviceListAndSelect(const std::string& serial, int attempts = 6, int delayMs = 250);
+    void connectDeviceBySerialNow(const std::string& serial);
+    void addKnownPrimarySerials(std::set<std::string>& serials, const std::string& serial) const;
 
     // Panel screen bounds (updated each frame for external drop targeting)
     ImVec2 m_leftPanelMin, m_leftPanelMax;

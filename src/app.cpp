@@ -15,6 +15,7 @@
 #include <ctime>
 #include <iomanip>
 #include <cctype>
+#include <cmath>
 #include <fstream>
 #include <set>
 #include <mutex>
@@ -764,6 +765,7 @@ void AppPreferences::save() {
         f << "wifiDevice=" << w.serial << "|" << w.wifiIp << "|" << w.port << "|" << (w.autoConnect ? 1 : 0) << "|" << w.model << "\n";
     }
     f << "enableMultiNic=" << (enableMultiNic ? 1 : 0) << "\n";
+    f << "pipeSettingsV2=1\n";
     f << "usbPipeCount=" << usbPipeCount << "\n";
     f << "wifiPipeCount=" << wifiPipeCount << "\n";
     f << "useRoot=" << (useRoot ? 1 : 0) << "\n";
@@ -778,6 +780,7 @@ void AppPreferences::load() {
     std::ifstream f(path);
     if (!f) return;
     std::string line;
+    bool pipeSettingsV2 = false;
     while (std::getline(f, line)) {
         if (line.find("restartAdbOnLaunch=") == 0)
             restartAdbOnLaunch = (line.back() == '1');
@@ -811,10 +814,12 @@ void AppPreferences::load() {
         }
         else if (line.find("enableMultiNic=") == 0)
             enableMultiNic = (line.back() == '1');
+        else if (line.find("pipeSettingsV2=") == 0)
+            pipeSettingsV2 = (line.back() == '1');
         else if (line.find("usbPipeCount=") == 0)
-            usbPipeCount = std::clamp(std::stoi(line.substr(13)), 1, 2);
+            usbPipeCount = std::clamp(std::stoi(line.substr(13)), 1, 4);
         else if (line.find("wifiPipeCount=") == 0)
-            wifiPipeCount = std::clamp(std::stoi(line.substr(14)), 1, 2);
+            wifiPipeCount = std::clamp(std::stoi(line.substr(14)), 1, 4);
         else if (line.find("useRoot=") == 0)
             useRoot = (line.substr(8) == "1");
         else if (line.find("nicBinding=") == 0) {
@@ -827,6 +832,13 @@ void AppPreferences::load() {
             nb.enabled = (val[p2+1] == '1');
             multiNicBindings.push_back(std::move(nb));
         }
+    }
+
+    // Older builds only allowed up to 2 pipes. Treat the old maximum as
+    // "high speed" and migrate it to the new maximum once.
+    if (!pipeSettingsV2) {
+        if (usbPipeCount == 2) usbPipeCount = 4;
+        if (wifiPipeCount == 2) wifiPipeCount = 4;
     }
 }
 
@@ -1023,6 +1035,53 @@ void App::postAsync(const std::string& statusMsg, std::function<void()> action) 
         m_asyncQueue.push_back(std::move(action));
     }
     m_asyncCV.notify_one();
+}
+
+bool App::selectDeviceBySerial(const std::string& serial, const std::vector<DeviceInfo>* refreshedDevices) {
+    if (serial.empty()) return false;
+    std::lock_guard<std::mutex> lk(m_deviceMutex);
+    if (refreshedDevices) m_devices = *refreshedDevices;
+    for (int i = 0; i < (int)m_devices.size(); i++) {
+        if (m_devices[i].serial == serial && m_devices[i].state == "device") {
+            m_selectedDevice = i;
+            m_lastDeviceSerial.clear();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool App::refreshDeviceListAndSelect(const std::string& serial, int attempts, int delayMs) {
+    for (int attempt = 0; attempt < attempts && !m_shutdownPoll; attempt++) {
+        auto devices = m_device.getDevices();
+        if (selectDeviceBySerial(serial, &devices)) return true;
+        if (attempt + 1 < attempts)
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+    }
+    return false;
+}
+
+void App::connectDeviceBySerialNow(const std::string& serial) {
+    if (serial.empty()) return;
+    if (!refreshDeviceListAndSelect(serial) && !selectDeviceBySerial(serial)) {
+        m_statusMessage = "Device not available: " + serial;
+        m_statusTime = std::chrono::steady_clock::now();
+        return;
+    }
+    onDeviceChanged();
+}
+
+void App::addKnownPrimarySerials(std::set<std::string>& serials, const std::string& serial) const {
+    if (serial.empty()) return;
+    serials.insert(serial);
+    for (const auto& w : m_prefs.savedWifiDevices) {
+        if (w.wifiIp.empty()) continue;
+        std::string wifiSerial = w.wifiIp + ":" + std::to_string(w.port);
+        if (w.serial == serial || wifiSerial == serial) {
+            if (!w.serial.empty()) serials.insert(w.serial);
+            serials.insert(wifiSerial);
+        }
+    }
 }
 
 void App::setupStyle() {
@@ -1779,8 +1838,14 @@ void App::renderMenuBar() {
                                 std::string ip = w.wifiIp;
                                 int port = w.port;
                                 postAsync("Connecting WiFi...", [this, ip, port]() {
-                                    std::string result = m_device.runAdbCommand("connect " + ip + ":" + std::to_string(port));
-                                    m_statusMessage = result;
+                                    std::string connectAddr = ip + ":" + std::to_string(port);
+                                    std::string result = m_device.runAdbCommand("connect " + connectAddr);
+                                    if (result.find("connected") != std::string::npos &&
+                                        result.find("failed") == std::string::npos) {
+                                        connectDeviceBySerialNow(connectAddr);
+                                    } else {
+                                        m_statusMessage = result;
+                                    }
                                     m_statusTime = std::chrono::steady_clock::now();
                                 });
                             }
@@ -1925,9 +1990,15 @@ void App::renderDeviceBar() {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,0.5f,0.5f,1));
                     }
                     if (ImGui::Selectable(label.c_str(), i == selSnap)) {
+                        std::string selectedSerial = devSnap[i].serial;
                         std::lock_guard<std::mutex> lk(m_deviceMutex);
                         m_selectedDevice = i;
                         m_lastDeviceSerial.clear(); // force re-detection
+                        if (devSnap[i].state == "device") {
+                            postAsync("Connecting to " + selectedSerial + "...", [this, selectedSerial]() {
+                                connectDeviceBySerialNow(selectedSerial);
+                            });
+                        }
                     }
                     if (devSnap[i].state != "device") ImGui::PopStyleColor();
                 }
@@ -1959,26 +2030,47 @@ void App::renderDeviceBar() {
                     ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "Connecting...");
                 }
 
-                // Pipe toggles — directly visible for quick tuning
+                auto drawPipeSelector = [&](const char* label, const char* id, int& value) -> bool {
+                    bool changed = false;
+                    ImGui::TextUnformatted(label);
+                    for (int pipes = 1; pipes <= 4; pipes++) {
+                        ImGui::SameLine(0, 3);
+                        bool selected = (value == pipes);
+                        if (selected) {
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.45f, 0.25f, 1));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.55f, 0.30f, 1));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.25f, 0.65f, 0.35f, 1));
+                        }
+                        std::string btn = "x" + std::to_string(pipes) + "##" + id + std::to_string(pipes);
+                        if (ImGui::SmallButton(btn.c_str()) && value != pipes) {
+                            value = pipes;
+                            changed = true;
+                        }
+                        if (selected) ImGui::PopStyleColor(3);
+                    }
+                    return changed;
+                };
+
+                // Pipe controls, directly visible for quick tuning
                 ImGui::SameLine(0, 16);
                 {
-                    bool usbDual = (m_prefs.usbPipeCount == 2);
-                    if (ImGui::Checkbox("USB x2##devbar", &usbDual)) {
-                        m_prefs.usbPipeCount = usbDual ? 2 : 1;
+                    if (drawPipeSelector("USB", "usbdevbar", m_prefs.usbPipeCount)) {
                         m_prefs.save();
+                        m_statusMessage = "USB pipes: x" + std::to_string(m_prefs.usbPipeCount);
+                        m_statusTime = std::chrono::steady_clock::now();
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("USB dual-pipe: two parallel ADB connections\nfor ~2x USB throughput (USB 3.x recommended).\nApplies on next device reconnect.");
+                        ImGui::SetTooltip("Parallel ADB connections over USB. Higher values can improve throughput on fast devices.\nApplies on next device reconnect or transfer channel setup.");
                 }
                 ImGui::SameLine(0, 8);
                 {
-                    bool wifiDual = (m_prefs.wifiPipeCount == 2);
-                    if (ImGui::Checkbox("WiFi x2##devbar", &wifiDual)) {
-                        m_prefs.wifiPipeCount = wifiDual ? 2 : 1;
+                    if (drawPipeSelector("WiFi", "wifidevbar", m_prefs.wifiPipeCount)) {
                         m_prefs.save();
+                        m_statusMessage = "WiFi pipes: x" + std::to_string(m_prefs.wifiPipeCount);
+                        m_statusTime = std::chrono::steady_clock::now();
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("WiFi dual-pipe: two parallel TCP connections\nfor ~2x WiFi throughput (WiFi 6/7 recommended).\nApplies on next device reconnect.");
+                        ImGui::SetTooltip("Parallel direct TCP connections over WiFi. Higher values can help WiFi 6/7 devices.\nApplies on next device reconnect or transfer channel setup.");
                 }
 
                 // Root mode toggle — relaunches the on-device server via `su -c`
@@ -2181,9 +2273,13 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
                     }
                     if (ImGui::SmallButton(label.c_str())) {
+                        std::string selectedSerial = m_devices[i].serial;
                         m_selectedDevice = i;
                         m_lastDeviceSerial.clear();
                         panel.needsRefresh = true;
+                        postAsync("Connecting to " + selectedSerial + "...", [this, selectedSerial]() {
+                            connectDeviceBySerialNow(selectedSerial);
+                        });
                     }
                     if (isSel) ImGui::PopStyleColor(2);
                 }
@@ -2234,6 +2330,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                                     m_prefs.save();
                                 }
                             }
+                            connectDeviceBySerialNow(connectAddr);
                         } else {
                             m_statusMessage = "Connect failed: " + result;
                         }
@@ -2384,6 +2481,31 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                     }
                     return m_slotSerial[slot];
                 };
+                auto channelBadgeText = [&](int slot) -> const char* {
+                    if (slot == 0 && m_dualChannelAvailable && m_activeChannelCount > 1) return "dual";
+                    if (slot >= 0 && slot < 2 && m_slotConnected[slot] &&
+                        (m_prefs.usbPipeCount > 1 || m_prefs.wifiPipeCount > 1)) return "multi";
+                    return "single";
+                };
+                auto channelBadgeColor = [&](int slot) -> ImVec4 {
+                    if ((slot == 0 && m_dualChannelAvailable && m_activeChannelCount > 1) ||
+                        (slot >= 0 && slot < 2 && m_slotConnected[slot] &&
+                         (m_prefs.usbPipeCount > 1 || m_prefs.wifiPipeCount > 1)))
+                        return ImVec4(0.25f, 0.80f, 0.35f, 1.0f);
+                    return ImVec4(0.95f, 0.65f, 0.25f, 1.0f);
+                };
+                auto showChannelTooltip = [&](int slot) {
+                    if (slot == 0 && m_dualChannelAvailable && m_activeChannelCount > 1) {
+                        ImGui::SetTooltip("%d transfer channels available for this device", m_activeChannelCount);
+                    } else if (slot >= 0 && slot < 2 && m_slotConnected[slot] &&
+                               (m_prefs.usbPipeCount > 1 || m_prefs.wifiPipeCount > 1)) {
+                        ImGui::SetTooltip("Extra transfer channels will be opened for this device when a transfer starts");
+                    } else if (slot == 0) {
+                        ImGui::SetTooltip("Single-channel transfer for this device");
+                    } else {
+                        ImGui::SetTooltip("Secondary devices use a separate single-channel connection");
+                    }
+                };
 
                 // Slot colors for visual distinction between devices
                 static const ImVec4 slotColors[] = {
@@ -2417,7 +2539,8 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                                 bool isSel = (panel.deviceSlot == di);
                                 std::string devName = getSlotName(di);
                                 // Show serial in parentheses for disambiguation, unique ImGui ID per slot
-                                std::string fullLabel = devName + "  (" + m_slotSerial[di] + ")##slot" + std::to_string(di);
+                                std::string fullLabel = devName + "  (" + m_slotSerial[di] + ")  [" +
+                                    channelBadgeText(di) + "]##slot" + std::to_string(di);
 
                                 ImVec4 itemColor = slotColors[di < 2 ? di : 0];
                                 if (isSel) ImGui::PushStyleColor(ImGuiCol_Text, itemColor);
@@ -2442,6 +2565,9 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                         // Single device: show name as colored label
                         ImGui::TextColored(slotColor, "%s", currentName.c_str());
                     }
+                    ImGui::SameLine(0, 6);
+                    ImGui::TextColored(channelBadgeColor(slotIdx), "%s", channelBadgeText(slotIdx));
+                    if (ImGui::IsItemHovered()) showChannelTooltip(slotIdx);
                 }
             }
         }
@@ -2932,6 +3058,41 @@ void App::renderTransferOverlay() {
     double eta    = batch->etaSeconds.load();
     int curIdx    = batch->currentFileIndex.load();
     int totalFiles = batch->totalFiles();
+    if (totalBytes > 0 && totalTx > totalBytes) totalTx = totalBytes;
+    totalProg = std::clamp(totalProg, 0.0f, 1.0f);
+    curFileProg = std::clamp(curFileProg, 0.0f, 1.0f);
+
+    static const TransferBatch* smoothedBatch = nullptr;
+    static double displayedTotalTxD = 0.0;
+    static double displayedLastFrameTime = 0.0;
+    double nowTime = ImGui::GetTime();
+    if (smoothedBatch != batch.get() || st == BatchState::Queued) {
+        smoothedBatch = batch.get();
+        displayedTotalTxD = (double)totalTx;
+        displayedLastFrameTime = nowTime;
+    } else if (st == BatchState::Completed) {
+        displayedTotalTxD = (double)totalBytes;
+    } else {
+        double dt = std::clamp(nowTime - displayedLastFrameTime, 0.0, 0.25);
+        displayedLastFrameTime = nowTime;
+        double targetTx = (double)totalTx;
+        if (totalBytes > 0 && totalTx >= totalBytes && st != BatchState::Completed)
+            targetTx = (double)totalBytes * 0.995;
+        if (targetTx >= displayedTotalTxD) {
+            double minRate = 64.0 * 1024.0 * 1024.0;
+            double catchupRate = totalBytes > 0 ? (double)totalBytes * 0.04 : minRate;
+            double maxStep = std::max(minRate, catchupRate) * dt;
+            displayedTotalTxD += std::min(targetTx - displayedTotalTxD, maxStep);
+        } else {
+            displayedTotalTxD = targetTx;
+        }
+    }
+    if (displayedTotalTxD < 0.0) displayedTotalTxD = 0.0;
+    if (totalBytes > 0 && displayedTotalTxD > (double)totalBytes) displayedTotalTxD = (double)totalBytes;
+    uint64_t totalDisplayTx = (uint64_t)std::round(displayedTotalTxD);
+    float totalDisplayProg = totalBytes > 0
+        ? (float)std::clamp(displayedTotalTxD / (double)totalBytes, 0.0, 1.0)
+        : totalProg;
     std::string verb = batch->isMove ? "Move" : "Copy";
     std::string direction;
     if (batch->isCrossDevice)
@@ -2942,15 +3103,23 @@ void App::renderTransferOverlay() {
         direction = verb + ": Android -> Windows";
     else
         direction = verb + ": Windows -> Android";
+    int transferDeviceSlot = -1;
+    if (!batch->isLocalCopy && !batch->isCrossDevice)
+        transferDeviceSlot = batch->isPull ? batch->srcDeviceSlot : batch->dstDeviceSlot;
     if (batch->useMultiNic)
         direction += " [" + std::to_string(batch->numChannels) + " NICs]";
     else if (batch->useParallelChannels)
-        direction += " [dual channel]";
+        direction += " [" + std::to_string(batch->numChannels) + " channels]";
+    else if (transferDeviceSlot >= 0)
+        direction += " [single channel]";
 
     // Header
     ImGui::TextColored(ImVec4(0.5f,0.7f,1,1), "%s", direction.c_str());
     ImGui::SameLine();
     if (queueSize > 1) ImGui::TextDisabled("(%d batches queued)", queueSize);
+    if (transferDeviceSlot > 0 && !batch->useParallelChannels && !batch->useMultiNic) {
+        ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.25f, 1), "Secondary device, single channel");
+    }
 
     ImGui::Separator();
 
@@ -3035,6 +3204,8 @@ void App::renderTransferOverlay() {
         // Per-channel summary for parallel transfers
         if ((batch->useParallelChannels || batch->useMultiNic) && batch->numChannels > 1) {
             ImGui::Spacing();
+            if (batch->isCrossDevice)
+                ImGui::TextDisabled("  Effective speed is shown in the green total bar. Rows below show per-channel relay throughput.");
             int nCh = batch->numChannels;
             for (int ch = 0; ch < nCh; ch++) {
                 auto& cp = batch->channels[ch];
@@ -3052,7 +3223,7 @@ void App::renderTransferOverlay() {
         snprintf(totalOvl, sizeof(totalOvl), "%s / %s  -  %s",
                  formatSize(totalTx).c_str(), formatSize(totalBytes).c_str(),
                  st == BatchState::Stopped ? "Stopped" : "Failed");
-        drawProgressBar(totalProg, totalOvl, 22.0f,
+        drawProgressBar(totalDisplayProg, totalOvl, 22.0f,
                         ImVec4(0.7f,0.2f,0.2f,0.9f), ImVec4(0.04f,0.04f,0.06f,1));
     } else if (st == BatchState::Verifying) {
         // Transfer done, CRC verification in progress — two phases
@@ -3079,14 +3250,19 @@ void App::renderTransferOverlay() {
                             ImVec4(0.5f,0.4f,0.9f,0.9f), ImVec4(0.04f,0.04f,0.06f,1));
         }
     } else {
-        std::string etaStr = (eta > 0) ? ("  ETA: " + formatETA(eta)) : "";
-        std::string speedStr = formatSpeed(speed);
-
-        // For push with no estimate: show animated total bar too
-        snprintf(totalOvl, sizeof(totalOvl), "%s / %s  (%.1f%%)  -  %s%s",
-                 formatSize(totalTx).c_str(), formatSize(totalBytes).c_str(),
-                 totalProg * 100.0f, speedStr.c_str(), etaStr.c_str());
-        float barFrac = totalProg;
+        bool showStableTotalOnly = batch->isCrossDevice || batch->useParallelChannels || batch->useMultiNic;
+        if (showStableTotalOnly) {
+            snprintf(totalOvl, sizeof(totalOvl), "%s / %s  (%.1f%%)",
+                     formatSize(totalDisplayTx).c_str(), formatSize(totalBytes).c_str(),
+                     totalDisplayProg * 100.0f);
+        } else {
+            std::string etaStr = (eta > 0) ? ("  ETA: " + formatETA(eta)) : "";
+            std::string speedStr = formatSpeed(speed);
+            snprintf(totalOvl, sizeof(totalOvl), "%s / %s  (%.1f%%)  -  %s%s",
+                     formatSize(totalDisplayTx).c_str(), formatSize(totalBytes).c_str(),
+                     totalDisplayProg * 100.0f, speedStr.c_str(), etaStr.c_str());
+        }
+        float barFrac = totalDisplayProg;
         ImVec4 barCol;
         if (batch->disconnected.load()) barCol = ImVec4(0.8f,0.4f,0.1f,0.9f); // orange when disconnected
         else if (st == BatchState::Paused || st == BatchState::WaitingConflict) barCol = ImVec4(0.7f,0.6f,0.1f,0.9f);
@@ -3905,6 +4081,7 @@ void App::renderWifiPairingDialog() {
                         m_prefs.savedWifiDevices.push_back(saved);
                         m_prefs.save();
                         m_statusMessage = "Connected via WiFi: " + connectAddr;
+                        connectDeviceBySerialNow(connectAddr);
                     } else {
                         m_statusMessage = "Connect failed: " + result;
                     }
@@ -3946,11 +4123,31 @@ void App::renderCrossDeviceDialog() {
         bool dokanAvailable = m_pendingBatch &&
             DeviceMountManager::instance(m_pendingBatch->srcDeviceSlot).isMounted();
 
-        // Dokan streaming option
-        ImGui::BeginDisabled(!dokanAvailable);
+        // Fast PC relay option
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
-        if (ImGui::Button("Stream via Dokan", ImVec2(250, 0))) {
+        if (ImGui::Button("Fast via PC (multi-channel)", ImVec2(250, 0))) {
+            m_pendingBatch->useDokanRelay = false;
+            {
+                std::lock_guard<std::mutex> lk(m_batchMutex);
+                m_batchQueue.push_back(m_pendingBatch);
+            }
+            m_batchCV.notify_one();
+            m_overlayWasOpen = false;
+            m_pendingBatch.reset();
+            m_showCrossDeviceDialog = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::TextDisabled("  Streams chunks through the PC and uses\n  available USB and WiFi channels.");
+
+        ImGui::Spacing();
+
+        // Compatibility streaming option
+        ImGui::BeginDisabled(!dokanAvailable);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.25f, 0.30f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.35f, 0.35f, 0.42f, 1));
+        if (ImGui::Button("Compatibility stream", ImVec2(250, 0))) {
             m_pendingBatch->useDokanRelay = true;
             {
                 std::lock_guard<std::mutex> lk(m_batchMutex);
@@ -3965,29 +4162,9 @@ void App::renderCrossDeviceDialog() {
         ImGui::PopStyleColor(2);
         ImGui::EndDisabled();
         if (dokanAvailable)
-            ImGui::TextDisabled("  Streams directly from device A to B through PC.\n  No temp files. Requires Dokan mount.");
+            ImGui::TextDisabled("  Single stream through the PC.\n  Use only if fast mode has trouble.");
         else
-            ImGui::TextDisabled("  Not available — mount device A via Dokan first\n  (Connection > Mount as Drive).");
-
-        ImGui::Spacing();
-
-        // Temp relay option
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f, 0.35f, 0.10f, 1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.50f, 0.15f, 1));
-        if (ImGui::Button("Relay via PC (temp file)", ImVec2(250, 0))) {
-            m_pendingBatch->useDokanRelay = false;
-            {
-                std::lock_guard<std::mutex> lk(m_batchMutex);
-                m_batchQueue.push_back(m_pendingBatch);
-            }
-            m_batchCV.notify_one();
-            m_overlayWasOpen = false;
-            m_pendingBatch.reset();
-            m_showCrossDeviceDialog = false;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::PopStyleColor(2);
-        ImGui::TextDisabled("  Pulls from device A to PC temp folder,\n  then pushes to device B. Always works.");
+            ImGui::TextDisabled("  Not available, mount device A via Dokan first\n  (Connection > Mount as Drive).");
 
         ImGui::EndPopup();
     }
@@ -4158,31 +4335,47 @@ void App::renderPreferencesWindow() {
     ImGui::TextColored(ImVec4(1,0.85f,0.4f,1), "Transfer Channels");
     ImGui::Spacing();
 
-    {
-        bool usbDual = (m_prefs.usbPipeCount == 2);
-        if (ImGui::Checkbox("USB dual-pipe (2x USB throughput)", &usbDual)) {
-            m_prefs.usbPipeCount = usbDual ? 2 : 1;
-            changed = true;
+    auto drawPipeSelector = [&](const char* label, const char* id, int& value) -> bool {
+        bool changed = false;
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine(120.0f);
+        for (int pipes = 1; pipes <= 4; pipes++) {
+            if (pipes > 1) ImGui::SameLine(0, 6);
+            bool selected = (value == pipes);
+            if (selected) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.45f, 0.25f, 1));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.55f, 0.30f, 1));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.25f, 0.65f, 0.35f, 1));
+            }
+            std::string btn = "x" + std::to_string(pipes) + "##" + id + std::to_string(pipes);
+            if (ImGui::Button(btn.c_str(), ImVec2(44.0f, 0.0f)) && value != pipes) {
+                value = pipes;
+                changed = true;
+            }
+            if (selected) ImGui::PopStyleColor(3);
         }
-        ImGui::TextDisabled("  Two parallel ADB connections through USB.");
-        ImGui::TextDisabled("  Best for USB 3.x. Disable for USB 2.0 devices.");
+        return changed;
+    };
+
+    {
+        if (drawPipeSelector("USB pipes", "usbpref", m_prefs.usbPipeCount))
+            changed = true;
+        ImGui::TextDisabled("  Parallel ADB connections through USB. Range: 1 to 4.");
+        ImGui::TextDisabled("  Best for USB 3.x. Use lower values if a device becomes unstable.");
     }
 
     ImGui::Spacing();
 
     {
-        bool wifiDual = (m_prefs.wifiPipeCount == 2);
-        if (ImGui::Checkbox("WiFi dual-pipe (2x WiFi throughput)", &wifiDual)) {
-            m_prefs.wifiPipeCount = wifiDual ? 2 : 1;
+        if (drawPipeSelector("WiFi pipes", "wifipref", m_prefs.wifiPipeCount))
             changed = true;
-        }
-        ImGui::TextDisabled("  Two parallel TCP connections over WiFi.");
-        ImGui::TextDisabled("  Best for fast WiFi (WiFi 6/7).");
+        ImGui::TextDisabled("  Parallel direct TCP connections over WiFi. Range: 1 to 4.");
+        ImGui::TextDisabled("  Best for fast WiFi (WiFi 6/7). Use lower values if a device becomes unstable.");
     }
 
     ImGui::Spacing();
     ImGui::TextDisabled("  Changes apply on next device connect.");
-    ImGui::TextDisabled("  USB + WiFi dual = up to 4 parallel channels.");
+    ImGui::TextDisabled("  USB + WiFi can use up to 8 parallel channels.");
 
     ImGui::Spacing();
     ImGui::Spacing();
@@ -5074,7 +5267,7 @@ void App::renderDeleteConfirmPopup() {
             const char* btnLabel = (m_deletePermanent || isAndroid) ? "Delete Permanently" : "Move to Recycle Bin";
             if (ImGui::Button(btnLabel, ImVec2(180, 0))) {
                 if (isAndroid) {
-                    // Android: always permanent via server — run async
+                    // Android: always permanent via server, refresh after the queued work finishes.
                     std::vector<std::string> delPaths;
                     for (int idx : m_contextPanel->selectedIndices) {
                         if (!m_contextPanel->validIndex(idx)) continue;
@@ -5082,8 +5275,27 @@ void App::renderDeleteConfirmPopup() {
                     }
                     if (m_selectedDevice >= 0 && !delPaths.empty()) {
                         int slot = m_contextPanel->deviceSlot;
-                        postAsync("Deleting files...", [this, delPaths, slot]() {
-                            for (auto& p : delPaths) deviceForSlot(slot).deleteFile(p);
+                        bool refreshLeft = (m_contextPanel == &m_leftPanel);
+                        m_contextPanel->selectedIndices.clear();
+                        postAsync("Deleting files...", [this, delPaths, slot, refreshLeft]() {
+                            int failed = 0;
+                            std::string lastError;
+                            for (auto& p : delPaths) {
+                                if (!deviceForSlot(slot).deleteFile(p)) {
+                                    failed++;
+                                    lastError = deviceForSlot(slot).lastError();
+                                }
+                            }
+                            FilePanel& panel = refreshLeft ? m_leftPanel : m_rightPanel;
+                            panel.needsRefresh = true;
+                            if (failed == 0) {
+                                m_statusMessage = "Deleted " + std::to_string(delPaths.size()) + " item(s)";
+                            } else {
+                                m_statusMessage = "Deleted " + std::to_string((int)delPaths.size() - failed) +
+                                    " item(s), " + std::to_string(failed) + " failed";
+                                if (!lastError.empty()) m_statusMessage += ": " + lastError;
+                            }
+                            m_statusTime = std::chrono::steady_clock::now();
                         });
                     }
                 } else {
@@ -5101,8 +5313,8 @@ void App::renderDeleteConfirmPopup() {
                         m_statusMessage = "Delete failed: " + error;
                         m_statusTime = std::chrono::steady_clock::now();
                     }
+                    m_contextPanel->needsRefresh = true;
                 }
-                m_contextPanel->needsRefresh = true;
                 m_contextIndex = -1; m_contextPanel = nullptr;
                 ImGui::CloseCurrentPopup();
             }
@@ -5397,8 +5609,15 @@ void App::devicePollLoop() {
     auto processDeviceUpdate = [&](const std::vector<DeviceInfo>& devices) {
         m_pollBusy = true;
         std::string curSerial;
+        bool primaryServerRunning = m_device.isServerRunning();
         {
             std::lock_guard<std::mutex> lk(m_deviceMutex);
+            std::string previousSelectedSerial;
+            if (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size())
+                previousSelectedSerial = m_devices[m_selectedDevice].serial;
+            if (previousSelectedSerial.empty())
+                previousSelectedSerial = m_lastDeviceSerial;
+
             m_devices = devices;
 
             // Build list of online devices only
@@ -5414,6 +5633,37 @@ void App::devicePollLoop() {
                     if (m_devices[i].state == "device") return i;
                 return -1;
             };
+            auto findSerial = [&](const std::string& serial) -> int {
+                if (serial.empty()) return -1;
+                for (int i = 0; i < (int)m_devices.size(); i++) {
+                    if (m_devices[i].serial == serial && m_devices[i].state == "device")
+                        return i;
+                }
+                return -1;
+            };
+
+            // Keep slot 0 stable while its server is alive. Panel device dropdowns
+            // browse slots, they must not cause slot 1 to be promoted to primary.
+            int primaryIdx = -1;
+            if (primaryServerRunning && m_slotConnected[0]) {
+                primaryIdx = findSerial(m_slotSerial[0]);
+                if (primaryIdx < 0) {
+                    std::string partner;
+                    if (isWifiSerial(m_slotSerial[0]) && m_slotSerial[0] == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
+                        partner = m_wifiToUsbSerial;
+                    else if (!isWifiSerial(m_slotSerial[0]) && m_slotSerial[0] == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
+                        partner = m_usbToWifiSerial;
+                    primaryIdx = findSerial(partner);
+                }
+            }
+
+            if (primaryIdx >= 0) {
+                m_selectedDevice = primaryIdx;
+            } else {
+                int preserved = findSerial(previousSelectedSerial);
+                if (preserved >= 0)
+                    m_selectedDevice = preserved;
+            }
 
             // Check if currently selected device went offline
             bool selectedOffline = (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size() &&
@@ -5437,9 +5687,9 @@ void App::devicePollLoop() {
                         ? m_devices[m_selectedDevice].serial : m_lastDeviceSerial;
                     // Check if the partner serial (USB↔WiFi) is online
                     std::string partnerSerial;
-                    if (isWifiSerial(lostSerial) && !m_wifiToUsbSerial.empty())
+                    if (isWifiSerial(lostSerial) && lostSerial == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
                         partnerSerial = m_wifiToUsbSerial;
-                    else if (!isWifiSerial(lostSerial) && !m_usbToWifiSerial.empty())
+                    else if (!isWifiSerial(lostSerial) && lostSerial == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
                         partnerSerial = m_usbToWifiSerial;
 
                     if (!partnerSerial.empty()) {
@@ -5644,19 +5894,22 @@ void App::devicePollLoop() {
 
         if (curSerial != m_lastDeviceSerial) {
             LOG_INFO("Poll", "Serial changed: '" + m_lastDeviceSerial + "' -> '" + curSerial + "'");
+            bool handledSerialChange = false;
 
             // Don't treat USB↔WiFi flip as disconnect if server is still running
             // BUT allow the upgrade from WiFi-only to USB+WiFi
+            bool knownPartnerFlip =
+                (isWifiSerial(m_lastDeviceSerial) && curSerial == m_wifiToUsbSerial) ||
+                (!isWifiSerial(m_lastDeviceSerial) && curSerial == m_usbToWifiSerial);
             if (!curSerial.empty() && !m_lastDeviceSerial.empty() &&
                 isWifiSerial(curSerial) != isWifiSerial(m_lastDeviceSerial) &&
-                m_device.isServerRunning()) {
+                knownPartnerFlip && m_device.isServerRunning()) {
                 LOG_INFO("Poll", "USB/WiFi serial flip - server still connected, skipping reconnect");
                 m_lastDeviceSerial = curSerial;
-                m_pollBusy = false;
-                return;
+                handledSerialChange = true;
             }
 
-            if (curSerial.empty() && !m_lastDeviceSerial.empty()) {
+            if (!handledSerialChange && curSerial.empty() && !m_lastDeviceSerial.empty()) {
                 LOG_WARN("Poll", "Device disconnected");
                 m_wifiProbeAttempts = 0; // reset probe backoff for fast reconnect
                 m_device.disconnectTcp(); // immediately kill TCP so reconnect doesn't think server is still up
@@ -5673,30 +5926,31 @@ void App::devicePollLoop() {
                     p.currentPath = "/";
                     strcpy_s(p.pathInput, "/");
                 });
-            } else if (!curSerial.empty()) {
+            } else if (!handledSerialChange && !curSerial.empty()) {
                 if (m_device.isServerRunning() && m_device.connectedSerial() == curSerial) {
                     LOG_INFO("Poll", "Device " + curSerial + " already connected, skipping init");
                     m_lastDeviceSerial = curSerial;
-                    m_pollBusy = false;
-                    return;
+                    handledSerialChange = true;
                 }
-                std::string model;
-                {
-                    std::lock_guard<std::mutex> lk(m_deviceMutex);
-                    model = (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size())
-                        ? m_devices[m_selectedDevice].model : curSerial;
-                }
-                m_statusMessage = "Device detected: " + model + " - initializing...";
-                m_statusTime = std::chrono::steady_clock::now();
-                std::this_thread::sleep_for(std::chrono::seconds(1)); // brief settle
-                if (m_shutdownPoll) return;
-                // Don't restart server during active transfers - it kills existing connections
-                if (isBatchActive()) {
-                    LOG_INFO("Poll", "Skipping onDeviceChanged - transfer active");
-                    m_lastDeviceSerial = curSerial;
-                } else {
-                    LOG_INFO("Poll", "Calling onDeviceChanged()");
-                    onDeviceChanged();
+                if (!handledSerialChange) {
+                    std::string model;
+                    {
+                        std::lock_guard<std::mutex> lk(m_deviceMutex);
+                        model = (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size())
+                            ? m_devices[m_selectedDevice].model : curSerial;
+                    }
+                    m_statusMessage = "Device detected: " + model + " - initializing...";
+                    m_statusTime = std::chrono::steady_clock::now();
+                    std::this_thread::sleep_for(std::chrono::seconds(1)); // brief settle
+                    if (m_shutdownPoll) return;
+                    // Don't restart server during active transfers - it kills existing connections
+                    if (isBatchActive()) {
+                        LOG_INFO("Poll", "Skipping onDeviceChanged - transfer active");
+                        m_lastDeviceSerial = curSerial;
+                    } else {
+                        LOG_INFO("Poll", "Calling onDeviceChanged()");
+                        onDeviceChanged();
+                    }
                 }
             }
             m_lastDeviceSerial = curSerial;
@@ -5713,14 +5967,32 @@ void App::devicePollLoop() {
         }
 
         // Auto-connect secondary device slot when a new device appears
+        std::set<std::string> primarySerials;
+        if (!curSerial.empty()) {
+            addKnownPrimarySerials(primarySerials, curSerial);
+            if (curSerial == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
+                primarySerials.insert(m_usbToWifiSerial);
+            if (curSerial == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
+                primarySerials.insert(m_wifiToUsbSerial);
+        }
+        if (m_slotConnected[1] && primarySerials.count(m_slotSerial[1])) {
+            LOG_INFO("Poll", "Clearing slot 1 because it is another path to the primary device: " + m_slotSerial[1]);
+            m_deviceSlots[1].disconnectTcp();
+            m_slotConnected[1] = false;
+            m_slotSerial[1].clear();
+            m_slotStorageRoot[1].clear();
+            m_slotVolumes[1].clear();
+            forEachAndroidPanel([&](FilePanel& p) {
+                if (p.deviceSlot == 1) {
+                    p.deviceSlot = 0;
+                    p.currentPath = m_slotStorageRoot[0].empty() ? "/" : m_slotStorageRoot[0];
+                    strcpy_s(p.pathInput, p.currentPath.c_str());
+                    p.needsRefresh = true;
+                }
+            });
+        }
         if (!curSerial.empty() && m_device.isServerRunning() && !m_slotConnected[1] && !isBatchActive()) {
             std::lock_guard<std::mutex> lk(m_deviceMutex);
-            // Build set of serials belonging to the primary device (USB + WiFi of same phone)
-            std::set<std::string> primarySerials;
-            primarySerials.insert(curSerial);
-            if (!m_usbToWifiSerial.empty()) primarySerials.insert(m_usbToWifiSerial);
-            if (!m_wifiToUsbSerial.empty()) primarySerials.insert(m_wifiToUsbSerial);
-
             for (int i = 0; i < (int)m_devices.size(); i++) {
                 if (primarySerials.count(m_devices[i].serial)) continue; // skip primary device (any serial)
                 if (m_devices[i].state != "device") continue;
@@ -5785,13 +6057,46 @@ void App::devicePollLoop() {
                     m_statusMessage = "Server connection lost";
                     m_statusTime = std::chrono::steady_clock::now();
                     forEachAndroidPanel([](FilePanel& p) {
+                        if (p.deviceSlot != 0) return;
                         p.androidEntries.clear();
                         p.selectedIndices.clear();
                         p.needsRefresh = true;
                     });
                 } else {
                     forEachAndroidPanel([](FilePanel& p) {
-                        if (p.androidEntries.empty()) p.needsRefresh = true;
+                        if (p.deviceSlot == 0 && p.androidEntries.empty()) p.needsRefresh = true;
+                    });
+                }
+            }
+        }
+
+        if (m_slotConnected[1] && !isBatchActive() && !m_tetheringInProgress) {
+            auto sinceLast = std::chrono::steady_clock::now() - m_lastTransferActivity;
+            if (sinceLast >= std::chrono::seconds(15) && !m_deviceSlots[1].verifyConnection()) {
+                std::string secondarySerial = m_slotSerial[1];
+                LOG_WARN("Poll", "Secondary health check failed, reconnecting: " + secondarySerial);
+                m_deviceSlots[1].disconnectTcp();
+                if (!secondarySerial.empty() && m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/)) {
+                    m_slotSerial[1] = secondarySerial;
+                    m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
+                    m_slotVolumes[1].clear();
+                    m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
+                    m_slotConnected[1] = true;
+                    forEachAndroidPanel([&](FilePanel& p) {
+                        if (p.deviceSlot == 1) p.needsRefresh = true;
+                    });
+                    LOG_INFO("Poll", "Secondary slot reconnected: " + secondarySerial);
+                } else {
+                    m_slotConnected[1] = false;
+                    m_slotSerial[1].clear();
+                    m_slotStorageRoot[1].clear();
+                    m_slotVolumes[1].clear();
+                    forEachAndroidPanel([&](FilePanel& p) {
+                        if (p.deviceSlot == 1) {
+                            p.androidEntries.clear();
+                            p.selectedIndices.clear();
+                            p.needsRefresh = true;
+                        }
                     });
                 }
             }
@@ -5912,13 +6217,45 @@ void App::devicePollLoop() {
                                 m_statusMessage = "Server connection lost";
                                 m_statusTime = std::chrono::steady_clock::now();
                                 forEachAndroidPanel([](FilePanel& p) {
+                                    if (p.deviceSlot != 0) return;
                                     p.androidEntries.clear();
                                     p.selectedIndices.clear();
                                     p.needsRefresh = true;
                                 });
                             } else {
                                 forEachAndroidPanel([](FilePanel& p) {
-                                    if (p.androidEntries.empty()) p.needsRefresh = true;
+                                    if (p.deviceSlot == 0 && p.androidEntries.empty()) p.needsRefresh = true;
+                                });
+                            }
+                        }
+                    }
+                    if (m_slotConnected[1] && !isBatchActive() && !m_tetheringInProgress) {
+                        auto sinceLast = std::chrono::steady_clock::now() - m_lastTransferActivity;
+                        if (sinceLast >= std::chrono::seconds(15) && !m_deviceSlots[1].verifyConnection()) {
+                            std::string secondarySerial = m_slotSerial[1];
+                            LOG_WARN("Poll", "Secondary health check failed, reconnecting: " + secondarySerial);
+                            m_deviceSlots[1].disconnectTcp();
+                            if (!secondarySerial.empty() && m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/)) {
+                                m_slotSerial[1] = secondarySerial;
+                                m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
+                                m_slotVolumes[1].clear();
+                                m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
+                                m_slotConnected[1] = true;
+                                forEachAndroidPanel([&](FilePanel& p) {
+                                    if (p.deviceSlot == 1) p.needsRefresh = true;
+                                });
+                                LOG_INFO("Poll", "Secondary slot reconnected: " + secondarySerial);
+                            } else {
+                                m_slotConnected[1] = false;
+                                m_slotSerial[1].clear();
+                                m_slotStorageRoot[1].clear();
+                                m_slotVolumes[1].clear();
+                                forEachAndroidPanel([&](FilePanel& p) {
+                                    if (p.deviceSlot == 1) {
+                                        p.androidEntries.clear();
+                                        p.selectedIndices.clear();
+                                        p.needsRefresh = true;
+                                    }
                                 });
                             }
                         }
@@ -6092,6 +6429,11 @@ void App::onDeviceChanged() {
 
     // Navigate slot-0 Android panels to the detected storage root
     forEachAndroidPanel([&](FilePanel& p) {
+        if ((p.deviceSlot < 0 || p.deviceSlot >= 2 || !m_slotConnected[p.deviceSlot]) && m_slotConnected[0]) {
+            p.deviceSlot = 0;
+            p.navHistory.clear();
+            p.navHistoryPos = -1;
+        }
         if (p.deviceSlot == 0) {
             p.currentPath = m_androidStorageRoot;
             strcpy_s(p.pathInput, p.currentPath.c_str());
@@ -6104,9 +6446,20 @@ void App::onDeviceChanged() {
         std::lock_guard<std::mutex> lk(m_deviceMutex);
         // Build set of serials belonging to the primary device (USB + WiFi of same phone)
         std::set<std::string> primarySerials;
-        primarySerials.insert(serial);
-        if (!m_usbToWifiSerial.empty()) primarySerials.insert(m_usbToWifiSerial);
-        if (!m_wifiToUsbSerial.empty()) primarySerials.insert(m_wifiToUsbSerial);
+        addKnownPrimarySerials(primarySerials, serial);
+        if (serial == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
+            primarySerials.insert(m_usbToWifiSerial);
+        if (serial == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
+            primarySerials.insert(m_wifiToUsbSerial);
+
+        if (m_slotConnected[1] && primarySerials.count(m_slotSerial[1])) {
+            LOG_INFO("Poll", "Clearing slot 1 because it is another path to the new primary device: " + m_slotSerial[1]);
+            m_deviceSlots[1].disconnectTcp();
+            m_slotConnected[1] = false;
+            m_slotSerial[1].clear();
+            m_slotStorageRoot[1].clear();
+            m_slotVolumes[1].clear();
+        }
 
         // Prefer reassigning the old primary to slot 1 if it's still online
         std::string candidateSerial;
@@ -6503,7 +6856,6 @@ void App::startTransfer(bool pullFromAndroid) {
     batch->isLocalCopy = localCopy;
     batch->srcDeviceSlot = src.deviceSlot;
     batch->dstDeviceSlot = dst.deviceSlot;
-    batch->useParallelChannels = m_dualChannelAvailable;
 
     // Cross-device Android-to-Android
     if (bothAndroid && src.deviceSlot != dst.deviceSlot) {
@@ -6512,6 +6864,8 @@ void App::startTransfer(bool pullFromAndroid) {
     } else {
         batch->isPull = !localCopy && pullFromAndroid;
     }
+    batch->useParallelChannels = !localCopy &&
+        (m_prefs.usbPipeCount > 1 || m_prefs.wifiPipeCount > 1);
 
     uint64_t total = 0;
     if (localCopy)
@@ -6577,6 +6931,10 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
     // Build batch items from dropped paths
     auto batch = std::make_shared<TransferBatch>();
     uint64_t total = 0;
+    if (target->isAndroid) {
+        batch->dstDeviceSlot = target->deviceSlot;
+        batch->useParallelChannels = (m_prefs.usbPipeCount > 1 || m_prefs.wifiPipeCount > 1);
+    }
 
     for (auto& srcPath : paths) {
         BatchFileItem item;
@@ -6660,7 +7018,6 @@ void App::startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel) {
     auto batch = std::make_shared<TransferBatch>();
     batch->isLocalCopy = localCopy;
     batch->srcDeviceSlot = srcPanel.deviceSlot;
-    batch->useParallelChannels = m_dualChannelAvailable;
     batch->dstDeviceSlot = dstPanel.deviceSlot;
 
     // Cross-device Android-to-Android via drag
@@ -6671,6 +7028,8 @@ void App::startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel) {
     } else {
         batch->isPull = !localCopy && isPull;
     }
+    batch->useParallelChannels = !localCopy &&
+        (m_prefs.usbPipeCount > 1 || m_prefs.wifiPipeCount > 1);
 
     uint64_t total = 0;
     if (localCopy)
@@ -6745,8 +7104,10 @@ void App::processBatchQueue() {
         }
         if (!batch) continue;
 
-        // Get the device client for this batch
-        DeviceClient& batchDev = m_deviceSlots[batch->srcDeviceSlot];
+        // Single-device transfers use whichever panel is Android:
+        // pulls read from the Android source slot, pushes write to the Android destination slot.
+        int batchDeviceSlot = batch->isPull ? batch->srcDeviceSlot : batch->dstDeviceSlot;
+        DeviceClient& batchDev = m_deviceSlots[batchDeviceSlot & 1];
 
         if (!batch->isLocalCopy && !batch->isCrossDevice && !batchDev.isServerRunning()) {
             batch->state = BatchState::Failed;
@@ -6759,6 +7120,54 @@ void App::processBatchQueue() {
 
         batch->state = BatchState::Running;
         batch->startTime = std::chrono::steady_clock::now();
+
+        auto logBatchPerformance = [&](const std::string& mode, double seconds, double avgSpeed) {
+            if (seconds < 0.1) seconds = 0.1;
+            std::string direction;
+            if (batch->isLocalCopy)
+                direction = "PC to PC";
+            else if (batch->isCrossDevice)
+                direction = "Android to Android";
+            else if (batch->isPull)
+                direction = "Android to PC";
+            else
+                direction = "PC to Android";
+
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(2);
+            oss << "Transfer complete: direction=" << direction
+                << ", mode=" << mode
+                << ", files=" << batch->totalFiles()
+                << ", bytes=" << batch->totalTransferred.load()
+                << " (" << formatSize(batch->totalTransferred.load()) << ")"
+                << ", duration=" << seconds << "s"
+                << ", avg=" << formatSpeed(avgSpeed)
+                << ", channels=" << batch->numChannels;
+            if (batch->skippedFiles > 0)
+                oss << ", skipped=" << batch->skippedFiles;
+            LOG_INFO("Perf", oss.str());
+
+            if (batch->numChannels > 1) {
+                int nCh = std::min(batch->numChannels, (int)TransferBatch::MAX_CHANNELS);
+                for (int ch = 0; ch < nCh; ch++) {
+                    auto& cp = batch->channels[ch];
+                    uint64_t bytes = cp.bytesTransferred.load();
+                    if (bytes == 0 && cp.filesCompleted.load() == 0) continue;
+                    double chSec = cp.elapsedSec.load();
+                    if (chSec < 0.1) chSec = seconds;
+                    if (chSec < 0.1) chSec = 0.1;
+                    LOG_INFO("Perf", "  channel " + std::to_string(ch + 1) + "/" + std::to_string(nCh) +
+                        " " + cp.channelName + ": blocks=" + std::to_string(cp.filesCompleted.load()) +
+                        ", bytes=" + std::to_string(bytes) + " (" + formatSize(bytes) + ")" +
+                        ", duration=" + std::to_string(chSec) + "s" +
+                        ", avg=" + formatSpeed((double)bytes / chSec) +
+                        (cp.relayReadSec.load() > 0 || cp.relaySendSec.load() > 0
+                            ? ", srcRecv=" + std::to_string(cp.relayReadSec.load()) + "s" +
+                              ", dstSend=" + std::to_string(cp.relaySendSec.load()) + "s"
+                            : ""));
+                }
+            }
+        };
 
         // --- Multi-NIC channel setup ---
         bool useMultiNic = false;
@@ -6847,8 +7256,146 @@ void App::processBatchQueue() {
         }
 
         // --- Parallel transfer (dual-channel or multi-NIC) ---
-        bool doDualChannel = batch->useParallelChannels && m_dualChannelAvailable &&
-            m_secondaryChannel.isServerRunning() && !useMultiNic;
+        struct RuntimeChannel {
+            DeviceClient* dev = nullptr;
+            std::unique_ptr<DeviceClient> owned;
+            std::string name;
+            std::string reconnectIp;
+            bool preferUsb = false;
+        };
+        std::vector<RuntimeChannel> runtimeChannels;
+        std::string batchWifiIp;
+        std::string batchUsbSerial;
+        std::string batchHwSerial;
+
+        if (batch->useParallelChannels && !batch->isLocalCopy && !batch->isCrossDevice && !useMultiNic) {
+            std::string batchSerial = batchDev.connectedSerial();
+            bool primaryIsUsb = !batchSerial.empty() && !isWifiSerial(batchSerial);
+            if (primaryIsUsb) batchUsbSerial = batchSerial;
+            if (isWifiSerial(batchSerial)) {
+                auto colon = batchSerial.rfind(':');
+                if (colon != std::string::npos) batchWifiIp = batchSerial.substr(0, colon);
+            }
+
+            if (!batchSerial.empty()) {
+                std::string hwOut = batchDev.runAdbCommand("-s " + batchSerial + " shell getprop ro.serialno");
+                while (!hwOut.empty() && (hwOut.back() == '\n' || hwOut.back() == '\r' || hwOut.back() == ' '))
+                    hwOut.pop_back();
+                batchHwSerial = hwOut;
+            }
+
+            if (batchWifiIp.empty() && !batchSerial.empty()) {
+                std::string wlanOut = batchDev.runAdbCommand("-s " + batchSerial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+                auto inetPos = wlanOut.find("inet ");
+                if (inetPos != std::string::npos) {
+                    auto start = inetPos + 5;
+                    auto slash = wlanOut.find('/', start);
+                    if (slash != std::string::npos)
+                        batchWifiIp = wlanOut.substr(start, slash - start);
+                }
+            }
+            if (batchWifiIp.empty()) {
+                for (auto& w : m_prefs.savedWifiDevices) {
+                    std::string wifiSerial = w.wifiIp + ":" + std::to_string(w.port);
+                    if (!w.wifiIp.empty() && (w.serial == batchSerial || wifiSerial == batchSerial)) {
+                        batchWifiIp = w.wifiIp;
+                        break;
+                    }
+                }
+            }
+
+            if (batchUsbSerial.empty() && !batchHwSerial.empty()) {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+                for (auto& d : m_devices) {
+                    if (d.state != "device" || isWifiSerial(d.serial)) continue;
+                    std::string hw = batchDev.runAdbCommand("-s " + d.serial + " shell getprop ro.serialno");
+                    while (!hw.empty() && (hw.back() == '\n' || hw.back() == '\r' || hw.back() == ' '))
+                        hw.pop_back();
+                    if (hw == batchHwSerial) {
+                        batchUsbSerial = d.serial;
+                        break;
+                    }
+                }
+            }
+
+            RuntimeChannel primary;
+            primary.dev = &batchDev;
+            primary.name = primaryIsUsb ? "USB (ADB)" : (batchDev.isDirectConnection() ? "WiFi (Direct)" : "WiFi (ADB)");
+            primary.reconnectIp = batchWifiIp;
+            primary.preferUsb = primaryIsUsb;
+            runtimeChannels.push_back(std::move(primary));
+
+            int usbChannels = primaryIsUsb ? 1 : 0;
+            int wifiChannels = primaryIsUsb ? 0 : 1;
+            int nextPort = 5840 + (batchDeviceSlot & 1) * 20;
+
+            auto addUsbChannel = [&]() -> bool {
+                if (batchUsbSerial.empty()) return false;
+                for (int attempt = 0; attempt < 32; attempt++) {
+                    auto ch = std::make_unique<DeviceClient>();
+                    ch->setAdbPath(batchDev.getAdbPath());
+                    ch->setLocalPort(nextPort++);
+                    int localPort = ch->localPort();
+                    std::string fwd = batchDev.runAdbCommand("-s " + batchUsbSerial + " forward tcp:" +
+                        std::to_string(localPort) + " tcp:" + std::to_string(AFM_PORT));
+                    if (fwd.find("offline") != std::string::npos)
+                        return false;
+                    if (fwd.find("error") != std::string::npos) {
+                        LOG_WARN("Transfer", "USB forward port " + std::to_string(localPort) +
+                            " failed, trying next port");
+                        continue;
+                    }
+                    if (!ch->connectTcp("127.0.0.1", localPort) || !ch->verifyConnection()) {
+                        LOG_WARN("Transfer", "USB forward port " + std::to_string(localPort) +
+                            " connected but did not verify, trying next port");
+                        continue;
+                    }
+                    RuntimeChannel rc;
+                    rc.dev = ch.get();
+                    rc.owned = std::move(ch);
+                    rc.name = "USB (ADB)";
+                    rc.reconnectIp = batchWifiIp;
+                    rc.preferUsb = true;
+                    runtimeChannels.push_back(std::move(rc));
+                    usbChannels++;
+                    return true;
+                }
+                return false;
+            };
+
+            auto addWifiChannel = [&]() -> bool {
+                if (batchWifiIp.empty()) return false;
+                auto ch = std::make_unique<DeviceClient>();
+                ch->setAdbPath(batchDev.getAdbPath());
+                ch->setLocalPort(nextPort++);
+                if (!ch->connectTcp(batchWifiIp, AFM_PORT) || !ch->verifyConnection())
+                    return false;
+                RuntimeChannel rc;
+                rc.dev = ch.get();
+                rc.owned = std::move(ch);
+                rc.name = "WiFi (Direct)";
+                rc.reconnectIp = batchWifiIp;
+                rc.preferUsb = false;
+                runtimeChannels.push_back(std::move(rc));
+                wifiChannels++;
+                return true;
+            };
+
+            while (usbChannels < m_prefs.usbPipeCount && runtimeChannels.size() < TransferBatch::MAX_CHANNELS)
+                if (!addUsbChannel()) break;
+            while (wifiChannels < m_prefs.wifiPipeCount && runtimeChannels.size() < TransferBatch::MAX_CHANNELS)
+                if (!addWifiChannel()) break;
+
+            if (runtimeChannels.size() > 1) {
+                batch->numChannels = (int)runtimeChannels.size();
+                LOG_INFO("Transfer", "Prepared " + std::to_string(runtimeChannels.size()) +
+                    " channels for slot " + std::to_string(batchDeviceSlot));
+            }
+        }
+
+        bool doDualChannel = batch->useParallelChannels && runtimeChannels.size() > 1 && !useMultiNic;
+        if (!doDualChannel && !useMultiNic)
+            batch->useParallelChannels = false;
         if ((doDualChannel || useMultiNic) && !batch->isLocalCopy &&
             !batch->isCrossDevice && batch->totalFiles() >= 1) {
             LOG_INFO("Transfer", useMultiNic ?
@@ -6864,19 +7411,8 @@ void App::processBatchQueue() {
                 for (int i = 0; i < (int)multiNicDevPtrs.size(); i++)
                     batch->channels[i].channelName = multiNicNames[i];
             } else {
-                std::string primarySerial = batchDev.connectedSerial();
-                bool usbCableConnected = !isWifiSerial(primarySerial);
-                batch->channels[0].channelName = usbCableConnected ? "USB" : "WiFi (ADB)";
-                // Determine actual secondary type — verify USB device is still online
-                bool secIsUsb = (m_secondaryChannelType == "USB");
-                if (secIsUsb && !usbCableConnected) {
-                    bool usbOnline = false;
-                    std::lock_guard<std::mutex> lk(m_deviceMutex);
-                    for (auto& d : m_devices)
-                        if (d.state == "device" && !isWifiSerial(d.serial)) { usbOnline = true; break; }
-                    if (!usbOnline) secIsUsb = false;
-                }
-                batch->channels[1].channelName = secIsUsb ? "USB (ADB)" : "WiFi (Direct)";
+                for (int i = 0; i < (int)runtimeChannels.size(); i++)
+                    batch->channels[i].channelName = runtimeChannels[i].name;
             }
 
             // === Work-stealing block queue for file distribution ===
@@ -7046,8 +7582,40 @@ void App::processBatchQueue() {
                 }
             }
 
+            bool hasDirectoryItems = false;
+            for (auto& item : batch->files) {
+                if (item.isDirectory) {
+                    hasDirectoryItems = true;
+                    break;
+                }
+            }
+            if (!hasDirectoryItems && batch->totalFiles() > 1 && workQueue.size() > 1) {
+                std::vector<std::deque<WorkBlock>> byFile(batch->totalFiles());
+                for (auto& block : workQueue) {
+                    if (block.fileIndex >= 0 && block.fileIndex < (int)byFile.size())
+                        byFile[block.fileIndex].push_back(block);
+                }
+
+                std::deque<WorkBlock> interleaved;
+                bool added = true;
+                while (added) {
+                    added = false;
+                    for (auto& blocks : byFile) {
+                        if (blocks.empty()) continue;
+                        interleaved.push_back(blocks.front());
+                        blocks.pop_front();
+                        added = true;
+                    }
+                }
+                if (interleaved.size() == workQueue.size()) {
+                    workQueue.swap(interleaved);
+                    LOG_INFO("Transfer", "Interleaved " + std::to_string(batch->totalFiles()) +
+                        " files across " + std::to_string(workQueue.size()) + " work blocks");
+                }
+            }
+
             int totalBlocks = (int)workQueue.size();
-            int numCh = useMultiNic ? batch->numChannels : 2;
+            int numCh = useMultiNic ? batch->numChannels : (int)runtimeChannels.size();
             uint64_t perChBytes = batch->totalBytes.load() / numCh;
             for (int c = 0; c < numCh; c++) {
                 batch->channels[c].totalBytes = perChBytes;
@@ -7059,22 +7627,30 @@ void App::processBatchQueue() {
             // Use the IP that was actually used for the secondary channel, not a saved one
             std::string secondaryWifiIp;
             {
+                secondaryWifiIp = batchWifiIp;
                 // Extract IP from the actual secondary connection
                 // The secondary channel was established to the WiFi IP of the current device
                 std::string serial = batchDev.connectedSerial();
                 // Try to get WiFi IP from the current device
-                std::string wlanOut = m_device.runAdbCommand("-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
-                auto inetPos = wlanOut.find("inet ");
-                if (inetPos != std::string::npos) {
-                    auto start = inetPos + 5;
-                    auto slash = wlanOut.find('/', start);
-                    if (slash != std::string::npos)
-                        secondaryWifiIp = wlanOut.substr(start, slash - start);
+                if (secondaryWifiIp.empty() && !serial.empty()) {
+                    std::string wlanOut = m_device.runAdbCommand("-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+                    auto inetPos = wlanOut.find("inet ");
+                    if (inetPos != std::string::npos) {
+                        auto start = inetPos + 5;
+                        auto slash = wlanOut.find('/', start);
+                        if (slash != std::string::npos)
+                            secondaryWifiIp = wlanOut.substr(start, slash - start);
+                    }
                 }
                 // Fallback: extract from the saved device matching this serial
                 if (secondaryWifiIp.empty()) {
-                    for (auto& w : m_prefs.savedWifiDevices)
-                        if (w.serial == serial && !w.wifiIp.empty()) { secondaryWifiIp = w.wifiIp; break; }
+                    for (auto& w : m_prefs.savedWifiDevices) {
+                        std::string wifiSerial = w.wifiIp + ":" + std::to_string(w.port);
+                        if (!w.wifiIp.empty() && (w.serial == serial || wifiSerial == serial)) {
+                            secondaryWifiIp = w.wifiIp;
+                            break;
+                        }
+                    }
                 }
                 if (!secondaryWifiIp.empty())
                     LOG_INFO("Transfer", "Secondary WiFi reconnect IP: " + secondaryWifiIp);
@@ -7270,8 +7846,12 @@ void App::processBatchQueue() {
                             combined += batch->channels[c].bytesTransferred.load();
                             combinedSpeed += batch->channels[c].speed.load();
                         }
-                        batch->totalTransferred = combined;
                         uint64_t tb = batch->totalBytes.load();
+                        if (tb > 0 && combined > tb)
+                            combined = batch->totalTransferred.load();
+                        uint64_t currentTotal = batch->totalTransferred.load();
+                        if (combined < currentTotal) combined = currentTotal;
+                        batch->totalTransferred = combined;
                         if (tb > 0) batch->totalProgress = (float)((double)combined / (double)tb);
                         batch->speedBytesPerSec = combinedSpeed;
                         batch->etaSeconds = (combinedSpeed > 0 && tb > combined)
@@ -7597,27 +8177,12 @@ void App::processBatchQueue() {
             } else {
                 // Launch all available channels as worker threads
                 std::vector<std::thread> threads;
-                batch->numChannels = std::min(m_activeChannelCount, (int)TransferBatch::MAX_CHANNELS);
+                batch->numChannels = std::min((int)runtimeChannels.size(), (int)TransferBatch::MAX_CHANNELS);
                 numCh = batch->numChannels;
-                // Channel 0: primary (batchDev) — prefer based on actual connection
-                bool primaryIsUsb = !batchDev.connectedSerial().empty() &&
-                                    !isWifiSerial(batchDev.connectedSerial());
-                batch->channels[0].channelName = primaryIsUsb ? "USB (ADB)" : "WiFi (ADB)";
-                threads.emplace_back(worker, std::ref(batchDev), std::ref(batch->channels[0]),
-                                     secondaryWifiIp, std::string(""), primaryIsUsb);
-                // Channel 1: secondary — prefers WiFi if available
-                if (batch->numChannels >= 2) {
-                    batch->channels[1].channelName = (m_secondaryChannelType == "WiFi") ? "WiFi (Direct)" : "USB (ADB)";
-                    threads.emplace_back(worker, std::ref(m_secondaryChannel), std::ref(batch->channels[1]),
-                                         secondaryWifiIp, std::string(""), m_secondaryChannelType != "WiFi");
-                }
-                // Channels 2+: extra pipes
-                for (int i = 0; i < (int)m_extraChannels.size() && (i + 2) < batch->numChannels; i++) {
-                    bool extraIsUsb = m_extraChannels[i].isUsb;
-                    std::string chName = extraIsUsb ? "USB (ADB)" : "WiFi (Direct)";
-                    batch->channels[i + 2].channelName = chName;
-                    threads.emplace_back(worker, std::ref(*m_extraChannels[i].dev), std::ref(batch->channels[i + 2]),
-                                         secondaryWifiIp, std::string(""), extraIsUsb);
+                for (int i = 0; i < batch->numChannels; i++) {
+                    batch->channels[i].channelName = runtimeChannels[i].name;
+                    threads.emplace_back(worker, std::ref(*runtimeChannels[i].dev), std::ref(batch->channels[i]),
+                                         runtimeChannels[i].reconnectIp, std::string(""), runtimeChannels[i].preferUsb);
                 }
                 for (auto& t : threads) t.join();
             }
@@ -7736,11 +8301,14 @@ void App::processBatchQueue() {
                     batch->errorMessage = "CRC verification failed — file(s) may be corrupted";
                 } else {
                     batch->state = BatchState::Completed;
+                    logBatchPerformance(useMultiNic ? "multi-NIC parallel" : "multi-channel parallel",
+                                        wallSec, avgSpeed);
                 }
 
                 m_statusMessage = "Parallel done: " + std::to_string(batch->totalFiles()) + " files, " +
                     formatSize(batch->totalTransferred.load()) + " @ " + formatSpeed(avgSpeed) +
-                    (useMultiNic ? " (" + std::to_string(numCh) + " NICs)" : " (dual channel)");
+                    (useMultiNic ? " (" + std::to_string(numCh) + " NICs)" :
+                        " (" + std::to_string(numCh) + " channels)");
                 m_statusTime = std::chrono::steady_clock::now();
 
                 m_leftPanel.needsRefresh = true;
@@ -7774,10 +8342,11 @@ void App::processBatchQueue() {
                         dev->restoreTimeouts();
                     }
                 } else {
-                    batchDev.flushStaleData();
-                    batchDev.restoreTimeouts();
-                    m_secondaryChannel.flushStaleData();
-                    m_secondaryChannel.restoreTimeouts();
+                    for (auto& rc : runtimeChannels) {
+                        if (!rc.dev) continue;
+                        rc.dev->flushStaleData();
+                        rc.dev->restoreTimeouts();
+                    }
                 }
             }
             // Clean up multi-NIC channels after transfer completes
@@ -7786,6 +8355,9 @@ void App::processBatchQueue() {
                 m_nicChannels.clear();
                 m_nicLocalIps.clear();
             }
+            for (auto& rc : runtimeChannels) {
+                if (rc.owned) rc.owned->disconnectTcp();
+            }
             continue;
         }
 
@@ -7793,6 +8365,665 @@ void App::processBatchQueue() {
         auto batchStart = std::chrono::steady_clock::now();
         uint64_t lastSpeedBytes = 0;
         auto lastSpeedTime = batchStart;
+
+        std::vector<RuntimeChannel> crossSrcChannels;
+        std::vector<RuntimeChannel> crossDstChannels;
+
+        auto buildCrossDeviceChannels = [&](DeviceClient& baseDev, int slot, int portBase,
+                                            std::vector<RuntimeChannel>& out) {
+            out.clear();
+            if (!baseDev.isServerRunning()) return;
+
+            std::string serial = baseDev.connectedSerial();
+            std::string wifiIp;
+            std::string usbSerial;
+            std::string hwSerial;
+            bool primaryIsUsb = !serial.empty() && !isWifiSerial(serial);
+            if (primaryIsUsb) usbSerial = serial;
+            if (isWifiSerial(serial)) {
+                auto colon = serial.rfind(':');
+                if (colon != std::string::npos) wifiIp = serial.substr(0, colon);
+            }
+
+            if (!serial.empty()) {
+                std::string hwOut = baseDev.runAdbCommand("-s " + serial + " shell getprop ro.serialno");
+                while (!hwOut.empty() && (hwOut.back() == '\n' || hwOut.back() == '\r' || hwOut.back() == ' '))
+                    hwOut.pop_back();
+                hwSerial = hwOut;
+            }
+
+            if (wifiIp.empty() && !serial.empty()) {
+                std::string wlanOut = baseDev.runAdbCommand("-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+                auto inetPos = wlanOut.find("inet ");
+                if (inetPos != std::string::npos) {
+                    auto start = inetPos + 5;
+                    auto slash = wlanOut.find('/', start);
+                    if (slash != std::string::npos)
+                        wifiIp = wlanOut.substr(start, slash - start);
+                }
+            }
+            if (wifiIp.empty()) {
+                for (auto& w : m_prefs.savedWifiDevices) {
+                    std::string wifiSerial = w.wifiIp + ":" + std::to_string(w.port);
+                    if (!w.wifiIp.empty() && (w.serial == serial || wifiSerial == serial)) {
+                        wifiIp = w.wifiIp;
+                        break;
+                    }
+                }
+            }
+
+            if (usbSerial.empty() && !hwSerial.empty()) {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+                for (auto& d : m_devices) {
+                    if (d.state != "device" || isWifiSerial(d.serial)) continue;
+                    std::string hw = baseDev.runAdbCommand("-s " + d.serial + " shell getprop ro.serialno");
+                    while (!hw.empty() && (hw.back() == '\n' || hw.back() == '\r' || hw.back() == ' '))
+                        hw.pop_back();
+                    if (hw == hwSerial) {
+                        usbSerial = d.serial;
+                        break;
+                    }
+                }
+            }
+
+            RuntimeChannel primary;
+            primary.dev = &baseDev;
+            primary.name = primaryIsUsb ? "USB (ADB)" : (baseDev.isDirectConnection() ? "WiFi (Direct)" : "WiFi (ADB)");
+            primary.reconnectIp = wifiIp;
+            primary.preferUsb = primaryIsUsb;
+            out.push_back(std::move(primary));
+
+            int usbChannels = primaryIsUsb ? 1 : 0;
+            int wifiChannels = primaryIsUsb ? 0 : 1;
+            int nextPort = portBase + (slot & 1) * 32;
+
+            auto addUsbChannel = [&]() -> bool {
+                if (usbSerial.empty()) return false;
+                for (int attempt = 0; attempt < 32; attempt++) {
+                    auto ch = std::make_unique<DeviceClient>();
+                    ch->setAdbPath(baseDev.getAdbPath());
+                    ch->setLocalPort(nextPort++);
+                    int localPort = ch->localPort();
+                    std::string fwd = baseDev.runAdbCommand("-s " + usbSerial + " forward tcp:" +
+                        std::to_string(localPort) + " tcp:" + std::to_string(AFM_PORT));
+                    if (fwd.find("offline") != std::string::npos)
+                        return false;
+                    if (fwd.find("error") != std::string::npos) {
+                        LOG_WARN("Transfer", "USB forward port " + std::to_string(localPort) +
+                            " failed, trying next port");
+                        continue;
+                    }
+                    if (!ch->connectTcp("127.0.0.1", localPort) || !ch->verifyConnection()) {
+                        LOG_WARN("Transfer", "USB forward port " + std::to_string(localPort) +
+                            " connected but did not verify, trying next port");
+                        continue;
+                    }
+                    RuntimeChannel rc;
+                    rc.dev = ch.get();
+                    rc.owned = std::move(ch);
+                    rc.name = "USB (ADB)";
+                    rc.reconnectIp = wifiIp;
+                    rc.preferUsb = true;
+                    out.push_back(std::move(rc));
+                    usbChannels++;
+                    return true;
+                }
+                return false;
+            };
+
+            auto addWifiChannel = [&]() -> bool {
+                if (wifiIp.empty()) return false;
+                auto ch = std::make_unique<DeviceClient>();
+                ch->setAdbPath(baseDev.getAdbPath());
+                ch->setLocalPort(nextPort++);
+                if (!ch->connectTcp(wifiIp, AFM_PORT) || !ch->verifyConnection())
+                    return false;
+                RuntimeChannel rc;
+                rc.dev = ch.get();
+                rc.owned = std::move(ch);
+                rc.name = "WiFi (Direct)";
+                rc.reconnectIp = wifiIp;
+                rc.preferUsb = false;
+                out.push_back(std::move(rc));
+                wifiChannels++;
+                return true;
+            };
+
+            while (usbChannels < m_prefs.usbPipeCount && out.size() < TransferBatch::MAX_CHANNELS)
+                if (!addUsbChannel()) break;
+            while (wifiChannels < m_prefs.wifiPipeCount && out.size() < TransferBatch::MAX_CHANNELS)
+                if (!addWifiChannel()) break;
+        };
+
+        if (batch->isCrossDevice && !batch->useDokanRelay) {
+            DeviceClient& srcDev = m_deviceSlots[batch->srcDeviceSlot & 1];
+            DeviceClient& dstDev = m_deviceSlots[batch->dstDeviceSlot & 1];
+            buildCrossDeviceChannels(srcDev, batch->srcDeviceSlot, 5920, crossSrcChannels);
+            buildCrossDeviceChannels(dstDev, batch->dstDeviceSlot, 5984, crossDstChannels);
+
+            int pairCount = std::min((int)crossSrcChannels.size(), (int)crossDstChannels.size());
+            pairCount = std::min(pairCount, (int)TransferBatch::MAX_CHANNELS);
+            if (pairCount > 0) {
+                batch->numChannels = pairCount;
+                batch->useParallelChannels = pairCount > 1;
+                for (int i = 0; i < pairCount; i++) {
+                    batch->channels[i].channelName = crossSrcChannels[i].name + " > " + crossDstChannels[i].name;
+                    batch->channels[i].totalBytes = batch->totalBytes.load() / pairCount;
+                    batch->channels[i].filesAssigned = 0;
+                }
+                LOG_INFO("Transfer", "Cross-device fast relay ready with " + std::to_string(pairCount) + " channel pair(s)");
+            }
+        }
+
+        if (batch->isCrossDevice && !batch->useDokanRelay &&
+            !crossSrcChannels.empty() && !crossDstChannels.empty()) {
+            DeviceClient& srcDev = m_deviceSlots[batch->srcDeviceSlot & 1];
+            DeviceClient& dstDev = m_deviceSlots[batch->dstDeviceSlot & 1];
+            int pairCount = std::min((int)crossSrcChannels.size(), (int)crossDstChannels.size());
+            pairCount = std::min(pairCount, (int)TransferBatch::MAX_CHANNELS);
+
+            if (!srcDev.isServerRunning() || !dstDev.isServerRunning()) {
+                batch->state = BatchState::Failed;
+                batch->errorMessage = "Both devices must be connected for cross-device transfer";
+                continue;
+            }
+
+            struct RelayWork {
+                int fileIndex;
+                uint64_t offset;
+                uint64_t length;
+            };
+            struct RelayRangeCrc {
+                uint64_t offset;
+                uint64_t length;
+                uint32_t srcCrc;
+                uint32_t dstCrc;
+            };
+
+            static const uint64_t MB = 1024ULL * 1024;
+            static const uint64_t GB = 1024ULL * MB;
+            auto relayReadRangeSizeFor = [](uint64_t fileSize, int channels) -> uint64_t {
+                if (channels <= 1) return fileSize;
+                const uint64_t MB = 1024ULL * 1024;
+                // Paired streaming relays each range immediately. Keep ranges large
+                // enough to avoid overhead, but not so large that one slow pair owns
+                // the tail of a multi-file batch.
+                if (fileSize >= 1024 * MB) return 128 * MB;
+                if (fileSize >= 500 * MB) return 96 * MB;
+                return 64 * MB;
+            };
+            std::vector<bool> skipped(batch->totalFiles(), false);
+            uint64_t newTotal = 0;
+
+            for (int fi = 0; fi < batch->totalFiles() && !m_shutdownTransfer; fi++) {
+                if (batch->stopRequested.load()) break;
+                auto& item = batch->files[fi];
+
+                if (item.isDirectory) {
+                    if (!dstDev.createDirectory(item.destPath)) {
+                        batch->state = BatchState::Failed;
+                        batch->errorMessage = item.displayName + ": create directory failed";
+                        break;
+                    }
+                    continue;
+                }
+
+                if (item.fileSize == 0)
+                    item.fileSize = srcDev.getFileSize(item.sourcePath);
+
+                bool destExists = dstDev.getFileSize(item.destPath) > 0;
+                if (destExists) {
+                    ConflictAction action = batch->conflictAllDecision;
+                    if (action == ConflictAction::None) {
+                        batch->conflictFileName = item.displayName;
+                        batch->waitingConflict = true;
+                        batch->conflictResponse = ConflictAction::None;
+                        batch->state = BatchState::WaitingConflict;
+                        {
+                            std::unique_lock<std::mutex> lk(m_batchMutex);
+                            m_batchCV.wait(lk, [&]() {
+                                return m_shutdownTransfer || batch->stopRequested.load() ||
+                                    batch->conflictResponse.load() != ConflictAction::None;
+                            });
+                        }
+                        batch->waitingConflict = false;
+                        action = batch->conflictResponse.load();
+                        batch->conflictResponse = ConflictAction::None;
+                        batch->state = BatchState::Running;
+                        if (action == ConflictAction::OverwriteAll) {
+                            batch->conflictAllDecision = ConflictAction::OverwriteAll;
+                            action = ConflictAction::Overwrite;
+                        } else if (action == ConflictAction::SkipAll) {
+                            batch->conflictAllDecision = ConflictAction::SkipAll;
+                            action = ConflictAction::Skip;
+                        }
+                    } else {
+                        if (action == ConflictAction::OverwriteAll) action = ConflictAction::Overwrite;
+                        else if (action == ConflictAction::SkipAll) action = ConflictAction::Skip;
+                    }
+
+                    if (batch->stopRequested.load() || m_shutdownTransfer) break;
+                    if (action == ConflictAction::Skip) {
+                        skipped[fi] = true;
+                        batch->skippedFiles++;
+                        continue;
+                    }
+                }
+
+                if (!dstDev.createFile(item.destPath, item.fileSize)) {
+                    batch->state = BatchState::Failed;
+                    batch->errorMessage = item.displayName + ": create destination file failed";
+                    break;
+                }
+                newTotal += item.fileSize;
+            }
+
+            if (batch->state.load() == BatchState::Failed) {
+                for (auto& rc : crossSrcChannels) if (rc.owned) rc.owned->disconnectTcp();
+                for (auto& rc : crossDstChannels) if (rc.owned) rc.owned->disconnectTcp();
+                continue;
+            }
+            if (batch->stopRequested.load() || m_shutdownTransfer) {
+                batch->state = BatchState::Stopped;
+                for (auto& rc : crossSrcChannels) if (rc.owned) rc.owned->disconnectTcp();
+                for (auto& rc : crossDstChannels) if (rc.owned) rc.owned->disconnectTcp();
+                continue;
+            }
+
+            batch->totalBytes = newTotal;
+            std::vector<std::deque<RelayWork>> byFile(batch->totalFiles());
+            std::vector<int> totalBlocksPerFile(batch->totalFiles(), 0);
+            std::vector<int> completedBlocksPerFile(batch->totalFiles(), 0);
+            std::vector<std::vector<RelayRangeCrc>> rangeCrcs(batch->totalFiles());
+            std::set<int> completedFileIndices;
+            int totalReadRanges = 0;
+
+            for (int fi = 0; fi < batch->totalFiles(); fi++) {
+                auto& item = batch->files[fi];
+                if (item.isDirectory || skipped[fi]) continue;
+                uint64_t readRangeSize = relayReadRangeSizeFor(item.fileSize, pairCount);
+                uint64_t remaining = item.fileSize;
+                uint64_t offset = 0;
+                while (remaining > 0) {
+                    uint64_t len = std::min(remaining, readRangeSize);
+                    byFile[fi].push_back({fi, offset, len});
+                    totalReadRanges++;
+                    totalBlocksPerFile[fi]++;
+                    offset += len;
+                    remaining -= len;
+                }
+            }
+
+            std::deque<RelayWork> workQueue;
+            bool added = true;
+            while (added) {
+                added = false;
+                for (auto& blocks : byFile) {
+                    if (blocks.empty()) continue;
+                    workQueue.push_back(blocks.front());
+                    blocks.pop_front();
+                    added = true;
+                }
+            }
+
+            int totalBlocks = totalReadRanges;
+            int progressChannels = std::min(pairCount, (int)TransferBatch::MAX_CHANNELS);
+            for (int c = 0; c < progressChannels; c++) {
+                batch->channels[c].bytesTransferred = 0;
+                batch->channels[c].speed = 0;
+                batch->channels[c].curBlockSize = 0;
+                batch->channels[c].curBlockTransferred = 0;
+                batch->channels[c].relayReadSec = 0;
+                batch->channels[c].relaySendSec = 0;
+                batch->channels[c].currentFile.clear();
+                batch->channels[c].filesAssigned = totalBlocks;
+                batch->channels[c].channelName = crossSrcChannels[c].name + " > " + crossDstChannels[c].name;
+                batch->channels[c].totalBytes = progressChannels > 0 ? batch->totalBytes.load() / progressChannels : 0;
+            }
+            batch->numChannels = progressChannels;
+
+            std::mutex workMutex;
+            std::mutex crcMutex;
+            std::atomic<bool> failed{false};
+            std::atomic<int> completedBlocks{0};
+            std::string relayError;
+            std::mutex relayErrorMutex;
+            std::atomic<uint64_t> bytesWrittenToDest{0};
+
+            auto updateCrossProgress = [&]() {
+                double combinedSpeed = 0;
+                for (int c = 0; c < progressChannels; c++) {
+                    combinedSpeed += batch->channels[c].speed.load();
+                }
+                uint64_t totalTransferred = bytesWrittenToDest.load();
+                uint64_t tb = batch->totalBytes.load();
+                if (tb > 0 && totalTransferred > tb)
+                    totalTransferred = batch->totalTransferred.load();
+                uint64_t currentTotal = batch->totalTransferred.load();
+                if (totalTransferred < currentTotal) totalTransferred = currentTotal;
+                batch->totalTransferred = totalTransferred;
+                if (tb > 0) batch->totalProgress = (float)((double)totalTransferred / (double)tb);
+                batch->speedBytesPerSec = combinedSpeed;
+                batch->etaSeconds = (combinedSpeed > 0 && tb > totalTransferred)
+                    ? (double)(tb - totalTransferred) / combinedSpeed : -1.0;
+            };
+
+            auto relayWorker = [&](int chIdx) {
+                auto& ch = batch->channels[chIdx];
+                DeviceClient& srcCh = *crossSrcChannels[chIdx].dev;
+                DeviceClient& dstCh = *crossDstChannels[chIdx].dev;
+                uint64_t chCompleted = 0;
+                uint64_t lastChBytes = 0;
+                auto chStart = std::chrono::steady_clock::now();
+                auto lastChTime = chStart;
+                ch.channelName = crossSrcChannels[chIdx].name + " > " + crossDstChannels[chIdx].name;
+
+                while (!m_shutdownTransfer && !batch->stopRequested.load() && !failed.load()) {
+                    RelayWork work{};
+                    {
+                        std::lock_guard<std::mutex> lk(workMutex);
+                        if (workQueue.empty()) break;
+                        work = workQueue.front();
+                        workQueue.pop_front();
+                    }
+
+                    auto& item = batch->files[work.fileIndex];
+                    batch->currentFileIndex = work.fileIndex;
+                    batch->curFileSize = item.fileSize;
+                    ch.curBlockSize = work.length;
+                    ch.curBlockTransferred = 0;
+                    ch.currentFile = item.displayName + " [" + formatSize(work.offset) + "]";
+
+                    while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
+                        batch->state = BatchState::Paused;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                    if (m_shutdownTransfer || batch->stopRequested.load() || failed.load())
+                        break;
+                    batch->state = BatchState::Running;
+
+                    auto rangeProgress = [&](uint64_t transferred, uint64_t total) -> bool {
+                        if (m_shutdownTransfer || batch->stopRequested.load() || failed.load())
+                            return false;
+                        while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
+                            batch->state = BatchState::Paused;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        if (m_shutdownTransfer || batch->stopRequested.load()) return false;
+                        batch->state = BatchState::Running;
+
+                        ch.bytesTransferred = chCompleted + transferred;
+                        ch.curBlockTransferred = transferred;
+                        batch->currentFileIndex = work.fileIndex;
+                        batch->curFileSize = item.fileSize;
+                        batch->curFileTransferred = transferred;
+                        if (total > 0)
+                            batch->curFileProgress = (float)((double)transferred / (double)total);
+                        auto now = std::chrono::steady_clock::now();
+                        double dt = std::chrono::duration<double>(now - lastChTime).count();
+                        if (dt >= 0.5) {
+                            uint64_t chBytes = ch.bytesTransferred.load();
+                            double instant = (double)(chBytes - lastChBytes) / dt;
+                            double prev = ch.speed.load();
+                            ch.speed = prev > 0 ? prev * 0.8 + instant * 0.2 : instant;
+                            lastChBytes = chBytes;
+                            lastChTime = now;
+                        }
+                        bytesWrittenToDest = 0;
+                        for (int c = 0; c < progressChannels; c++)
+                            bytesWrittenToDest += batch->channels[c].bytesTransferred.load();
+                        updateCrossProgress();
+                        m_lastTransferActivity = std::chrono::steady_clock::now();
+                        return true;
+                    };
+
+                    DeviceClient::RelayRangeStats relayStats;
+                    bool relayed = DeviceClient::relayRange(srcCh, dstCh,
+                        item.sourcePath, item.destPath,
+                        work.offset, work.offset, work.length,
+                        rangeProgress, &relayStats);
+
+                    ch.relayReadSec = ch.relayReadSec.load() + relayStats.srcRecvSec;
+                    ch.relaySendSec = ch.relaySendSec.load() + relayStats.dstSendSec;
+
+                    if (!relayed && !batch->stopRequested.load()) {
+                        failed = true;
+                        std::lock_guard<std::mutex> lk(relayErrorMutex);
+                        relayError = item.displayName + ": " + ch.channelName;
+                        if (!srcCh.lastError().empty())
+                            relayError += ", " + srcCh.lastError();
+                        if (!dstCh.lastError().empty())
+                            relayError += ", " + dstCh.lastError();
+                        break;
+                    }
+
+                    chCompleted += work.length;
+                    ch.bytesTransferred = chCompleted;
+                    ch.curBlockTransferred = work.length;
+                    ch.filesCompleted++;
+                    bytesWrittenToDest = 0;
+                    for (int c = 0; c < progressChannels; c++)
+                        bytesWrittenToDest += batch->channels[c].bytesTransferred.load();
+                    updateCrossProgress();
+                    completedBlocks++;
+                    {
+                        std::lock_guard<std::mutex> lk(workMutex);
+                        if (relayStats.hasSrcCrc && relayStats.hasDstCrc) {
+                            std::lock_guard<std::mutex> crcLk(crcMutex);
+                            rangeCrcs[work.fileIndex].push_back({
+                                work.offset, work.length, relayStats.srcCrc, relayStats.dstCrc
+                            });
+                        }
+                        completedBlocksPerFile[work.fileIndex]++;
+                        if (completedBlocksPerFile[work.fileIndex] >= totalBlocksPerFile[work.fileIndex])
+                            completedFileIndices.insert(work.fileIndex);
+                    }
+                }
+                ch.speed = 0;
+                ch.elapsedSec = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - chStart).count();
+            };
+
+            LOG_INFO("Transfer", "Cross-device streaming relay: " + std::to_string(batch->totalFiles()) +
+                " files using " + std::to_string(pairCount) + " channel pair(s), " +
+                std::to_string(totalReadRanges) + " interleaved range(s)");
+
+            std::vector<std::thread> relayThreads;
+            for (int c = 0; c < pairCount; c++)
+                relayThreads.emplace_back(relayWorker, c);
+            for (auto& t : relayThreads) t.join();
+
+            if (failed.load() || (!batch->stopRequested.load() && completedBlocks.load() < totalBlocks)) {
+                batch->state = BatchState::Failed;
+                batch->errorMessage = relayError.empty() ? "Cross-device transfer failed" : relayError;
+                for (int fi = 0; fi < batch->totalFiles(); fi++) {
+                    auto& item = batch->files[fi];
+                    if (item.isDirectory || skipped[fi]) continue;
+                    if (completedFileIndices.count(fi)) continue;
+                    dstDev.deleteFile(item.destPath);
+                }
+            } else if (batch->stopRequested.load()) {
+                batch->state = BatchState::Stopped;
+                for (int fi = 0; fi < batch->totalFiles(); fi++) {
+                    auto& item = batch->files[fi];
+                    if (item.isDirectory || skipped[fi]) continue;
+                    if (completedFileIndices.count(fi)) continue;
+                    dstDev.deleteFile(item.destPath);
+                }
+            } else {
+                bool anyCrcFail = false;
+                if (m_prefs.enableCrcVerification) {
+                    batch->state = BatchState::Verifying;
+                    for (int fi = 0; fi < batch->totalFiles() && !batch->stopRequested.load(); fi++) {
+                        auto& item = batch->files[fi];
+                        if (item.isDirectory || skipped[fi]) continue;
+
+                        batch->crcFileName = item.displayName;
+                        batch->crcProgress = 1.0f;
+                        batch->crcPhase = 2;
+                        batch->errorMessage = "Verifying: " + item.displayName;
+
+                        auto blocks = rangeCrcs[fi];
+                        std::sort(blocks.begin(), blocks.end(),
+                                  [](const RelayRangeCrc& a, const RelayRangeCrc& b) {
+                                      return a.offset < b.offset;
+                                  });
+
+                        bool crcOk = !blocks.empty();
+                        bool inlineCrcComplete = !blocks.empty() &&
+                            blocks.size() == (size_t)totalBlocksPerFile[fi];
+                        uint64_t expectedOffset = 0;
+                        uint32_t srcCrc = 0;
+                        uint32_t dstCrc = 0;
+                        std::string crcFailReason;
+                        if (blocks.empty()) {
+                            crcFailReason = "inline range CRC unavailable";
+                        } else if (!inlineCrcComplete) {
+                            crcOk = false;
+                            crcFailReason = "inline range CRC incomplete: " +
+                                std::to_string(blocks.size()) + "/" +
+                                std::to_string(totalBlocksPerFile[fi]) + " ranges";
+                        } else {
+                            srcCrc = blocks[0].srcCrc;
+                            dstCrc = blocks[0].dstCrc;
+                            expectedOffset = blocks[0].length;
+                            crcOk = (blocks[0].offset == 0);
+                            if (!crcOk)
+                                crcFailReason = "first range does not start at offset 0";
+                            else if (blocks[0].srcCrc != blocks[0].dstCrc) {
+                                crcOk = false;
+                                crcFailReason = "range CRC mismatch at offset 0";
+                            }
+                        }
+                        for (size_t i = 1; crcOk && i < blocks.size(); i++) {
+                            if (blocks[i].offset != expectedOffset) {
+                                crcOk = false;
+                                crcFailReason = "missing range at offset " + std::to_string(expectedOffset);
+                                break;
+                            }
+                            if (blocks[i].srcCrc != blocks[i].dstCrc) {
+                                crcOk = false;
+                                crcFailReason = "range CRC mismatch at offset " + std::to_string(blocks[i].offset);
+                                break;
+                            }
+                            srcCrc = crc32Combine(srcCrc, blocks[i].srcCrc, blocks[i].length);
+                            dstCrc = crc32Combine(dstCrc, blocks[i].dstCrc, blocks[i].length);
+                            expectedOffset += blocks[i].length;
+                        }
+                        if (crcOk && expectedOffset != item.fileSize) {
+                            crcOk = false;
+                            crcFailReason = "range coverage ended at " + std::to_string(expectedOffset) +
+                                " of " + std::to_string(item.fileSize);
+                        }
+                        if (crcOk)
+                            crcOk = (srcCrc == dstCrc);
+                        if (!crcOk && crcFailReason.empty())
+                            crcFailReason = "combined CRC mismatch";
+
+                        bool usedFallbackCrc = false;
+                        double srcRemoteMs = 0.0;
+                        double dstRemoteMs = 0.0;
+                        std::string fallbackDetail;
+                        if (!crcOk) {
+                            uint32_t srcRemoteCrc = 0;
+                            uint32_t dstRemoteCrc = 0;
+                            std::string srcDetail;
+                            std::string dstDetail;
+                            bool srcRemoteOk = srcDev.getRemoteCrc32(item.sourcePath, srcRemoteCrc,
+                                srcDetail, item.fileSize, &srcRemoteMs);
+                            bool dstRemoteOk = dstDev.getRemoteCrc32(item.destPath, dstRemoteCrc,
+                                dstDetail, item.fileSize, &dstRemoteMs);
+                            usedFallbackCrc = true;
+
+                            char fbBuf[192];
+                            snprintf(fbBuf, sizeof(fbBuf),
+                                     "Source remote: %08X  Destination remote: %08X",
+                                     srcRemoteCrc, dstRemoteCrc);
+                            fallbackDetail = fbBuf;
+
+                            if (srcRemoteOk && dstRemoteOk) {
+                                crcOk = (srcRemoteCrc == dstRemoteCrc);
+                                if (crcOk) {
+                                    srcCrc = srcRemoteCrc;
+                                    dstCrc = dstRemoteCrc;
+                                } else {
+                                    crcFailReason = "remote CRC mismatch after inline failure: " + crcFailReason;
+                                }
+                            } else {
+                                std::string remoteReason = "remote CRC fallback failed";
+                                if (!srcRemoteOk) remoteReason += " (source: " + srcDetail + ")";
+                                if (!dstRemoteOk) remoteReason += " (destination: " + dstDetail + ")";
+                                crcFailReason = remoteReason + " after inline failure: " + crcFailReason;
+                            }
+                        }
+
+                        char detailBuf[160];
+                        snprintf(detailBuf, sizeof(detailBuf),
+                                 "Source inline: %08X  Destination inline: %08X",
+                                 srcCrc, dstCrc);
+
+                        TransferBatch::CrcResult crcRes;
+                        crcRes.fileName = item.displayName;
+                        crcRes.passed = crcOk;
+                        if (usedFallbackCrc) {
+                            crcRes.detail = fallbackDetail + " (inline: " + crcFailReason + ")";
+                        } else {
+                            crcRes.detail = crcOk ? detailBuf : std::string(detailBuf) + " (" + crcFailReason + ")";
+                        }
+                        crcRes.remoteMs = srcRemoteMs;
+                        crcRes.localMs = dstRemoteMs;
+                        crcRes.totalMs = srcRemoteMs + dstRemoteMs;
+                        crcRes.fileSize = item.fileSize;
+                        crcRes.sourcePath = item.sourcePath;
+                        crcRes.destPath = item.destPath;
+                        batch->crcResults.push_back(std::move(crcRes));
+
+                        if (!crcOk) {
+                            anyCrcFail = true;
+                            LOG_ERROR("Transfer", "CRC FAILED (cross-device inline): " + item.displayName +
+                                " - " + crcFailReason);
+                        } else if (usedFallbackCrc) {
+                            LOG_WARN("Transfer", "CRC OK (cross-device remote fallback): " + item.displayName +
+                                " - inline check could not complete: " + crcFailReason);
+                        } else {
+                            LOG_INFO("Transfer", "CRC OK (cross-device inline): " + item.displayName);
+                        }
+                    }
+                    batch->crcFileName.clear();
+                    batch->crcProgress = 0.0f;
+                    batch->crcPhase = 0;
+                }
+
+                batch->totalProgress = 1.0f;
+                batch->totalTransferred = batch->totalBytes.load();
+                auto totalTime = std::chrono::steady_clock::now() - batch->startTime;
+                double activeSec = std::chrono::duration<double>(totalTime).count() -
+                    batch->pausedSeconds.load();
+                if (activeSec < 0.1) activeSec = 0.1;
+                double avgSpeed = (double)batch->totalTransferred.load() / activeSec;
+                batch->finalAvgSpeed = avgSpeed;
+                batch->finalTimeSec = activeSec;
+                batch->speedBytesPerSec = 0;
+                batch->etaSeconds = -1;
+                if (anyCrcFail) {
+                    batch->state = BatchState::Failed;
+                    batch->errorMessage = "CRC verification failed - file(s) may be corrupted";
+                } else {
+                    batch->state = BatchState::Completed;
+                    logBatchPerformance("cross-device streaming relay", activeSec, avgSpeed);
+                    batch->errorMessage.clear();
+                }
+                m_statusMessage = "Cross-device done: " + std::to_string(batch->totalFiles()) + " files, " +
+                    formatSize(batch->totalTransferred.load()) + " @ " + formatSpeed(avgSpeed);
+                m_statusTime = std::chrono::steady_clock::now();
+                m_leftPanel.needsRefresh = true;
+                m_rightPanel.needsRefresh = true;
+            }
+
+            for (auto& rc : crossSrcChannels) if (rc.owned) rc.owned->disconnectTcp();
+            for (auto& rc : crossDstChannels) if (rc.owned) rc.owned->disconnectTcp();
+            continue;
+        }
 
         // --- Fast parallel MCRAW batch extraction ---
         // If this is a local copy and contains MCRAW virtual DNG frames from the same container,
@@ -7882,6 +9113,16 @@ void App::processBatchQueue() {
                 } else {
                     batch->state = BatchState::Failed;
                     batch->errorMessage = "MCRAW batch extraction failed";
+                }
+                if (batch->state.load() == BatchState::Completed) {
+                    auto totalTime = std::chrono::steady_clock::now() - batch->startTime;
+                    double activeSec = std::chrono::duration<double>(totalTime).count() -
+                        batch->pausedSeconds.load();
+                    if (activeSec < 0.1) activeSec = 0.1;
+                    double avgSpeed = (double)batch->totalTransferred.load() / activeSec;
+                    batch->finalAvgSpeed = avgSpeed;
+                    batch->finalTimeSec = activeSec;
+                    logBatchPerformance("MCRAW batch extraction", activeSec, avgSpeed);
                 }
                 continue; // skip per-item loop
             }
@@ -8044,8 +9285,11 @@ void App::processBatchQueue() {
 
                 // Update total progress
                 uint64_t totalTx = bytesCompletedBefore + transferred;
-                batch->totalTransferred = totalTx;
                 uint64_t tb = batch->totalBytes.load();
+                if (tb > 0 && totalTx > tb) totalTx = tb;
+                uint64_t currentTotal = batch->totalTransferred.load();
+                if (totalTx < currentTotal) totalTx = currentTotal;
+                batch->totalTransferred = totalTx;
                 if (tb > 0) batch->totalProgress = (float)((double)totalTx / (double)tb);
 
                 // Speed/ETA
@@ -8160,6 +9404,184 @@ void App::processBatchQueue() {
                 if (item.isDirectory) {
                     // Create directory on destination device
                     ok = dstDev.createDirectory(item.destPath);
+                } else if (!batch->useDokanRelay) {
+                    int pairCount = std::min((int)crossSrcChannels.size(), (int)crossDstChannels.size());
+                    pairCount = std::min(pairCount, (int)TransferBatch::MAX_CHANNELS);
+
+                    if (pairCount <= 0) {
+                        ok = DeviceClient::relayFile(srcDev, dstDev, item.sourcePath, item.destPath,
+                                                     item.fileSize, progressCb);
+                    } else {
+                        if (item.fileSize == 0)
+                            item.fileSize = srcDev.getFileSize(item.sourcePath);
+
+                        ok = dstDev.createFile(item.destPath, item.fileSize);
+                        if (ok) {
+                            static const uint64_t MB = 1024ULL * 1024;
+                            static const uint64_t GB = 1024ULL * MB;
+                            auto blockSizeFor = [](uint64_t fileSize, int channels) -> uint64_t {
+                                if (channels <= 1) return fileSize;
+                                const uint64_t MB = 1024ULL * 1024;
+                                const uint64_t GB = 1024ULL * MB;
+                                if (fileSize >= 2 * GB) return 128 * MB;
+                                if (fileSize >= 512 * MB) return 96 * MB;
+                                return 64 * MB;
+                            };
+
+                            struct RelayBlock {
+                                uint64_t offset;
+                                uint64_t length;
+                            };
+
+                            std::deque<RelayBlock> workQueue;
+                            uint64_t blockSize = blockSizeFor(item.fileSize, pairCount);
+                            uint64_t remaining = item.fileSize;
+                            uint64_t offset = 0;
+                            while (remaining > 0) {
+                                uint64_t len = std::min(remaining, blockSize);
+                                workQueue.push_back({offset, len});
+                                offset += len;
+                                remaining -= len;
+                            }
+
+                            std::mutex workMutex;
+                            std::atomic<bool> failed{false};
+                            std::atomic<int> completedBlocks{0};
+                            int totalBlocks = (int)workQueue.size();
+                            std::string relayError;
+                            std::mutex relayErrorMutex;
+
+                            for (int c = 0; c < pairCount; c++) {
+                                batch->channels[c].bytesTransferred = 0;
+                                batch->channels[c].speed = 0;
+                                batch->channels[c].curBlockSize = 0;
+                                batch->channels[c].curBlockTransferred = 0;
+                                batch->channels[c].relayReadSec = 0;
+                                batch->channels[c].relaySendSec = 0;
+                                batch->channels[c].currentFile = item.displayName;
+                                batch->channels[c].filesAssigned = totalBlocks;
+                                batch->channels[c].channelName = crossSrcChannels[c].name + " > " + crossDstChannels[c].name;
+                            }
+                            batch->numChannels = pairCount;
+
+                            auto updateCombinedProgress = [&]() {
+                                uint64_t fileTransferred = 0;
+                                double combinedSpeed = 0;
+                                for (int c = 0; c < pairCount; c++) {
+                                    fileTransferred += batch->channels[c].bytesTransferred.load();
+                                    combinedSpeed += batch->channels[c].speed.load();
+                                }
+                                if (fileTransferred > item.fileSize) fileTransferred = item.fileSize;
+                                batch->curFileTransferred = fileTransferred;
+                                if (item.fileSize > 0)
+                                    batch->curFileProgress = (float)((double)fileTransferred / (double)item.fileSize);
+                                uint64_t totalTx = bytesCompletedBefore + fileTransferred;
+                                uint64_t tb = batch->totalBytes.load();
+                                if (tb > 0 && totalTx > tb) totalTx = tb;
+                                uint64_t currentTotal = batch->totalTransferred.load();
+                                if (totalTx < currentTotal) totalTx = currentTotal;
+                                batch->totalTransferred = totalTx;
+                                if (tb > 0) batch->totalProgress = (float)((double)totalTx / (double)tb);
+                                batch->speedBytesPerSec = combinedSpeed;
+                                batch->etaSeconds = (combinedSpeed > 0 && tb > totalTx)
+                                    ? (double)(tb - totalTx) / combinedSpeed : -1.0;
+                            };
+
+                            auto relayWorker = [&](int chIdx) {
+                                auto& ch = batch->channels[chIdx];
+                                DeviceClient& srcCh = *crossSrcChannels[chIdx].dev;
+                                DeviceClient& dstCh = *crossDstChannels[chIdx].dev;
+                                uint64_t chCompleted = 0;
+                                uint64_t lastChBytes = 0;
+                                auto lastChTime = std::chrono::steady_clock::now();
+
+                                while (!m_shutdownTransfer && !batch->stopRequested.load() && !failed.load()) {
+                                    RelayBlock block{};
+                                    {
+                                        std::lock_guard<std::mutex> lk(workMutex);
+                                        if (workQueue.empty()) break;
+                                        block = workQueue.front();
+                                        workQueue.pop_front();
+                                    }
+
+                                    ch.curBlockSize = block.length;
+                                    ch.curBlockTransferred = 0;
+                                    ch.currentFile = item.displayName + " [" + formatSize(block.offset) + "]";
+
+                                    auto rangeProgress = [&](uint64_t transferred, uint64_t total) -> bool {
+                                        if (m_shutdownTransfer || batch->stopRequested.load() || failed.load())
+                                            return false;
+                                        while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
+                                            batch->state = BatchState::Paused;
+                                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                                        }
+                                        if (m_shutdownTransfer || batch->stopRequested.load()) return false;
+                                        batch->state = BatchState::Running;
+
+                                        ch.bytesTransferred = chCompleted + transferred;
+                                        ch.curBlockTransferred = transferred;
+
+                                        auto now = std::chrono::steady_clock::now();
+                                        double dt = std::chrono::duration<double>(now - lastChTime).count();
+                                        if (dt >= 0.5) {
+                                            uint64_t chBytes = ch.bytesTransferred.load();
+                                            double instant = (double)(chBytes - lastChBytes) / dt;
+                                            double prev = ch.speed.load();
+                                            ch.speed = prev > 0 ? prev * 0.8 + instant * 0.2 : instant;
+                                            lastChBytes = chBytes;
+                                            lastChTime = now;
+                                        }
+
+                                        updateCombinedProgress();
+                                        m_lastTransferActivity = std::chrono::steady_clock::now();
+                                        return true;
+                                    };
+
+                                    DeviceClient::RelayRangeStats relayStats;
+                                    bool relayed = DeviceClient::relayRange(srcCh, dstCh,
+                                        item.sourcePath, item.destPath,
+                                        block.offset, block.offset, block.length,
+                                        rangeProgress, &relayStats);
+
+                                    ch.relayReadSec = ch.relayReadSec.load() + relayStats.srcRecvSec;
+                                    ch.relaySendSec = ch.relaySendSec.load() + relayStats.dstSendSec;
+
+                                    if (!relayed && !batch->stopRequested.load()) {
+                                        failed = true;
+                                        std::lock_guard<std::mutex> lk(relayErrorMutex);
+                                        relayError = ch.channelName + ": " + srcCh.lastError();
+                                        if (relayError.find(": ") == relayError.size() - 2)
+                                            relayError += dstCh.lastError();
+                                        break;
+                                    }
+
+                                    chCompleted += block.length;
+                                    ch.bytesTransferred = chCompleted;
+                                    ch.curBlockTransferred = block.length;
+                                    ch.filesCompleted = completedBlocks.fetch_add(1) + 1;
+                                    updateCombinedProgress();
+                                }
+                                ch.speed = 0;
+                            };
+
+                            LOG_INFO("Transfer", "Cross-device pipelined relay: " + item.displayName +
+                                " using " + std::to_string(pairCount) + " channel pair(s), " +
+                                std::to_string(totalBlocks) + " block(s)");
+
+                            std::vector<std::thread> relayThreads;
+                            for (int c = 0; c < pairCount; c++)
+                                relayThreads.emplace_back(relayWorker, c);
+                            for (auto& t : relayThreads) t.join();
+
+                            ok = !failed.load() && !batch->stopRequested.load() &&
+                                 completedBlocks.load() >= totalBlocks;
+                            if (!ok && !batch->stopRequested.load()) {
+                                if (!relayError.empty())
+                                    batch->errorMessage = item.displayName + ": " + relayError;
+                                dstDev.deleteFile(item.destPath);
+                            }
+                        }
+                    }
                 } else {
                     // Zero-copy relay: stream directly from device A to device B through PC memory
                     ok = DeviceClient::relayFile(srcDev, dstDev, item.sourcePath, item.destPath,
@@ -8169,7 +9591,8 @@ void App::processBatchQueue() {
                 if (batch->stopRequested.load()) { batch->state = BatchState::Stopped; break; }
                 if (!ok) {
                     batch->state = BatchState::Failed;
-                    batch->errorMessage = item.displayName + ": cross-device transfer failed";
+                    if (batch->errorMessage.empty())
+                        batch->errorMessage = item.displayName + ": cross-device transfer failed";
                     break;
                 }
 
@@ -8438,6 +9861,13 @@ void App::processBatchQueue() {
             batch->curFileProgress = 1.0f;
         }
 
+        for (auto& rc : crossSrcChannels) {
+            if (rc.owned) rc.owned->disconnectTcp();
+        }
+        for (auto& rc : crossDstChannels) {
+            if (rc.owned) rc.owned->disconnectTcp();
+        }
+
         // Clean up partial files and flush stale data on stop/cancel/error
         if (batch->state.load() == BatchState::Stopped || batch->state.load() == BatchState::Failed) {
             // Delete the partially-transferred file (the one that was in progress when stopped)
@@ -8484,6 +9914,9 @@ void App::processBatchQueue() {
             batch->speedBytesPerSec = 0;
             batch->etaSeconds = -1;
             batch->state = BatchState::Completed;
+            logBatchPerformance(batch->isCrossDevice ? "cross-device streamed" :
+                                (batch->isLocalCopy ? "local copy" : "single-channel"),
+                                activeSec, avgSpeed);
 
             std::string skippedStr = (batch->skippedFiles > 0)
                 ? " (" + std::to_string(batch->skippedFiles) + " skipped)" : "";

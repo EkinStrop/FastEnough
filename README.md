@@ -73,7 +73,7 @@ Only required if you modify `server/afm-server.cpp` or anything it pulls in.
 
 ```powershell
 $NDK = "$env:LOCALAPPDATA\Android\Sdk\ndk\28.2.13676358"
-$CXX = "$NDK\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android21-clang++.exe"
+$CXX = "$NDK\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android21-clang++.cmd"
 
 & $CXX -O2 -static -std=c++17 -march=armv8-a+crc `
   -Ithirdparty/motioncam/include -Ithirdparty `

@@ -30,6 +30,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <deque>
 
 #include <motioncam/Decoder.hpp>
 #include <nlohmann/json.hpp>
@@ -45,6 +46,14 @@
 static int g_running = 1;
 
 // --- Helpers ---
+
+static void tune_socket(int fd) {
+    int bufsize = 4 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+}
 
 static int send_all(int fd, const void* buf, size_t len) {
     const char* p = (const char*)buf;
@@ -385,16 +394,142 @@ struct WriteJob {
     int       active;
 };
 
+struct QueuedWrite {
+    char* buf;
+    uint32_t len;
+    uint64_t offset;
+};
+
+struct AsyncWriter {
+    int file_fd;
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t has_work;
+    pthread_cond_t has_free;
+    std::deque<QueuedWrite> queue;
+    std::vector<char*> free_buffers;
+    std::vector<char*> all_buffers;
+    bool done;
+    bool error;
+};
+
 static void* write_thread_func(void* arg) {
     WriteJob* job = (WriteJob*)arg;
     uint32_t written = 0;
     while (written < job->len) {
-        ssize_t w = write(job->file_fd, job->buf + written, job->len - written);
+        ssize_t w = pwrite(job->file_fd, job->buf + written, job->len - written,
+                           (off_t)(job->offset + written));
         if (w <= 0) { job->error = 1; break; }
         written += w;
     }
-    posix_fadvise(job->file_fd, job->offset, job->len, POSIX_FADV_DONTNEED);
     return NULL;
+}
+
+static void* async_writer_thread_func(void* arg) {
+    AsyncWriter* writer = (AsyncWriter*)arg;
+    while (1) {
+        QueuedWrite task{};
+        pthread_mutex_lock(&writer->mutex);
+        while (writer->queue.empty() && !writer->done && !writer->error)
+            pthread_cond_wait(&writer->has_work, &writer->mutex);
+        if ((writer->done && writer->queue.empty()) || writer->error) {
+            pthread_mutex_unlock(&writer->mutex);
+            break;
+        }
+        task = writer->queue.front();
+        writer->queue.pop_front();
+        pthread_mutex_unlock(&writer->mutex);
+
+        uint32_t written = 0;
+        while (written < task.len) {
+            ssize_t w = pwrite(writer->file_fd, task.buf + written, task.len - written,
+                               (off_t)(task.offset + written));
+            if (w <= 0) {
+                pthread_mutex_lock(&writer->mutex);
+                writer->error = true;
+                pthread_cond_broadcast(&writer->has_free);
+                pthread_cond_broadcast(&writer->has_work);
+                pthread_mutex_unlock(&writer->mutex);
+                return NULL;
+            }
+            written += w;
+        }
+
+        pthread_mutex_lock(&writer->mutex);
+        writer->free_buffers.push_back(task.buf);
+        pthread_cond_signal(&writer->has_free);
+        pthread_mutex_unlock(&writer->mutex);
+    }
+    return NULL;
+}
+
+static bool async_writer_start(AsyncWriter* writer, int file_fd, int depth) {
+    writer->file_fd = file_fd;
+    writer->done = false;
+    writer->error = false;
+    pthread_mutex_init(&writer->mutex, NULL);
+    pthread_cond_init(&writer->has_work, NULL);
+    pthread_cond_init(&writer->has_free, NULL);
+    for (int i = 0; i < depth; i++) {
+        char* buf = (char*)malloc(BUF_SIZE + 64);
+        if (!buf) {
+            writer->error = true;
+            break;
+        }
+        writer->all_buffers.push_back(buf);
+        writer->free_buffers.push_back(buf);
+    }
+    if (writer->error || writer->free_buffers.empty())
+        return false;
+    return pthread_create(&writer->thread, NULL, async_writer_thread_func, writer) == 0;
+}
+
+static char* async_writer_acquire(AsyncWriter* writer) {
+    pthread_mutex_lock(&writer->mutex);
+    while (writer->free_buffers.empty() && !writer->error)
+        pthread_cond_wait(&writer->has_free, &writer->mutex);
+    if (writer->error) {
+        pthread_mutex_unlock(&writer->mutex);
+        return NULL;
+    }
+    char* buf = writer->free_buffers.back();
+    writer->free_buffers.pop_back();
+    pthread_mutex_unlock(&writer->mutex);
+    return buf;
+}
+
+static bool async_writer_submit(AsyncWriter* writer, char* buf, uint32_t len, uint64_t offset) {
+    pthread_mutex_lock(&writer->mutex);
+    if (writer->error) {
+        writer->free_buffers.push_back(buf);
+        pthread_cond_signal(&writer->has_free);
+        pthread_mutex_unlock(&writer->mutex);
+        return false;
+    }
+    writer->queue.push_back({ buf, len, offset });
+    pthread_cond_signal(&writer->has_work);
+    pthread_mutex_unlock(&writer->mutex);
+    return true;
+}
+
+static bool async_writer_finish(AsyncWriter* writer) {
+    pthread_mutex_lock(&writer->mutex);
+    writer->done = true;
+    pthread_cond_broadcast(&writer->has_work);
+    pthread_mutex_unlock(&writer->mutex);
+    pthread_join(writer->thread, NULL);
+    return !writer->error;
+}
+
+static void async_writer_destroy(AsyncWriter* writer) {
+    for (char* buf : writer->all_buffers)
+        free(buf);
+    writer->all_buffers.clear();
+    writer->free_buffers.clear();
+    writer->queue.clear();
+    pthread_cond_destroy(&writer->has_work);
+    pthread_cond_destroy(&writer->has_free);
+    pthread_mutex_destroy(&writer->mutex);
 }
 
 static void handle_push(int fd, const void* payload, uint32_t payload_len) {
@@ -436,54 +571,45 @@ static void handle_push(int fd, const void* payload, uint32_t payload_len) {
 
     if (send_ok(fd, NULL, 0) < 0) { close(file_fd); return; }
 
-    char* buf_a = (char*)malloc(BUF_SIZE + 64);
-    char* buf_b = (char*)malloc(BUF_SIZE + 64);
-    char* recv_buf = buf_a;
     uint64_t received = 0;
     int error = 0;
 
     // Inline CRC: compute while receiving (free — data is already in memory)
     uint32_t push_crc = ~(uint32_t)0;
 
-    WriteJob wjob;
-    wjob.file_fd = file_fd;
-    wjob.active = 0;
-    wjob.error = 0;
+    AsyncWriter writer;
+    if (!async_writer_start(&writer, file_fd, 6)) {
+        async_writer_destroy(&writer);
+        close(file_fd);
+        send_error(fd, "Failed to start writer");
+        return;
+    }
 
     while (1) {
         MsgHeader hdr;
         if (recv_all(fd, &hdr, sizeof(hdr)) < 0) { error = 1; break; }
         if (hdr.cmd == RSP_DONE) break;
         if (hdr.cmd != RSP_DATA || hdr.length == 0) { error = 1; break; }
+        if (hdr.length > BUF_SIZE) { error = 1; break; }
+
+        char* recv_buf = async_writer_acquire(&writer);
+        if (!recv_buf) { error = 1; break; }
         if (recv_all(fd, recv_buf, hdr.length) < 0) { error = 1; break; }
 
         // CRC the received chunk before handing to write thread
         crc32_update_raw(&push_crc, recv_buf, hdr.length);
 
-        if (wjob.active) {
-            pthread_join(wjob.thread, NULL);
-            wjob.active = 0;
-            if (wjob.error) { error = 1; break; }
+        if (!async_writer_submit(&writer, recv_buf, hdr.length, received)) {
+            error = 1;
+            break;
         }
-
-        wjob.buf = recv_buf;
-        wjob.len = hdr.length;
-        wjob.offset = received;
-        wjob.error = 0;
-        wjob.active = 1;
-        pthread_create(&wjob.thread, NULL, write_thread_func, &wjob);
-
-        recv_buf = (recv_buf == buf_a) ? buf_b : buf_a;
         received += hdr.length;
     }
 
-    if (wjob.active) {
-        pthread_join(wjob.thread, NULL);
-        if (wjob.error) error = 1;
-    }
+    if (!async_writer_finish(&writer))
+        error = 1;
+    async_writer_destroy(&writer);
 
-    free(buf_a);
-    free(buf_b);
     fsync(file_fd);
     close(file_fd);
 
@@ -640,6 +766,7 @@ static void handle_read_range(int fd, const void* payload, uint32_t payload_len)
 
     // Send actual length we'll return
     if (send_ok(fd, &length, sizeof(length)) < 0) { close(file_fd); return; }
+    posix_fadvise(file_fd, (off_t)offset, (off_t)length, POSIX_FADV_SEQUENTIAL);
 
     // Stream the range using sendfile
     uint64_t remaining = length;
@@ -705,21 +832,22 @@ static void handle_write_range(int fd, const void* payload, uint32_t payload_len
         close(file_fd);
         return;
     }
+    posix_fadvise(file_fd, (off_t)offset, (off_t)length, POSIX_FADV_SEQUENTIAL);
 
     // Send OK to signal ready for data
     if (send_ok(fd, NULL, 0) < 0) { close(file_fd); return; }
 
-    // Double-buffered receive: recv chunk N+1 while writing chunk N in background
-    char* buf_a = (char*)malloc(BUF_SIZE + 64);
-    char* buf_b = (char*)malloc(BUF_SIZE + 64);
-    char* recv_buf = buf_a;
     uint64_t written = 0;
     int error = 0;
+    uint32_t range_crc = ~(uint32_t)0;
 
-    WriteJob wjob;
-    wjob.file_fd = file_fd;
-    wjob.active = 0;
-    wjob.error = 0;
+    AsyncWriter writer;
+    if (!async_writer_start(&writer, file_fd, 6)) {
+        async_writer_destroy(&writer);
+        close(file_fd);
+        send_error(fd, "Failed to start writer");
+        return;
+    }
 
     while (1) {
         MsgHeader hdr;
@@ -728,34 +856,22 @@ static void handle_write_range(int fd, const void* payload, uint32_t payload_len
         if (hdr.cmd != RSP_DATA || hdr.length == 0) { error = 1; break; }
         if (hdr.length > BUF_SIZE) { error = 1; break; }
 
+        char* recv_buf = async_writer_acquire(&writer);
+        if (!recv_buf) { error = 1; break; }
         if (recv_all(fd, recv_buf, hdr.length) < 0) { error = 1; break; }
+        crc32_update_raw(&range_crc, recv_buf, hdr.length);
 
-        // Wait for previous write to finish
-        if (wjob.active) {
-            pthread_join(wjob.thread, NULL);
-            wjob.active = 0;
-            if (wjob.error) { error = 1; break; }
+        if (!async_writer_submit(&writer, recv_buf, hdr.length, offset + written)) {
+            error = 1;
+            break;
         }
-
-        // Spawn background write
-        wjob.buf = recv_buf;
-        wjob.len = hdr.length;
-        wjob.offset = offset + written;
-        wjob.error = 0;
-        wjob.active = 1;
-        pthread_create(&wjob.thread, NULL, write_thread_func, &wjob);
-
-        recv_buf = (recv_buf == buf_a) ? buf_b : buf_a;
         written += hdr.length;
     }
 
-    if (wjob.active) {
-        pthread_join(wjob.thread, NULL);
-        if (wjob.error) error = 1;
-    }
+    if (!async_writer_finish(&writer))
+        error = 1;
+    async_writer_destroy(&writer);
 
-    free(buf_a);
-    free(buf_b);
     // No fsync per block — kernel writeback handles persistence.
     // File was pre-allocated by createFile; blocks are non-overlapping.
     close(file_fd);
@@ -763,7 +879,14 @@ static void handle_write_range(int fd, const void* payload, uint32_t payload_len
     if (error) {
         send_error(fd, "Write failed");
     } else {
-        send_ok(fd, &written, sizeof(written));
+        range_crc = ~range_crc;
+        struct {
+            uint64_t written;
+            uint32_t crc;
+        } resp;
+        resp.written = written;
+        resp.crc = range_crc;
+        send_ok(fd, &resp, sizeof(resp));
     }
 }
 
@@ -1435,7 +1558,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (listen(server_fd, 4) < 0) {
+    if (listen(server_fd, 32) < 0) {
         perror("listen");
         close(server_fd);
         return 1;
@@ -1452,6 +1575,7 @@ int main(int argc, char** argv) {
             if (errno == EINTR) continue;
             break;
         }
+        tune_socket(client_fd);
 
         // Spawn a thread per client for parallel transfers
         pthread_t t;
