@@ -3076,8 +3076,6 @@ void App::renderTransferOverlay() {
         double dt = std::clamp(nowTime - displayedLastFrameTime, 0.0, 0.25);
         displayedLastFrameTime = nowTime;
         double targetTx = (double)totalTx;
-        if (totalBytes > 0 && totalTx >= totalBytes && st != BatchState::Completed)
-            targetTx = (double)totalBytes * 0.995;
         if (targetTx >= displayedTotalTxD) {
             double minRate = 64.0 * 1024.0 * 1024.0;
             double catchupRate = totalBytes > 0 ? (double)totalBytes * 0.04 : minRate;
@@ -3093,6 +3091,35 @@ void App::renderTransferOverlay() {
     float totalDisplayProg = totalBytes > 0
         ? (float)std::clamp(displayedTotalTxD / (double)totalBytes, 0.0, 1.0)
         : totalProg;
+    auto formatSizeFixed = [](uint64_t bytes, int decimals) {
+        const char* u[] = {"B", "KB", "MB", "GB", "TB"};
+        int i = 0;
+        double s = (double)bytes;
+        while (s >= 1024.0 && i < 4) { s /= 1024.0; i++; }
+
+        char buf[48];
+        if (i == 0) snprintf(buf, sizeof(buf), "%llu B", bytes);
+        else snprintf(buf, sizeof(buf), "%.*f %s", decimals, s, u[i]);
+        return std::string(buf);
+    };
+    auto formatProgressPair = [&](uint64_t done, uint64_t total) {
+        if (total > 0 && done > total) done = total;
+        std::string doneText = formatSize(done);
+        std::string totalText = formatSize(total);
+        if (total > 0 && done < total && doneText == totalText) {
+            doneText = formatSizeFixed(done, 2);
+            totalText = formatSizeFixed(total, 2);
+            if (doneText == totalText) {
+                doneText = formatSizeFixed(done, 3);
+                totalText = formatSizeFixed(total, 3);
+            }
+            if (doneText == totalText) {
+                doneText = std::to_string(done) + " B";
+                totalText = std::to_string(total) + " B";
+            }
+        }
+        return std::pair<std::string, std::string>(doneText, totalText);
+    };
     std::string verb = batch->isMove ? "Move" : "Copy";
     std::string direction;
     if (batch->isCrossDevice)
@@ -3195,8 +3222,9 @@ void App::renderTransferOverlay() {
     if (st == BatchState::Completed) {
         double avgSpd = batch->finalAvgSpeed.load();
         double totalSec = batch->finalTimeSec.load();
+        auto sizePair = formatProgressPair(totalTx, totalBytes);
         snprintf(totalOvl, sizeof(totalOvl), "%s / %s  -  %s avg  -  Done in %s",
-                 formatSize(totalTx).c_str(), formatSize(totalBytes).c_str(),
+                 sizePair.first.c_str(), sizePair.second.c_str(),
                  formatSpeed(avgSpd).c_str(), formatETA(totalSec).c_str());
         drawProgressBar(1.0f, totalOvl, 22.0f,
                         ImVec4(0.2f,0.7f,0.3f,0.9f), ImVec4(0.04f,0.04f,0.06f,1));
@@ -3220,8 +3248,9 @@ void App::renderTransferOverlay() {
             }
         }
     } else if (st == BatchState::Failed || st == BatchState::Stopped) {
+        auto sizePair = formatProgressPair(totalTx, totalBytes);
         snprintf(totalOvl, sizeof(totalOvl), "%s / %s  -  %s",
-                 formatSize(totalTx).c_str(), formatSize(totalBytes).c_str(),
+                 sizePair.first.c_str(), sizePair.second.c_str(),
                  st == BatchState::Stopped ? "Stopped" : "Failed");
         drawProgressBar(totalDisplayProg, totalOvl, 22.0f,
                         ImVec4(0.7f,0.2f,0.2f,0.9f), ImVec4(0.04f,0.04f,0.06f,1));
@@ -3250,18 +3279,12 @@ void App::renderTransferOverlay() {
                             ImVec4(0.5f,0.4f,0.9f,0.9f), ImVec4(0.04f,0.04f,0.06f,1));
         }
     } else {
-        bool showStableTotalOnly = batch->isCrossDevice || batch->useParallelChannels || batch->useMultiNic;
-        if (showStableTotalOnly) {
-            snprintf(totalOvl, sizeof(totalOvl), "%s / %s  (%.1f%%)",
-                     formatSize(totalDisplayTx).c_str(), formatSize(totalBytes).c_str(),
-                     totalDisplayProg * 100.0f);
-        } else {
-            std::string etaStr = (eta > 0) ? ("  ETA: " + formatETA(eta)) : "";
-            std::string speedStr = formatSpeed(speed);
-            snprintf(totalOvl, sizeof(totalOvl), "%s / %s  (%.1f%%)  -  %s%s",
-                     formatSize(totalDisplayTx).c_str(), formatSize(totalBytes).c_str(),
-                     totalDisplayProg * 100.0f, speedStr.c_str(), etaStr.c_str());
-        }
+        std::string etaStr = (eta > 0) ? ("  ETA: " + formatETA(eta)) : "";
+        std::string speedStr = formatSpeed(speed);
+        auto sizePair = formatProgressPair(totalDisplayTx, totalBytes);
+        snprintf(totalOvl, sizeof(totalOvl), "%s / %s  (%.1f%%)  -  %s%s",
+                 sizePair.first.c_str(), sizePair.second.c_str(),
+                 totalDisplayProg * 100.0f, speedStr.c_str(), etaStr.c_str());
         float barFrac = totalDisplayProg;
         ImVec4 barCol;
         if (batch->disconnected.load()) barCol = ImVec4(0.8f,0.4f,0.1f,0.9f); // orange when disconnected
@@ -7848,7 +7871,7 @@ void App::processBatchQueue() {
                         }
                         uint64_t tb = batch->totalBytes.load();
                         if (tb > 0 && combined > tb)
-                            combined = batch->totalTransferred.load();
+                            combined = tb;
                         uint64_t currentTotal = batch->totalTransferred.load();
                         if (combined < currentTotal) combined = currentTotal;
                         batch->totalTransferred = combined;
@@ -8698,7 +8721,7 @@ void App::processBatchQueue() {
                 uint64_t totalTransferred = bytesWrittenToDest.load();
                 uint64_t tb = batch->totalBytes.load();
                 if (tb > 0 && totalTransferred > tb)
-                    totalTransferred = batch->totalTransferred.load();
+                    totalTransferred = tb;
                 uint64_t currentTotal = batch->totalTransferred.load();
                 if (totalTransferred < currentTotal) totalTransferred = currentTotal;
                 batch->totalTransferred = totalTransferred;
