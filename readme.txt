@@ -11,6 +11,11 @@ Getting Started
 For wireless connections, use the Setup Wizard or WiFi ADB Pairing
 from within the app.
 
+Keep all files and folders from this ZIP together. The included
+platform-tools folder contains ADB, which the app needs to find and
+connect to Android devices. A separate Android SDK install is not
+required when running from the release ZIP.
+
 
 Dokan Driver (Required for Virtual Drive)
 ------------------------------------------

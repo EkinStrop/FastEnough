@@ -1956,7 +1956,7 @@ void App::renderDeviceBar() {
 
     if (m_device.getAdbPath().empty()) {
         ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "ADB not found!");
-        ImGui::SameLine(); ImGui::TextDisabled("Install Android SDK or add adb.exe to PATH");
+        ImGui::SameLine(); ImGui::TextDisabled("Extract the full ZIP or add Android SDK Platform Tools to PATH");
     } else {
         ImGui::AlignTextToFramePadding();
         ImGui::TextColored(ImVec4(0.5f,0.7f,1,1), "Device:");
@@ -5613,7 +5613,7 @@ void App::devicePollLoop() {
         m_statusMessage = "ADB ready - waiting for device...";
         m_statusTime = std::chrono::steady_clock::now();
     } else {
-        m_statusMessage = "ADB not found - install Android SDK Platform Tools";
+        m_statusMessage = "ADB not found. Extract the full ZIP or install Android SDK Platform Tools.";
         m_statusTime = std::chrono::steady_clock::now();
     }
     m_pollBusy = false;
@@ -6197,7 +6197,13 @@ void App::devicePollLoop() {
     // Main loop: use track-devices for instant notifications, fallback to polling
     while (!m_shutdownPoll) {
         if (m_device.getAdbPath().empty()) {
-            m_statusMessage = "ADB not found - install Android SDK Platform Tools";
+            if (m_device.findAdb()) {
+                m_deviceSlots[1].setAdbPath(m_device.getAdbPath());
+                m_statusMessage = "ADB ready - waiting for device...";
+                m_statusTime = std::chrono::steady_clock::now();
+                continue;
+            }
+            m_statusMessage = "ADB not found. Extract the full ZIP or install Android SDK Platform Tools.";
             m_statusTime = std::chrono::steady_clock::now();
             for (int i = 0; i < 50 && !m_shutdownPoll; i++)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));

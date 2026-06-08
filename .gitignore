@@ -31,12 +31,14 @@ desktop.ini
 # Temp
 *.tmp
 *.bak
+release-staging/
 
 # ImGui runtime layout
 imgui.ini
 
 # Vendored deps fetched by setup.ps1
 thirdparty/imgui/
+thirdparty/android-platform-tools/
 
 # Track Dokan vendored libs (override *.lib)
 !thirdparty/dokan/lib/**

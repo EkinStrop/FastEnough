@@ -36,11 +36,13 @@ The wire format and command codes are defined in `server/protocol.h`.
 * Android device with USB debugging enabled, authorized for the host.
 * **Windows Projected File System** feature enabled (`Turn Windows features on or off` > `Windows Projected File System`). The app will not start without it.
 * **Dokan 2.x** driver installed. The release ZIP includes `Dokan_x64.msi`; otherwise grab it from the [Dokan releases](https://github.com/dokan-dev/dokany/releases).
+* The signed release ZIP includes Android Platform Tools for ADB. Keep the included `platform-tools` folder next to the exe.
 
 ### Build (to compile from source)
 
 * Visual Studio 2022 or newer with the Desktop C++ workload (MSBuild, Windows SDK, ATL is not required).
 * PowerShell 5+ (for `setup.ps1`).
+* Optional, to run an unpackaged local build with device discovery: Android SDK Platform Tools, or a `platform-tools` folder beside the exe.
 * Optional, only if you change the Android server: Android NDK r28 with `aarch64-linux-android21-clang++`.
 
 ## Building
@@ -85,6 +87,14 @@ $CXX = "$NDK\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android21
 ```
 
 After rebuilding the server, force a client rebuild (`-t:Rebuild`) so the new binary gets embedded.
+
+### 4. Create a release ZIP
+
+```powershell
+.\scripts\package-release.ps1 -Version v1.0.16
+```
+
+The packaging script builds the Release exe, checks that it is signed, downloads Android Platform Tools if needed, and creates a portable ZIP with ADB bundled in `platform-tools\`.
 
 ## Running
 

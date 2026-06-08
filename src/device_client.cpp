@@ -49,31 +49,41 @@ DeviceClient::~DeviceClient() {
 }
 
 bool DeviceClient::findAdb() {
-    auto tryPath = [&](const std::string& p) -> bool {
-        if (std::filesystem::exists(p)) { m_adbPath = p; return true; }
+    auto tryPath = [&](const std::filesystem::path& p) -> bool {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(p, ec)) {
+            m_adbPath = p.string();
+            return true;
+        }
         return false;
     };
 
-    // Check next to our exe first (bundled ADB)
+    if (!m_adbPath.empty() && tryPath(std::filesystem::path(m_adbPath))) return true;
+    m_adbPath.clear();
+
+    // Check bundled ADB first.
     char exePath[MAX_PATH];
-    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-    std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
-    if (tryPath((exeDir / "adb.exe").string())) return true;
+    DWORD exePathLen = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    if (exePathLen > 0 && exePathLen < MAX_PATH) {
+        std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
+        if (tryPath(exeDir / "platform-tools" / "adb.exe")) return true;
+        if (tryPath(exeDir / "adb.exe")) return true;
+    }
 
     // SDK paths
     if (const char* la = std::getenv("LOCALAPPDATA"))
-        if (tryPath(std::string(la) + "\\Android\\Sdk\\platform-tools\\adb.exe")) return true;
+        if (tryPath(std::filesystem::path(la) / "Android" / "Sdk" / "platform-tools" / "adb.exe")) return true;
     if (const char* ah = std::getenv("ANDROID_HOME"))
-        if (tryPath(std::string(ah) + "\\platform-tools\\adb.exe")) return true;
+        if (tryPath(std::filesystem::path(ah) / "platform-tools" / "adb.exe")) return true;
     if (const char* sr = std::getenv("ANDROID_SDK_ROOT"))
-        if (tryPath(std::string(sr) + "\\platform-tools\\adb.exe")) return true;
+        if (tryPath(std::filesystem::path(sr) / "platform-tools" / "adb.exe")) return true;
 
     std::string result = runProcess("where adb.exe");
     if (!result.empty()) {
         auto pos = result.find('\n');
         std::string p = result.substr(0, pos);
         while (!p.empty() && (p.back() == '\r' || p.back() == '\n' || p.back() == ' ')) p.pop_back();
-        if (std::filesystem::exists(p)) { m_adbPath = p; return true; }
+        if (tryPath(std::filesystem::path(p))) return true;
     }
     return false;
 }
