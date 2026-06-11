@@ -148,6 +148,8 @@ public:
                        double* remoteMs = nullptr, double* localMs = nullptr);
     bool getRemoteCrc32(const std::string& remotePath, uint32_t& outCrc, std::string& detail,
                         uint64_t fileSize = 0, double* remoteMs = nullptr);
+    bool getRemoteSha256(const std::string& remotePath, std::string& outSha256, std::string& detail,
+                         uint64_t fileSize = 0, double* remoteMs = nullptr);
 
     std::string lastError() const { return m_lastError; }
     std::string statusText() const { return m_statusText; } // current activity for UI display

@@ -31,6 +31,7 @@ enum {
     CMD_DISK_SPACE = 17, // payload: none - returns [8B total][8B free] bytes
     CMD_WRITE_RANGE = 18, // payload: [8B offset][8B length][path string] then RSP_DATA chunks, RSP_DONE
     CMD_CREATE_FILE = 19, // payload: [8B total_size][path string] - create/truncate file
+    CMD_SHA256     = 20, // payload: path string - returns 32B SHA-256
 };
 
 // Responses (server -> client)

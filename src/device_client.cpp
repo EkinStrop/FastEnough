@@ -2548,6 +2548,66 @@ bool DeviceClient::getRemoteCrc32(const std::string& remotePath, uint32_t& outCr
     return true;
 }
 
+bool DeviceClient::getRemoteSha256(const std::string& remotePath, std::string& outSha256, std::string& detail,
+                                   uint64_t fileSize, double* remoteMs) {
+    if (!m_connected) { detail = "Not connected"; return false; }
+
+    DWORD hashTimeout = 30000 + (DWORD)(fileSize / (50ULL * 1024 * 1024)) * 1000;
+    if (hashTimeout > 600000) hashTimeout = 600000;
+    LOG_INFO("SHA256", "getRemoteSha256: " + remotePath + " (size=" + std::to_string(fileSize) +
+             " timeout=" + std::to_string(hashTimeout) + "ms)");
+
+    auto remoteStart = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        SOCKET sock = (SOCKET)m_socket;
+        DWORD origTimeout = 10000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&hashTimeout, sizeof(hashTimeout));
+
+        if (!sendMsg(CMD_SHA256, remotePath.data(), (uint32_t)remotePath.size())) {
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+            detail = "Failed to request remote SHA-256";
+            LOG_ERROR("SHA256", detail);
+            return false;
+        }
+
+        MsgHeader hdr; std::vector<char> payload;
+        if (!recvMsg(hdr, payload)) {
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+            detail = "Failed to receive remote SHA-256";
+            LOG_ERROR("SHA256", detail + " (timeout was " + std::to_string(hashTimeout) + "ms)");
+            return false;
+        }
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+
+        if (hdr.cmd == RSP_ERROR) {
+            detail = "Server error: " + std::string(payload.data(), payload.size());
+            LOG_ERROR("SHA256", detail);
+            return false;
+        }
+        if (hdr.cmd != RSP_OK || payload.size() < 32) {
+            detail = "Invalid SHA-256 response";
+            return false;
+        }
+
+        static const char* hex = "0123456789abcdef";
+        outSha256.clear();
+        outSha256.reserve(64);
+        for (int i = 0; i < 32; i++) {
+            unsigned char b = (unsigned char)payload[i];
+            outSha256.push_back(hex[b >> 4]);
+            outSha256.push_back(hex[b & 0x0f]);
+        }
+    }
+
+    auto remoteEnd = std::chrono::steady_clock::now();
+    double remoteDur = std::chrono::duration<double, std::milli>(remoteEnd - remoteStart).count();
+    if (remoteMs) *remoteMs = remoteDur;
+    detail = "Remote SHA-256: " + outSha256;
+    LOG_INFO("SHA256", "Remote SHA-256: " + outSha256 + " (" + std::to_string((int)remoteDur) + "ms)");
+    return true;
+}
+
 bool DeviceClient::deleteFile(const std::string& path) {
     if (!m_connected) { m_lastError = "Not connected"; return false; }
     MsgHeader hdr; std::vector<char> payload;

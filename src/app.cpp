@@ -10,6 +10,7 @@
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <shlobj.h>
+#include <wincrypt.h>
 #include <sstream>
 #include <algorithm>
 #include <ctime>
@@ -53,6 +54,82 @@ static std::wstring toWide(const std::string& utf8) {
 // UTF-8 string to std::filesystem::path (via wide string to avoid ANSI codepage issues)
 static std::filesystem::path toFsPath(const std::string& utf8) {
     return std::filesystem::path(toWide(utf8));
+}
+
+static std::string normalizeCompareName(std::string name) {
+    std::transform(name.begin(), name.end(), name.begin(),
+        [](unsigned char c) { return (char)std::tolower(c); });
+    return name;
+}
+
+static std::string bytesToHex(const BYTE* data, DWORD len) {
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    out.reserve((size_t)len * 2);
+    for (DWORD i = 0; i < len; i++) {
+        BYTE b = data[i];
+        out.push_back(hex[b >> 4]);
+        out.push_back(hex[b & 0x0f]);
+    }
+    return out;
+}
+
+static bool computeCompareLocalSha256(const std::string& path, std::string& outSha256, std::string& detail) {
+    HANDLE hFile = CreateFileW(toWide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        detail = "Could not read local file";
+        return false;
+    }
+
+    FILE_IO_PRIORITY_HINT_INFO ph = { (PRIORITY_HINT)1 };
+    SetFileInformationByHandle(hFile, FileIoPriorityHintInfo, &ph, sizeof(ph));
+
+    HCRYPTPROV prov = 0;
+    HCRYPTHASH hash = 0;
+    if (!CryptAcquireContextW(&prov, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) ||
+        !CryptCreateHash(prov, CALG_SHA_256, 0, 0, &hash)) {
+        if (hash) CryptDestroyHash(hash);
+        if (prov) CryptReleaseContext(prov, 0);
+        CloseHandle(hFile);
+        detail = "Could not start SHA-256";
+        return false;
+    }
+
+    const DWORD bufSize = 4 * 1024 * 1024;
+    std::vector<char> buf(bufSize);
+    DWORD bytesRead = 0;
+    BOOL readOk = TRUE;
+    while ((readOk = ReadFile(hFile, buf.data(), bufSize, &bytesRead, nullptr)) && bytesRead > 0) {
+        if (!CryptHashData(hash, (const BYTE*)buf.data(), bytesRead, 0)) {
+            CryptDestroyHash(hash);
+            CryptReleaseContext(prov, 0);
+            CloseHandle(hFile);
+            detail = "Could not update SHA-256";
+            return false;
+        }
+    }
+    CloseHandle(hFile);
+    if (!readOk) {
+        CryptDestroyHash(hash);
+        CryptReleaseContext(prov, 0);
+        detail = "Could not finish local hash";
+        return false;
+    }
+
+    BYTE digest[32];
+    DWORD digestLen = sizeof(digest);
+    if (!CryptGetHashParam(hash, HP_HASHVAL, digest, &digestLen, 0) || digestLen != 32) {
+        CryptDestroyHash(hash);
+        CryptReleaseContext(prov, 0);
+        detail = "Could not finalize SHA-256";
+        return false;
+    }
+
+    outSha256 = bytesToHex(digest, digestLen);
+    CryptDestroyHash(hash);
+    CryptReleaseContext(prov, 0);
+    return true;
 }
 
 static std::vector<DetectedNic> enumerateNics() {
@@ -769,6 +846,10 @@ void AppPreferences::save() {
     f << "usbPipeCount=" << usbPipeCount << "\n";
     f << "wifiPipeCount=" << wifiPipeCount << "\n";
     f << "useRoot=" << (useRoot ? 1 : 0) << "\n";
+    for (auto& fav : favoritePaths) {
+        f << "favoritePath=" << (fav.isAndroid ? 1 : 0) << "|" << fav.deviceSlot << "|"
+          << fav.label << "|" << fav.path << "\n";
+    }
     for (auto& nb : multiNicBindings) {
         f << "nicBinding=" << nb.adapterName << "|" << nb.localIp << "|" << (nb.enabled ? 1 : 0) << "\n";
     }
@@ -822,6 +903,19 @@ void AppPreferences::load() {
             wifiPipeCount = std::clamp(std::stoi(line.substr(14)), 1, 4);
         else if (line.find("useRoot=") == 0)
             useRoot = (line.substr(8) == "1");
+        else if (line.find("favoritePath=") == 0) {
+            std::string val = line.substr(13);
+            FavoritePath fav;
+            auto p1 = val.find('|'); if (p1 == std::string::npos) continue;
+            auto p2 = val.find('|', p1 + 1); if (p2 == std::string::npos) continue;
+            auto p3 = val.find('|', p2 + 1); if (p3 == std::string::npos) continue;
+            fav.isAndroid = (val.substr(0, p1) == "1");
+            try { fav.deviceSlot = std::clamp(std::stoi(val.substr(p1 + 1, p2 - p1 - 1)), 0, 1); }
+            catch (...) { fav.deviceSlot = 0; }
+            fav.label = val.substr(p2 + 1, p3 - p2 - 1);
+            fav.path = val.substr(p3 + 1);
+            if (!fav.path.empty()) favoritePaths.push_back(std::move(fav));
+        }
         else if (line.find("nicBinding=") == 0) {
             std::string val = line.substr(11);
             NicBinding nb;
@@ -1312,6 +1406,7 @@ void App::render() {
     // Device polling happens in background thread - nothing blocking here
 
     // Refresh panels — each can be Windows or Android independently
+    bool panelsRefreshed = false;
     auto refreshPanel = [&](FilePanel& panel) {
         if (!panel.needsRefresh) return;
         if (panel.isAndroid) {
@@ -1323,9 +1418,14 @@ void App::render() {
             refreshWindowsPanel(panel);
             panel.needsRefresh = false;
         }
+        panelsRefreshed = true;
     };
     refreshPanel(m_leftPanel);
     refreshPanel(m_rightPanel);
+    if (m_compareEnabled && (m_compareDirty || panelsRefreshed)) {
+        updateCompareHighlights();
+        m_compareDirty = false;
+    }
 
     // --- Main full-screen window ---
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -1346,6 +1446,7 @@ void App::render() {
 
     renderDeviceBar();
     renderWifiBanner();
+    renderCompareToolbar();
 
     float availW = ImGui::GetContentRegionAvail().x;
     float availH = ImGui::GetContentRegionAvail().y;
@@ -1621,6 +1722,44 @@ void App::render() {
     }
 
     m_firstFrame = false;
+}
+
+bool App::wantsHighFps() {
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.MouseDown[0] || io.MouseDown[1] || io.MouseDown[2] || io.MouseWheel != 0.0f || io.MouseWheelH != 0.0f)
+        return true;
+    if (ImGui::IsAnyItemActive() || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+        return true;
+
+    if (m_isDragging || m_pendingOleDrag || m_pendingScale > 0.0f || m_themeNeedsReposition || m_showCloseConfirm)
+        return true;
+
+    if (m_asyncBusy.load() || m_pollBusy.load() || m_tetheringInProgress.load())
+        return true;
+
+    if (m_compareDirty)
+        return true;
+    {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        if (m_compareContentBusy)
+            return true;
+    }
+
+    if ((m_overlayVisible || m_overlayFade > 0.01f) && m_overlayFade < 0.99f)
+        return true;
+
+    {
+        std::lock_guard<std::mutex> lk(m_batchMutex);
+        for (const auto& batch : m_batchQueue) {
+            BatchState state = batch->state.load();
+            if (state == BatchState::Queued || state == BatchState::Running ||
+                state == BatchState::Verifying || state == BatchState::WaitingConflict) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 void App::renderMenuBar() {
@@ -1946,6 +2085,430 @@ void App::renderMenuBar() {
         ImGui::TextColored(ImVec4(0.5f,0.7f,1,1), "Fast Enough? - Android File Explorer");
         ImGui::EndMenuBar();
     }
+}
+
+void App::renderCompareToolbar() {
+    ImGui::Separator();
+
+    bool compareWasEnabled = m_compareEnabled;
+    if (compareWasEnabled) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.33f, 0.08f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.43f, 0.12f, 1));
+    }
+    if (ImGui::Button(m_compareEnabled ? "Compare: On" : "Compare")) {
+        m_compareEnabled = !m_compareEnabled;
+        m_compareDirty = true;
+    }
+    if (compareWasEnabled) ImGui::PopStyleColor(2);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Highlight items in the current folder that are missing from the other pane");
+
+    ImGui::SameLine(0, 8);
+    ImGui::BeginDisabled(!m_compareEnabled);
+
+    const char* currentMode = "Both sides";
+    if (m_compareMode == CompareHighlightMode::LeftOnly) currentMode = "Left side";
+    else if (m_compareMode == CompareHighlightMode::RightOnly) currentMode = "Right side";
+
+    ImGui::SetNextItemWidth(130.0f);
+    if (ImGui::BeginCombo("##CompareMode", currentMode)) {
+        if (ImGui::Selectable("Both sides", m_compareMode == CompareHighlightMode::Both)) {
+            m_compareMode = CompareHighlightMode::Both;
+        }
+        if (ImGui::Selectable("Left side", m_compareMode == CompareHighlightMode::LeftOnly)) {
+            m_compareMode = CompareHighlightMode::LeftOnly;
+        }
+        if (ImGui::Selectable("Right side", m_compareMode == CompareHighlightMode::RightOnly)) {
+            m_compareMode = CompareHighlightMode::RightOnly;
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Choose which pane shows items that do not exist on the opposite pane");
+
+    ImGui::SameLine(0, 8);
+    if (ImGui::Checkbox("Size/hash##CompareContent", &m_compareContentEnabled)) {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        m_compareContentSignature.clear();
+        m_compareContent.clear();
+        m_compareSizeMismatchCount = 0;
+        m_compareHashMatchCount = 0;
+        m_compareHashMismatchCount = 0;
+        m_compareHashErrorCount = 0;
+        m_compareContentGeneration++;
+        m_compareDirty = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("For names that exist on both sides, compare file size and SHA-256 hash");
+
+    ImGui::SameLine(0, 8);
+    if (ImGui::SmallButton("Recheck")) {
+        m_leftPanel.needsRefresh = true;
+        m_rightPanel.needsRefresh = true;
+        {
+            std::lock_guard<std::mutex> lk(m_compareMutex);
+            m_compareContentSignature.clear();
+            m_compareContentGeneration++;
+        }
+        m_compareDirty = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Refresh both folders and compare again");
+
+    ImGui::EndDisabled();
+
+    ImGui::SameLine(0, 12);
+    if (m_compareEnabled) {
+        if (m_compareContentEnabled) {
+            ImGui::TextDisabled("Missing L %d, R %d. Size %d. Hash ok %d, diff %d, errors %d%s",
+                m_compareMissingLeftCount, m_compareMissingRightCount,
+                m_compareSizeMismatchCount, m_compareHashMatchCount,
+                m_compareHashMismatchCount, m_compareHashErrorCount,
+                m_compareContentBusy ? ". Hashing..." : "");
+        } else {
+            ImGui::TextDisabled("Missing, left %d, right %d", m_compareMissingLeftCount, m_compareMissingRightCount);
+        }
+    } else {
+        ImGui::TextDisabled("Compare current folders");
+    }
+    ImGui::Separator();
+}
+
+void App::updateCompareHighlights() {
+    m_compareMissingLeft.clear();
+    m_compareMissingRight.clear();
+    m_compareMissingLeftCount = 0;
+    m_compareMissingRightCount = 0;
+
+    if (!m_compareEnabled) return;
+
+    std::unordered_set<std::string> leftNames;
+    std::unordered_set<std::string> rightNames;
+
+    for (int i = 0; i < m_leftPanel.entryCount(); i++) {
+        std::string name = m_leftPanel.entryName(i);
+        if (!name.empty()) leftNames.insert(normalizeCompareName(name));
+    }
+    for (int i = 0; i < m_rightPanel.entryCount(); i++) {
+        std::string name = m_rightPanel.entryName(i);
+        if (!name.empty()) rightNames.insert(normalizeCompareName(name));
+    }
+
+    for (const auto& name : leftNames) {
+        if (rightNames.find(name) == rightNames.end()) m_compareMissingLeft.insert(name);
+    }
+    for (const auto& name : rightNames) {
+        if (leftNames.find(name) == leftNames.end()) m_compareMissingRight.insert(name);
+    }
+
+    m_compareMissingLeftCount = (int)m_compareMissingLeft.size();
+    m_compareMissingRightCount = (int)m_compareMissingRight.size();
+
+    std::unordered_map<std::string, int> leftIndexByName;
+    std::unordered_map<std::string, int> rightIndexByName;
+    for (int i = 0; i < m_leftPanel.entryCount(); i++) {
+        std::string key = normalizeCompareName(m_leftPanel.entryName(i));
+        leftIndexByName[key] = i;
+    }
+    for (int i = 0; i < m_rightPanel.entryCount(); i++) {
+        std::string key = normalizeCompareName(m_rightPanel.entryName(i));
+        rightIndexByName[key] = i;
+    }
+
+    bool shouldStartHash = false;
+    std::string signature = std::to_string(m_compareContentGeneration + 1);
+    if (m_compareContentEnabled) {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        m_compareContentSignature = signature;
+        m_compareContent.clear();
+        m_compareSizeMismatchCount = 0;
+        m_compareHashMatchCount = 0;
+        m_compareHashMismatchCount = 0;
+        m_compareHashErrorCount = 0;
+        m_compareContentGeneration++;
+
+        for (const auto& [name, leftIndex] : leftIndexByName) {
+            auto rightIt = rightIndexByName.find(name);
+            if (rightIt == rightIndexByName.end()) continue;
+            int rightIndex = rightIt->second;
+            if (m_leftPanel.entryIsDir(leftIndex) || m_rightPanel.entryIsDir(rightIndex)) continue;
+
+            CompareContentInfo info;
+            info.leftSize = m_leftPanel.entrySize(leftIndex);
+            info.rightSize = m_rightPanel.entrySize(rightIndex);
+            if (info.leftSize != info.rightSize) {
+                info.state = CompareContentState::SizeMismatch;
+                info.detail = "File sizes are different";
+                m_compareSizeMismatchCount++;
+            } else {
+                info.state = CompareContentState::HashPending;
+                shouldStartHash = true;
+            }
+            m_compareContent[name] = std::move(info);
+        }
+
+        if (shouldStartHash) m_compareContentBusy = true;
+        else m_compareContentBusy = false;
+    } else {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        m_compareContentSignature.clear();
+        m_compareContent.clear();
+        m_compareContentBusy = false;
+        m_compareSizeMismatchCount = 0;
+        m_compareHashMatchCount = 0;
+        m_compareHashMismatchCount = 0;
+        m_compareHashErrorCount = 0;
+    }
+
+    if (shouldStartHash) startCompareHashCheck(signature);
+}
+
+bool App::isCompareHighlighted(const FilePanel& panel, PanelSide side, int index) const {
+    if (!m_compareEnabled || !panel.validIndex(index)) return false;
+
+    if (side == PanelSide::Left && m_compareMode == CompareHighlightMode::RightOnly) return false;
+    if (side == PanelSide::Right && m_compareMode == CompareHighlightMode::LeftOnly) return false;
+
+    std::string name = normalizeCompareName(panel.entryName(index));
+    if (side == PanelSide::Left) {
+        return m_compareMissingLeft.find(name) != m_compareMissingLeft.end();
+    }
+    return m_compareMissingRight.find(name) != m_compareMissingRight.end();
+}
+
+std::string App::favoriteLabelForPath(const std::string& path, bool isAndroid) {
+    if (path.empty()) return isAndroid ? "/" : "PC";
+    std::string trimmed = path;
+    while (trimmed.size() > 1 && (trimmed.back() == '/' || trimmed.back() == '\\')) trimmed.pop_back();
+    if (!isAndroid && trimmed.size() == 2 && trimmed[1] == ':') return trimmed + "\\";
+    size_t pos = trimmed.find_last_of(isAndroid ? "/" : "\\");
+    if (pos == std::string::npos) return trimmed;
+    std::string label = trimmed.substr(pos + 1);
+    if (label.empty()) return isAndroid ? "/" : trimmed;
+    return label;
+}
+
+bool App::isFavoritePath(const FilePanel& panel) const {
+    for (const auto& fav : m_prefs.favoritePaths) {
+        if (fav.isAndroid == panel.isAndroid &&
+            fav.deviceSlot == panel.deviceSlot &&
+            fav.path == panel.currentPath) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void App::addFavoritePath(const FilePanel& panel) {
+    if (panel.currentPath.empty() || isFavoritePath(panel)) return;
+
+    FavoritePath fav;
+    fav.path = panel.currentPath;
+    fav.isAndroid = panel.isAndroid;
+    fav.deviceSlot = panel.deviceSlot;
+    fav.label = favoriteLabelForPath(panel.currentPath, panel.isAndroid);
+    m_prefs.favoritePaths.push_back(std::move(fav));
+    m_prefs.save();
+
+    m_statusMessage = "Favorite added";
+    m_statusTime = std::chrono::steady_clock::now();
+}
+
+void App::removeFavoritePath(int index) {
+    if (index < 0 || index >= (int)m_prefs.favoritePaths.size()) return;
+    m_prefs.favoritePaths.erase(m_prefs.favoritePaths.begin() + index);
+    m_prefs.save();
+    m_statusMessage = "Favorite removed";
+    m_statusTime = std::chrono::steady_clock::now();
+}
+
+void App::renderFavoritesBar(FilePanel& panel, PanelSide side) {
+    bool alreadyFavorite = isFavoritePath(panel);
+    if (alreadyFavorite) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.33f, 0.08f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.43f, 0.12f, 1));
+    }
+
+    std::string starId = std::string(alreadyFavorite ? "*##Fav" : "+ Fav##Fav") +
+        (side == PanelSide::Left ? "L" : "R");
+    if (ImGui::SmallButton(starId.c_str())) {
+        if (alreadyFavorite) {
+            for (int i = 0; i < (int)m_prefs.favoritePaths.size(); i++) {
+                const auto& fav = m_prefs.favoritePaths[i];
+                if (fav.isAndroid == panel.isAndroid &&
+                    fav.deviceSlot == panel.deviceSlot &&
+                    fav.path == panel.currentPath) {
+                    removeFavoritePath(i);
+                    break;
+                }
+            }
+        } else {
+            addFavoritePath(panel);
+        }
+    }
+    if (alreadyFavorite) ImGui::PopStyleColor(2);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(alreadyFavorite ? "Remove this folder from favorites" : "Add this folder to favorites");
+
+    for (int i = 0; i < (int)m_prefs.favoritePaths.size(); i++) {
+        const auto& fav = m_prefs.favoritePaths[i];
+        if (fav.isAndroid != panel.isAndroid) continue;
+        if (fav.isAndroid && fav.deviceSlot != panel.deviceSlot) continue;
+
+        ImGui::SameLine();
+        std::string label = fav.label.empty() ? favoriteLabelForPath(fav.path, fav.isAndroid) : fav.label;
+        std::string id = label + "##FavPath" + std::to_string(i) + (side == PanelSide::Left ? "L" : "R");
+        if (ImGui::SmallButton(id.c_str())) {
+            navigateToDirectory(panel, fav.path);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Open %s\nRight-click to remove", fav.path.c_str());
+        }
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            removeFavoritePath(i);
+            break;
+        }
+    }
+}
+
+std::string App::compareEntryPath(const FilePanel& panel, int index) const {
+    std::string path = panel.currentPath;
+    char sep = panel.isAndroid ? '/' : '\\';
+    if (!path.empty() && path.back() != sep) path += sep;
+    path += panel.entryName(index);
+    return path;
+}
+
+void App::startCompareHashCheck(const std::string& signature) {
+    struct HashTask {
+        std::string name;
+        bool leftAndroid = false;
+        bool rightAndroid = false;
+        int leftSlot = 0;
+        int rightSlot = 0;
+        std::string leftPath;
+        std::string rightPath;
+        uint64_t size = 0;
+    };
+
+    std::vector<HashTask> tasks;
+    {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        for (const auto& [name, info] : m_compareContent) {
+            if (info.state != CompareContentState::HashPending) continue;
+
+            int leftIndex = -1;
+            int rightIndex = -1;
+            for (int i = 0; i < m_leftPanel.entryCount(); i++) {
+                if (normalizeCompareName(m_leftPanel.entryName(i)) == name) { leftIndex = i; break; }
+            }
+            for (int i = 0; i < m_rightPanel.entryCount(); i++) {
+                if (normalizeCompareName(m_rightPanel.entryName(i)) == name) { rightIndex = i; break; }
+            }
+            if (leftIndex < 0 || rightIndex < 0) continue;
+
+            HashTask task;
+            task.name = name;
+            task.leftAndroid = m_leftPanel.isAndroid;
+            task.rightAndroid = m_rightPanel.isAndroid;
+            task.leftSlot = m_leftPanel.deviceSlot;
+            task.rightSlot = m_rightPanel.deviceSlot;
+            task.leftPath = compareEntryPath(m_leftPanel, leftIndex);
+            task.rightPath = compareEntryPath(m_rightPanel, rightIndex);
+            task.size = info.leftSize;
+            tasks.push_back(std::move(task));
+        }
+    }
+
+    if (tasks.empty()) {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        if (m_compareContentSignature == signature) m_compareContentBusy = false;
+        return;
+    }
+
+    int generation;
+    {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        generation = m_compareContentGeneration;
+    }
+
+    postAsync("Hashing matching files...", [this, tasks = std::move(tasks), signature, generation]() {
+        {
+            std::lock_guard<std::mutex> lk(m_compareMutex);
+            if (generation != m_compareContentGeneration || signature != m_compareContentSignature) {
+                return;
+            }
+        }
+
+        auto hashFor = [this](bool android, int slot, const std::string& path, uint64_t size,
+                              std::string& hash, std::string& detail) -> bool {
+            if (android) {
+                DeviceClient& dev = deviceForSlot(slot);
+                if (!dev.isServerRunning()) {
+                    detail = "Android side is not connected";
+                    return false;
+                }
+                if (dev.getRemoteSha256(path, hash, detail, size)) return true;
+                if (detail.find("Unknown command") != std::string::npos) {
+                    std::string serial = dev.connectedSerial();
+                    bool preferAdbForward = !dev.isDirectConnection();
+                    bool useRoot = dev.useRoot();
+                    if (!serial.empty()) {
+                        LOG_INFO("SHA256", "Restarting Android server for SHA-256 support");
+                        dev.stopServer();
+                        if (dev.startServer(serial, preferAdbForward, useRoot)) {
+                            return dev.getRemoteSha256(path, hash, detail, size);
+                        }
+                        detail = "Restart failed: " + dev.lastError();
+                    }
+                }
+                return false;
+            }
+            return computeCompareLocalSha256(path, hash, detail);
+        };
+
+        std::unordered_map<std::string, CompareContentInfo> results;
+        int hashMatch = 0;
+        int hashMismatch = 0;
+        int hashError = 0;
+
+        for (const auto& task : tasks) {
+            CompareContentInfo info;
+            info.leftSize = task.size;
+            info.rightSize = task.size;
+
+            std::string leftDetail;
+            std::string rightDetail;
+            bool leftOk = hashFor(task.leftAndroid, task.leftSlot, task.leftPath, task.size, info.leftHash, leftDetail);
+            bool rightOk = hashFor(task.rightAndroid, task.rightSlot, task.rightPath, task.size, info.rightHash, rightDetail);
+
+            if (!leftOk || !rightOk) {
+                info.state = CompareContentState::HashError;
+                info.detail = !leftOk ? leftDetail : rightDetail;
+                hashError++;
+            } else if (info.leftHash == info.rightHash) {
+                info.state = CompareContentState::HashMatch;
+                info.detail = "Size and hash match";
+                hashMatch++;
+            } else {
+                info.state = CompareContentState::HashMismatch;
+                info.detail = "Same size, different hash";
+                hashMismatch++;
+            }
+            results[task.name] = std::move(info);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(m_compareMutex);
+            if (generation == m_compareContentGeneration && signature == m_compareContentSignature) {
+                for (auto& [name, info] : results) m_compareContent[name] = std::move(info);
+                m_compareHashMatchCount = hashMatch;
+                m_compareHashMismatchCount = hashMismatch;
+                m_compareHashErrorCount = hashError;
+                m_compareContentBusy = false;
+            }
+        }
+    });
 }
 
 void App::renderDeviceBar() {
@@ -2640,6 +3203,13 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
     ImGui::InputTextWithHint(("##Filter" + std::string(label)).c_str(), "Search / filter...", panel.searchFilter, sizeof(panel.searchFilter));
     ImGui::Separator();
 
+    renderFavoritesBar(panel, side);
+    if (!m_prefs.favoritePaths.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+    }
+
     if (!panel.isAndroid) {
         for (const auto& d : getWindowsDrives()) { if (ImGui::SmallButton(d.c_str())) navigateToDirectory(panel, d + "\\"); ImGui::SameLine(); }
         ImGui::NewLine();
@@ -2740,6 +3310,11 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         struct RowInfo { int index; float yMin, yMax; };
         std::vector<RowInfo> visibleRows;
 
+        std::unique_lock<std::mutex> compareContentLock;
+        if (m_compareEnabled && m_compareContentEnabled) {
+            compareContentLock = std::unique_lock<std::mutex>(m_compareMutex);
+        }
+
         int count = panel.entryCount();
         for (int i = 0; i < count; i++) {
             std::string name = panel.entryName(i);
@@ -2755,16 +3330,50 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
 
             bool isDir = panel.entryIsDir(i);
             bool isSel = panel.selectedIndices.count(i) > 0;
+            CompareContentInfo contentInfo;
+            if (compareContentLock.owns_lock()) {
+                auto contentIt = m_compareContent.find(normalizeCompareName(name));
+                if (contentIt != m_compareContent.end()) contentInfo = contentIt->second;
+            }
+            CompareContentState contentState = contentInfo.state;
 
-            ImGui::TableNextRow(); ImGui::TableNextColumn();
+            ImGui::TableNextRow();
+            bool compareHighlight = isCompareHighlighted(panel, side, i);
+            if (contentState == CompareContentState::SizeMismatch ||
+                contentState == CompareContentState::HashMismatch) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(110, 34, 34, 155));
+            } else if (contentState == CompareContentState::HashError) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(90, 52, 115, 150));
+            } else if (contentState == CompareContentState::HashMatch) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(30, 82, 48, 120));
+            } else if (contentState == CompareContentState::HashPending) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(70, 70, 78, 100));
+            } else if (compareHighlight) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(122, 92, 18, 150));
+            }
+            ImGui::TableNextColumn();
 
             // Track row screen position for rubber-band
             float rowYMin = ImGui::GetCursorScreenPos().y;
 
             std::string icon = getFileIcon(name, isDir);
-            std::string sid = icon + " " + name + "##" + std::to_string(i);
+            std::string compareTag;
+            if (contentState == CompareContentState::SizeMismatch) compareTag = " [size diff]";
+            else if (contentState == CompareContentState::HashPending) compareTag = " [hashing]";
+            else if (contentState == CompareContentState::HashMatch) compareTag = " [hash ok]";
+            else if (contentState == CompareContentState::HashMismatch) compareTag = " [hash diff]";
+            else if (contentState == CompareContentState::HashError) compareTag = " [hash error]";
+            std::string sid = icon + " " + name + compareTag + "##" + std::to_string(i);
 
+            bool pushedTextColor = true;
             if (isDir) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f,0.70f,1,1));
+            else if (contentState == CompareContentState::SizeMismatch ||
+                     contentState == CompareContentState::HashMismatch) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f,0.55f,0.50f,1));
+            else if (contentState == CompareContentState::HashError) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f,0.65f,1.0f,1));
+            else if (contentState == CompareContentState::HashMatch) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,1.0f,0.68f,1));
+            else if (contentState == CompareContentState::HashPending) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.78f,0.78f,0.84f,1));
+            else if (compareHighlight) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f,0.86f,0.42f,1));
+            else pushedTextColor = false;
             if (isSel) ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.15f,0.28f,0.50f,0.90f));
 
             ImGuiSelectableFlags sf = ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick;
@@ -2837,6 +3446,22 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                 }
             }
 
+            if (contentState != CompareContentState::Unknown && ImGui::IsItemHovered()) {
+                if (contentState == CompareContentState::SizeMismatch) {
+                    ImGui::SetTooltip("Size differs\nLeft: %s\nRight: %s",
+                        formatSize(contentInfo.leftSize).c_str(), formatSize(contentInfo.rightSize).c_str());
+                } else if (contentState == CompareContentState::HashPending) {
+                    ImGui::SetTooltip("Hash check is queued or running");
+                } else if (contentState == CompareContentState::HashMatch) {
+                    ImGui::SetTooltip("Size and SHA-256 hash match\nSHA-256: %s", contentInfo.leftHash.c_str());
+                } else if (contentState == CompareContentState::HashMismatch) {
+                    ImGui::SetTooltip("Same size, different SHA-256 hash\nLeft: %s\nRight: %s",
+                        contentInfo.leftHash.c_str(), contentInfo.rightHash.c_str());
+                } else if (contentState == CompareContentState::HashError) {
+                    ImGui::SetTooltip("Hash check failed\n%s", contentInfo.detail.c_str());
+                }
+            }
+
             // --- Drag source — auto-select item if not already selected ---
             if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
                 if (panel.selectedIndices.count(i) == 0) {
@@ -2859,7 +3484,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
             }
 
             if (isSel) ImGui::PopStyleColor(); // header
-            if (isDir) ImGui::PopStyleColor(); // text
+            if (pushedTextColor) ImGui::PopStyleColor(); // text
 
             // Right-click context - preserve multi-selection if clicking an already-selected item
             if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {

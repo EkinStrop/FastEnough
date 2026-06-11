@@ -310,7 +310,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     bool done = false;
     while (!done) {
         MSG msg;
+        bool hadMessage = false;
         while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
+            hadMessage = true;
             TranslateMessage(&msg);
             DispatchMessage(&msg);
             if (msg.message == WM_QUIT)
@@ -321,6 +323,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         // Render frame (handles resize internally)
         if (!g_inSizeMove) // skip if WndProc is already rendering during resize
             RenderFrame();
+
+        if (!hadMessage && !app.wantsHighFps())
+            Sleep(33);
     }
     g_pApp = nullptr;
 

@@ -7,6 +7,7 @@
 #include <deque>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -261,6 +262,18 @@ struct FilePanel {
     }
 };
 
+enum class CompareHighlightMode { Both, LeftOnly, RightOnly };
+enum class CompareContentState { Unknown, SizeMismatch, HashPending, HashMatch, HashMismatch, HashError };
+
+struct CompareContentInfo {
+    CompareContentState state = CompareContentState::Unknown;
+    uint64_t leftSize = 0;
+    uint64_t rightSize = 0;
+    std::string leftHash;
+    std::string rightHash;
+    std::string detail;
+};
+
 // --- App Preferences (persisted to disk) ---
 // Saved WiFi ADB device for auto-reconnect
 struct SavedWifiDevice {
@@ -286,6 +299,13 @@ struct DetectedNic {
     uint64_t speed = 0;  // link speed in bps
 };
 
+struct FavoritePath {
+    std::string label;
+    std::string path;
+    bool isAndroid = false;
+    int deviceSlot = 0;
+};
+
 struct AppPreferences {
     bool restartAdbOnLaunch = false;  // default OFF
     bool enableCrcVerification = true;
@@ -299,6 +319,7 @@ struct AppPreferences {
     int usbPipeCount = 4;   // 1-4 ADB forward pipes
     int wifiPipeCount = 4;  // 1-4 WiFi TCP connections
     bool useRoot = false;   // launch the on-device server via `su -c` for restricted-path access
+    std::vector<FavoritePath> favoritePaths;
 
     void save();
     void load();
@@ -321,6 +342,7 @@ public:
     ~App();
 
     void render();
+    bool wantsHighFps();
     void applyScale(float newScale);
     AppPreferences m_prefs;
     AppTheme m_theme;
@@ -373,6 +395,16 @@ private:
     void refreshAndroidPanel(FilePanel& panel);
     void navigateToDirectory(FilePanel& panel, const std::string& path);
     void navigateUp(FilePanel& panel);
+    void renderCompareToolbar();
+    void renderFavoritesBar(FilePanel& panel, PanelSide side);
+    void addFavoritePath(const FilePanel& panel);
+    void removeFavoritePath(int index);
+    bool isFavoritePath(const FilePanel& panel) const;
+    static std::string favoriteLabelForPath(const std::string& path, bool isAndroid);
+    void updateCompareHighlights();
+    bool isCompareHighlighted(const FilePanel& panel, PanelSide side, int index) const;
+    void startCompareHashCheck(const std::string& signature);
+    std::string compareEntryPath(const FilePanel& panel, int index) const;
 
     // Create a batch from selected files in srcPanel, targeting dstPanel
     void switchPanelMode(FilePanel& panel, bool toAndroid);
@@ -437,6 +469,24 @@ private:
 
     FilePanel m_leftPanel;
     FilePanel m_rightPanel;
+
+    bool m_compareEnabled = false;
+    bool m_compareDirty = false;
+    CompareHighlightMode m_compareMode = CompareHighlightMode::Both;
+    std::unordered_set<std::string> m_compareMissingLeft;
+    std::unordered_set<std::string> m_compareMissingRight;
+    int m_compareMissingLeftCount = 0;
+    int m_compareMissingRightCount = 0;
+    bool m_compareContentEnabled = false;
+    bool m_compareContentBusy = false;
+    int m_compareContentGeneration = 0;
+    int m_compareSizeMismatchCount = 0;
+    int m_compareHashMatchCount = 0;
+    int m_compareHashMismatchCount = 0;
+    int m_compareHashErrorCount = 0;
+    std::string m_compareContentSignature;
+    std::unordered_map<std::string, CompareContentInfo> m_compareContent;
+    mutable std::mutex m_compareMutex;
 
     // Batch queue
     std::deque<std::shared_ptr<TransferBatch>> m_batchQueue;
