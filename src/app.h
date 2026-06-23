@@ -201,10 +201,13 @@ struct FilePanel {
     std::string currentPath;
     std::vector<WindowsFileEntry> windowsEntries;
     std::vector<DeviceFileEntry> androidEntries;
+    std::vector<InstalledAppEntry> appEntries;
     std::set<int> selectedIndices;
     int focusedIndex = -1;
     bool isAndroid = false;
+    bool isApps = false;
     bool needsRefresh = true;
+    bool refreshInProgress = false;
     float scrollY = 0.0f;
     char pathInput[1024] = {};
     char searchFilter[256] = {};
@@ -232,6 +235,7 @@ struct FilePanel {
     int navHistoryPos = -1;
 
     int entryCount() const {
+        if (isApps) return (int)appEntries.size();
         return isAndroid ? (int)androidEntries.size() : (int)windowsEntries.size();
     }
     bool validIndex(int i) const {
@@ -239,18 +243,22 @@ struct FilePanel {
     }
     std::string entryName(int i) const {
         if (!validIndex(i)) return "";
+        if (isApps) return appEntries[i].packageName;
         return isAndroid ? androidEntries[i].name : windowsEntries[i].name;
     }
     bool entryIsDir(int i) const {
         if (!validIndex(i)) return false;
+        if (isApps) return false;
         return isAndroid ? androidEntries[i].isDirectory() : windowsEntries[i].isDirectory;
     }
     uint64_t entrySize(int i) const {
         if (!validIndex(i)) return 0;
+        if (isApps) return 0;
         return isAndroid ? androidEntries[i].size : windowsEntries[i].size;
     }
     std::string entryDate(int i) const {
         if (!validIndex(i)) return "";
+        if (isApps) return appEntries[i].isSystem ? "System" : "User";
         if (isAndroid) {
             // Convert mtime to string
             time_t t = (time_t)androidEntries[i].mtime;
@@ -282,6 +290,11 @@ struct SavedWifiDevice {
     int port = 5555;      // WiFi ADB port
     bool autoConnect = true;
     std::string model;    // Phone model name for display
+};
+
+struct RootDevicePreference {
+    std::string serial;
+    bool enabled = false;
 };
 
 // Saved NIC binding for multi-NIC parallel transfers
@@ -318,9 +331,11 @@ struct AppPreferences {
     std::vector<NicBinding> multiNicBindings;
     int usbPipeCount = 4;   // 1-4 ADB forward pipes
     int wifiPipeCount = 4;  // 1-4 WiFi TCP connections
-    bool useRoot = false;   // launch the on-device server via `su -c` for restricted-path access
+    std::vector<RootDevicePreference> rootDevices; // per-device root server preference
     std::vector<FavoritePath> favoritePaths;
 
+    bool rootEnabledForSerial(const std::string& serial) const;
+    void setRootEnabledForSerial(const std::string& serial, bool enabled);
     void save();
     void load();
 };
@@ -353,6 +368,7 @@ public:
 
     // External drag-and-drop (Explorer <-> App)
     void handleExternalFileDrop(const std::vector<std::string>& paths, int mouseX, int mouseY);
+    void requestApkInstall(const std::string& apkPath);
     void performOleDragDrop(const std::vector<std::string>& filePaths);
     void performAndroidDragOut(FilePanel* src);
     bool m_pendingOleDrag = false;
@@ -373,6 +389,7 @@ private:
     void renderCloseConfirmDialog();
     void renderDeviceBar();
     void renderPanel(FilePanel& panel, PanelSide side);
+    void renderAppsPanel(FilePanel& panel, PanelSide side);
     void renderTransferOverlay();
     void renderStatusBar();
     void renderContextMenu(FilePanel& panel);
@@ -381,6 +398,9 @@ private:
     void renderDeleteConfirmPopup();
     void renderAboutPopup();
     void renderNotificationPopup();
+    void showNotification(const std::string& title, const std::string& message, bool isError);
+    void renderApkInstallDialog();
+    void registerApkAssociation();
     void renderThemeWindow();
     void renderNicConfigWindow();
     void renderWifiWizard();
@@ -393,6 +413,7 @@ private:
 
     void refreshWindowsPanel(FilePanel& panel);
     void refreshAndroidPanel(FilePanel& panel);
+    void refreshAppsPanel(FilePanel& panel);
     void navigateToDirectory(FilePanel& panel, const std::string& path);
     void navigateUp(FilePanel& panel);
     void renderCompareToolbar();
@@ -408,7 +429,9 @@ private:
 
     // Create a batch from selected files in srcPanel, targeting dstPanel
     void switchPanelMode(FilePanel& panel, bool toAndroid);
+    void switchPanelToApps(FilePanel& panel);
     void forEachAndroidPanel(std::function<void(FilePanel&)> fn);
+    void forEachDevicePanel(std::function<void(FilePanel&)> fn);
     void startTransfer(bool pullFromAndroid);
     void startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel);
     void processBatchQueue();
@@ -504,6 +527,12 @@ private:
     std::string m_notificationTitle;
     std::string m_notificationMessage;
     bool m_notificationIsError = false;
+
+    bool m_showApkInstallDialog = false;
+    std::string m_pendingApkPath;
+    int m_pendingApkDeviceIndex = 0;
+    bool m_apkInstallGrantPermissions = false;
+    bool m_apkInstallAllowDowngrade = false;
 
     // Connection mode UI
     bool m_showConnectionPopup = false;

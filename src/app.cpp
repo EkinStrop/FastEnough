@@ -56,6 +56,18 @@ static std::filesystem::path toFsPath(const std::string& utf8) {
     return std::filesystem::path(toWide(utf8));
 }
 
+static void appendPathSeparator(std::string& path, char sep) {
+    if (path.empty()) {
+        path.push_back(sep);
+    } else if (path.back() != sep) {
+        path.push_back(sep);
+    }
+}
+
+static char lastCharOr(const std::string& value, char fallback = '\0') {
+    return value.empty() ? fallback : value.back();
+}
+
 static std::string normalizeCompareName(std::string name) {
     std::transform(name.begin(), name.end(), name.begin(),
         [](unsigned char c) { return (char)std::tolower(c); });
@@ -750,7 +762,7 @@ void App::performAndroidDragOut(FilePanel* src) {
         if (src->entryIsDir(idx)) continue;
         std::string name = src->entryName(idx);
         std::string remotePath = src->currentPath;
-        if (remotePath.back() != '/') remotePath += "/";
+        appendPathSeparator(remotePath, '/');
         remotePath += name;
         remotePaths.push_back(remotePath);
         wNames.push_back(toWide(name));
@@ -845,7 +857,10 @@ void AppPreferences::save() {
     f << "pipeSettingsV2=1\n";
     f << "usbPipeCount=" << usbPipeCount << "\n";
     f << "wifiPipeCount=" << wifiPipeCount << "\n";
-    f << "useRoot=" << (useRoot ? 1 : 0) << "\n";
+    for (auto& r : rootDevices) {
+        if (!r.serial.empty())
+            f << "rootDevice=" << r.serial << "|" << (r.enabled ? 1 : 0) << "\n";
+    }
     for (auto& fav : favoritePaths) {
         f << "favoritePath=" << (fav.isAndroid ? 1 : 0) << "|" << fav.deviceSlot << "|"
           << fav.label << "|" << fav.path << "\n";
@@ -853,6 +868,24 @@ void AppPreferences::save() {
     for (auto& nb : multiNicBindings) {
         f << "nicBinding=" << nb.adapterName << "|" << nb.localIp << "|" << (nb.enabled ? 1 : 0) << "\n";
     }
+}
+
+bool AppPreferences::rootEnabledForSerial(const std::string& serial) const {
+    if (serial.empty()) return false;
+    for (const auto& r : rootDevices)
+        if (r.serial == serial) return r.enabled;
+    return false;
+}
+
+void AppPreferences::setRootEnabledForSerial(const std::string& serial, bool enabled) {
+    if (serial.empty()) return;
+    for (auto& r : rootDevices) {
+        if (r.serial == serial) {
+            r.enabled = enabled;
+            return;
+        }
+    }
+    rootDevices.push_back({serial, enabled});
 }
 
 void AppPreferences::load() {
@@ -864,17 +897,17 @@ void AppPreferences::load() {
     bool pipeSettingsV2 = false;
     while (std::getline(f, line)) {
         if (line.find("restartAdbOnLaunch=") == 0)
-            restartAdbOnLaunch = (line.back() == '1');
+            restartAdbOnLaunch = (lastCharOr(line) == '1');
         else if (line.find("enableCrcVerification=") == 0)
-            enableCrcVerification = (line.back() == '1');
+            enableCrcVerification = (lastCharOr(line) == '1');
         else if (line.find("autoDismissTransfer=") == 0)
-            autoDismissTransfer = (line.back() == '1');
+            autoDismissTransfer = (lastCharOr(line) == '1');
         else if (line.find("wifiAutoConnect=") == 0)
-            wifiAutoConnect = (line.back() == '1');
+            wifiAutoConnect = (lastCharOr(line) == '1');
         else if (line.find("confirmOnClose=") == 0)
-            confirmOnClose = (line.back() == '1');
+            confirmOnClose = (lastCharOr(line) == '1');
         else if (line.find("killAdbOnClose=") == 0)
-            killAdbOnClose = (line.back() == '1');
+            killAdbOnClose = (lastCharOr(line) == '1');
         else if (line.find("wifiDevice=") == 0) {
             std::string val = line.substr(11);
             SavedWifiDevice w;
@@ -889,20 +922,29 @@ void AppPreferences::load() {
                 w.autoConnect = (val[p3+1] == '1');
                 w.model = val.substr(p4+1);
             } else {
-                w.autoConnect = (val.back() == '1');
+                w.autoConnect = (lastCharOr(val) == '1');
             }
             savedWifiDevices.push_back(std::move(w));
         }
         else if (line.find("enableMultiNic=") == 0)
-            enableMultiNic = (line.back() == '1');
+            enableMultiNic = (lastCharOr(line) == '1');
         else if (line.find("pipeSettingsV2=") == 0)
-            pipeSettingsV2 = (line.back() == '1');
+            pipeSettingsV2 = (lastCharOr(line) == '1');
         else if (line.find("usbPipeCount=") == 0)
             usbPipeCount = std::clamp(std::stoi(line.substr(13)), 1, 4);
         else if (line.find("wifiPipeCount=") == 0)
             wifiPipeCount = std::clamp(std::stoi(line.substr(14)), 1, 4);
-        else if (line.find("useRoot=") == 0)
-            useRoot = (line.substr(8) == "1");
+        else if (line.find("useRoot=") == 0) {
+            // Legacy global root setting intentionally ignored. Root is now per device.
+        }
+        else if (line.find("rootDevice=") == 0) {
+            std::string val = line.substr(11);
+            auto p1 = val.find('|'); if (p1 == std::string::npos) continue;
+            RootDevicePreference r;
+            r.serial = val.substr(0, p1);
+            r.enabled = (val.substr(p1 + 1) == "1");
+            if (!r.serial.empty()) rootDevices.push_back(std::move(r));
+        }
         else if (line.find("favoritePath=") == 0) {
             std::string val = line.substr(13);
             FavoritePath fav;
@@ -975,7 +1017,7 @@ void AppTheme::load() {
             if (userScale < 0.5f) userScale = 0.5f;
             if (userScale > 3.0f) userScale = 3.0f;
         } else if (line.find("customColors=") == 0) {
-            customColors = (line.back() == '1');
+            customColors = (lastCharOr(line) == '1');
         } else if (line.find("color") == 0) {
             // Parse "colorN=r,g,b,a"
             auto eq = line.find('=');
@@ -1293,7 +1335,7 @@ void App::render() {
     // Del / Shift+Del — delete selected files in the focused panel
     if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !anyModalOpen) {
         FilePanel* focused = m_lastFocusedPanel;
-        if (focused && !focused->selectedIndices.empty()) {
+        if (focused && !focused->isApps && !focused->selectedIndices.empty()) {
             m_contextPanel = focused;
             m_contextIndex = *focused->selectedIndices.begin();
             m_deletePermanent = ImGui::GetIO().KeyShift;
@@ -1303,24 +1345,24 @@ void App::render() {
 
     // Backspace — navigate up
     if (ImGui::IsKeyPressed(ImGuiKey_Backspace) && !anyModalOpen) {
-        if (m_lastFocusedPanel) navigateUp(*m_lastFocusedPanel);
+        if (m_lastFocusedPanel && !m_lastFocusedPanel->isApps) navigateUp(*m_lastFocusedPanel);
     }
 
     // Enter — open/navigate the focused item (same as double-click)
     if (ImGui::IsKeyPressed(ImGuiKey_Enter) && !anyModalOpen) {
         FilePanel* focused = m_lastFocusedPanel;
-        if (focused && focused->focusedIndex >= 0 && focused->validIndex(focused->focusedIndex)) {
+        if (focused && !focused->isApps && focused->focusedIndex >= 0 && focused->validIndex(focused->focusedIndex)) {
             std::string name = focused->entryName(focused->focusedIndex);
             bool isDir = focused->entryIsDir(focused->focusedIndex);
             if (isDir) {
                 std::string sep = focused->isAndroid ? "/" : "\\";
                 std::string np = focused->currentPath;
-                if (np.back() != sep[0]) np += sep;
+                appendPathSeparator(np, sep[0]);
                 np += name;
                 navigateToDirectory(*focused, np);
             } else if (endsWithCI(name, ".mcraw") && !focused->isAndroid) {
                 std::string mcrawFullPath = focused->currentPath;
-                if (mcrawFullPath.back() != '\\') mcrawFullPath += "\\";
+                appendPathSeparator(mcrawFullPath, '\\');
                 mcrawFullPath += name;
                 postAsync("Mounting MCRAW...", [this, mcrawFullPath, focused]() {
                     std::string mountPath = McrawMountManager::instance().mountMcraw(mcrawFullPath);
@@ -1332,7 +1374,7 @@ void App::render() {
                 });
             } else if (endsWithCI(name, ".mcraw") && focused->isAndroid) {
                 std::string np = focused->currentPath;
-                if (np.back() != '/') np += "/";
+                appendPathSeparator(np, '/');
                 np += name;
                 navigateToDirectory(*focused, np);
             }
@@ -1352,13 +1394,13 @@ void App::render() {
     // Ctrl+C — copy selected files to clipboard
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C) && !anyModalOpen) {
         FilePanel* focused = m_lastFocusedPanel;
-        if (focused && !focused->selectedIndices.empty()) {
+        if (focused && !focused->isApps && !focused->selectedIndices.empty()) {
             m_clipboardPaths.clear();
             std::string sep = focused->isAndroid ? "/" : "\\";
             for (int idx : focused->selectedIndices) {
                 if (!focused->validIndex(idx)) continue;
                 std::string p = focused->currentPath;
-                if (p.back() != sep[0]) p += sep;
+                appendPathSeparator(p, sep[0]);
                 p += focused->entryName(idx);
                 m_clipboardPaths.push_back(p);
             }
@@ -1371,13 +1413,13 @@ void App::render() {
     // Ctrl+X — cut selected files to clipboard
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X) && !anyModalOpen) {
         FilePanel* focused = m_lastFocusedPanel;
-        if (focused && !focused->selectedIndices.empty()) {
+        if (focused && !focused->isApps && !focused->selectedIndices.empty()) {
             m_clipboardPaths.clear();
             std::string sep = focused->isAndroid ? "/" : "\\";
             for (int idx : focused->selectedIndices) {
                 if (!focused->validIndex(idx)) continue;
                 std::string p = focused->currentPath;
-                if (p.back() != sep[0]) p += sep;
+                appendPathSeparator(p, sep[0]);
                 p += focused->entryName(idx);
                 m_clipboardPaths.push_back(p);
             }
@@ -1390,7 +1432,7 @@ void App::render() {
     // Ctrl+V — paste clipboard files into focused panel
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V) && !anyModalOpen) {
         FilePanel* focused = m_lastFocusedPanel;
-        if (focused && !m_clipboardPaths.empty()) {
+        if (focused && !focused->isApps && !m_clipboardPaths.empty()) {
             performClipboardPaste(*focused);
         }
     }
@@ -1409,16 +1451,82 @@ void App::render() {
     bool panelsRefreshed = false;
     auto refreshPanel = [&](FilePanel& panel) {
         if (!panel.needsRefresh) return;
-        if (panel.isAndroid) {
+        if (panel.isApps) {
+            if (panel.refreshInProgress) return;
+            panel.refreshInProgress = true;
+            panel.needsRefresh = false;
+            FilePanel* targetPanel = &panel;
+            int slot = panel.deviceSlot;
+            std::string expectedSerial = (slot >= 0 && slot < 2) ? m_slotSerial[slot] : "";
+            postAsync("Loading installed apps...", [this, targetPanel, slot, expectedSerial]() {
+                std::vector<InstalledAppEntry> apps;
+                DeviceClient& dev = deviceForSlot(slot);
+                if (dev.isServerRunning()) {
+                    std::string serial = m_slotSerial[slot];
+                    apps = dev.listInstalledApps(serial, true);
+                    int col = targetPanel->sortColumn;
+                    bool desc = targetPanel->sortDescending;
+                    std::sort(apps.begin(), apps.end(),
+                        [col, desc](const InstalledAppEntry& a, const InstalledAppEntry& b) {
+                            int cmp = 0;
+                            if (col == 1) cmp = (int)a.isSystem - (int)b.isSystem;
+                            else if (col == 2) cmp = _stricmp(a.apkPath.c_str(), b.apkPath.c_str());
+                            else cmp = _stricmp(a.packageName.c_str(), b.packageName.c_str());
+                            return desc ? cmp > 0 : cmp < 0;
+                        });
+                }
+                if (targetPanel->isApps && targetPanel->deviceSlot == slot && m_slotSerial[slot] == expectedSerial) {
+                    targetPanel->appEntries = std::move(apps);
+                    targetPanel->selectedIndices.clear();
+                    strcpy_s(targetPanel->pathInput, "Installed apps");
+                }
+                targetPanel->refreshInProgress = false;
+                m_compareDirty = true;
+            });
+        } else if (panel.isAndroid) {
             if (m_selectedDevice < 0) return;
-            // listDirectory uses the device's control channel, so it does not
-            // block on transfers or drag-out drains. Refresh freely.
-            refreshAndroidPanel(panel); panel.needsRefresh = false;
+            if (panel.refreshInProgress) return;
+            panel.refreshInProgress = true;
+            panel.needsRefresh = false;
+            FilePanel* targetPanel = &panel;
+            int slot = panel.deviceSlot;
+            std::string path = panel.currentPath;
+            bool insideMcraw = panel.insideMcraw;
+            std::string mcrawPath = panel.mcrawFilePath;
+            postAsync("Loading folder...", [this, targetPanel, slot, path, insideMcraw, mcrawPath]() {
+                std::vector<DeviceFileEntry> entries;
+                DeviceClient& dev = deviceForSlot(slot);
+                if (dev.isServerRunning()) {
+                    if (insideMcraw)
+                        entries = dev.listMcraw(mcrawPath);
+                    else
+                        entries = dev.listDirectory(path);
+                    int col = targetPanel->sortColumn;
+                    bool desc = targetPanel->sortDescending;
+                    std::sort(entries.begin(), entries.end(),
+                        [col, desc](const DeviceFileEntry& a, const DeviceFileEntry& b) {
+                            if (a.isDirectory() != b.isDirectory()) return a.isDirectory();
+                            int cmp;
+                            if (col == 1) cmp = (a.size < b.size) ? -1 : (a.size > b.size) ? 1 : 0;
+                            else if (col == 2) cmp = (a.mtime < b.mtime) ? -1 : (a.mtime > b.mtime) ? 1 : 0;
+                            else cmp = _stricmp(a.name.c_str(), b.name.c_str());
+                            return desc ? cmp > 0 : cmp < 0;
+                        });
+                }
+                if (targetPanel->isAndroid && targetPanel->deviceSlot == slot && targetPanel->currentPath == path) {
+                    targetPanel->androidEntries = std::move(entries);
+                    targetPanel->selectedIndices.clear();
+                    strcpy_s(targetPanel->pathInput, targetPanel->currentPath.c_str());
+                    m_compareDirty = true;
+                }
+                targetPanel->refreshInProgress = false;
+            });
         } else {
             refreshWindowsPanel(panel);
             panel.needsRefresh = false;
+            panel.refreshInProgress = false;
+            panelsRefreshed = true;
         }
-        panelsRefreshed = true;
     };
     refreshPanel(m_leftPanel);
     refreshPanel(m_rightPanel);
@@ -1502,6 +1610,7 @@ void App::render() {
     renderWifiPairingDialog();
     renderAboutPopup();
     renderNotificationPopup();
+    renderApkInstallDialog();
     renderCloseConfirmDialog();
     if (m_showPreferences) renderPreferencesWindow();
     if (m_showNicConfig) renderNicConfigWindow();
@@ -1595,7 +1704,7 @@ void App::render() {
                             if (m_device.connectDirect(connectIp)) {
                                 m_statusMessage = "Direct TCP: " + connectIp;
                             } else {
-                                m_device.startServer(ser);
+                                m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
                                 m_statusMessage = "Failed to connect to " + connectIp;
                             }
                             m_statusTime = std::chrono::steady_clock::now();
@@ -1645,7 +1754,7 @@ void App::render() {
                 if (m_device.connectDirect(connectIp)) {
                     m_statusMessage = "Direct TCP: " + connectIp;
                 } else {
-                    if (!ser.empty()) m_device.startServer(ser);
+                    if (!ser.empty()) m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
                     m_statusMessage = "Failed to connect to " + connectIp;
                 }
                 m_statusTime = std::chrono::steady_clock::now();
@@ -1668,7 +1777,7 @@ void App::render() {
                     } else {
                         m_device.disconnectTcp();
                         m_statusMessage = "ADB Forward failed — reconnecting...";
-                        m_device.startServer(ser);
+                        m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
                     }
                     m_statusTime = std::chrono::steady_clock::now();
                 });
@@ -1802,6 +1911,10 @@ void App::renderMenuBar() {
         if (ImGui::BeginMenu("Transfer")) {
             if (ImGui::MenuItem("Copy to Android  >>", "F6")) startTransfer(false);
             if (ImGui::MenuItem("<< Copy to Windows", "F7")) startTransfer(true);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Register APK Double-Click Installer")) {
+                registerApkAssociation();
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Connection")) {
@@ -1858,7 +1971,7 @@ void App::renderMenuBar() {
                             } else {
                                 m_device.disconnectTcp();
                                 m_statusMessage = "ADB Forward failed";
-                                m_device.startServer(ser);
+                                m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
                             }
                             m_statusTime = std::chrono::steady_clock::now();
                         });
@@ -2007,38 +2120,11 @@ void App::renderMenuBar() {
                     postAsync("Reconnecting server...", [this, ser, preferForward]() {
                         LOG_INFO("UI", std::string("Manual reconnect (prefer ") + (preferForward ? "ADB Forward" : "Direct TCP") + ")");
                         m_device.stopServer();
-                        if (preferForward) {
-                            // ADB Forward path — don't use startServer which prefers Direct TCP
-                            m_device.runAdbCommand("-s " + ser + " shell killall afm-server 2>/dev/null");
-                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                            // Push and start server
-                            std::string serverBin = m_device.getServerBinaryPath();
-                            if (std::filesystem::exists(toFsPath(serverBin)))
-                                m_device.runAdbCommand("-s " + ser + " push \"" + serverBin + "\" /data/local/tmp/afm-server");
-                            m_device.runAdbCommand("-s " + ser + " shell chmod 755 /data/local/tmp/afm-server");
-                            std::string cmd = "\"" + m_device.getAdbPath() + "\" -s " + ser +
-                                " shell \"nohup /data/local/tmp/afm-server " + std::to_string(AFM_PORT) + " > /dev/null 2>&1 &\"";
-                            std::string cmdBuf = cmd;
-                            STARTUPINFOA si{}; si.cb = sizeof(si);
-                            si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-                            PROCESS_INFORMATION pi{};
-                            CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-                            if (pi.hProcess) { WaitForSingleObject(pi.hProcess, 3000); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
-                            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-                            // Connect via ADB forward
-                            m_device.runAdbCommand("-s " + ser + " forward tcp:" + std::to_string(AFM_PORT) + " tcp:" + std::to_string(AFM_PORT));
-                            if (m_device.connectTcp("127.0.0.1", AFM_PORT) && m_device.verifyConnection()) {
-                                m_statusMessage = "Reconnected via ADB Forward";
-                            } else {
-                                m_device.disconnectTcp();
-                                m_statusMessage = "Reconnect failed";
-                            }
-                        } else {
-                            m_device.startServer(ser);
-                            m_statusMessage = m_device.isServerRunning()
-                                ? ("Reconnected via " + std::string(m_device.isDirectConnection() ? "Direct TCP" : "ADB Forward"))
-                                : ("Reconnect failed: " + m_device.lastError());
-                        }
+                        bool useRoot = m_prefs.rootEnabledForSerial(ser);
+                        m_device.startServer(ser, preferForward, useRoot);
+                        m_statusMessage = m_device.isServerRunning()
+                            ? ("Reconnected via " + std::string(m_device.isDirectConnection() ? "Direct TCP" : "ADB Forward"))
+                            : ("Reconnect failed: " + m_device.lastError());
                         m_statusTime = std::chrono::steady_clock::now();
                     });
                 }
@@ -2279,7 +2365,7 @@ bool App::isCompareHighlighted(const FilePanel& panel, PanelSide side, int index
 std::string App::favoriteLabelForPath(const std::string& path, bool isAndroid) {
     if (path.empty()) return isAndroid ? "/" : "PC";
     std::string trimmed = path;
-    while (trimmed.size() > 1 && (trimmed.back() == '/' || trimmed.back() == '\\')) trimmed.pop_back();
+    while (trimmed.size() > 1 && (lastCharOr(trimmed) == '/' || lastCharOr(trimmed) == '\\')) trimmed.pop_back();
     if (!isAndroid && trimmed.size() == 2 && trimmed[1] == ':') return trimmed + "\\";
     size_t pos = trimmed.find_last_of(isAndroid ? "/" : "\\");
     if (pos == std::string::npos) return trimmed;
@@ -2289,6 +2375,7 @@ std::string App::favoriteLabelForPath(const std::string& path, bool isAndroid) {
 }
 
 bool App::isFavoritePath(const FilePanel& panel) const {
+    if (panel.isApps) return false;
     for (const auto& fav : m_prefs.favoritePaths) {
         if (fav.isAndroid == panel.isAndroid &&
             fav.deviceSlot == panel.deviceSlot &&
@@ -2300,7 +2387,7 @@ bool App::isFavoritePath(const FilePanel& panel) const {
 }
 
 void App::addFavoritePath(const FilePanel& panel) {
-    if (panel.currentPath.empty() || isFavoritePath(panel)) return;
+    if (panel.isApps || panel.currentPath.empty() || isFavoritePath(panel)) return;
 
     FavoritePath fav;
     fav.path = panel.currentPath;
@@ -2323,6 +2410,7 @@ void App::removeFavoritePath(int index) {
 }
 
 void App::renderFavoritesBar(FilePanel& panel, PanelSide side) {
+    if (panel.isApps) return;
     bool alreadyFavorite = isFavoritePath(panel);
     if (alreadyFavorite) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.33f, 0.08f, 1));
@@ -2372,9 +2460,10 @@ void App::renderFavoritesBar(FilePanel& panel, PanelSide side) {
 }
 
 std::string App::compareEntryPath(const FilePanel& panel, int index) const {
+    if (panel.isApps) return panel.entryName(index);
     std::string path = panel.currentPath;
     char sep = panel.isAndroid ? '/' : '\\';
-    if (!path.empty() && path.back() != sep) path += sep;
+    appendPathSeparator(path, sep);
     path += panel.entryName(index);
     return path;
 }
@@ -2639,19 +2728,22 @@ void App::renderDeviceBar() {
                 // Root mode toggle — relaunches the on-device server via `su -c`
                 ImGui::SameLine(0, 16);
                 {
-                    bool rootOn = m_prefs.useRoot;
+                    std::string ser = devSnap[selSnap].serial;
+                    bool rootOn = m_prefs.rootEnabledForSerial(ser);
                     if (ImGui::Checkbox("Root##devbar", &rootOn)) {
-                        std::string ser = devSnap[selSnap].serial;
                         if (rootOn) {
                             // Probe root availability before committing.
                             postAsync("Checking root access...", [this, ser]() {
                                 bool hasRoot = m_device.isRootAvailable(ser);
                                 if (!hasRoot) {
-                                    m_statusMessage = "Root not available on this device (no su, or denied)";
+                                    std::string msg = "Root is not available for this device, or the root request was denied.\n\n"
+                                        "Check that the device is rooted and that ADB has been granted root access in Magisk, KernelSU, or your root manager. Then enable Root again for this device.";
+                                    showNotification("Root Access Unavailable", msg, true);
+                                    m_statusMessage = "Root not available or not granted";
                                     m_statusTime = std::chrono::steady_clock::now();
                                     return;
                                 }
-                                m_prefs.useRoot = true;
+                                m_prefs.setRootEnabledForSerial(ser, true);
                                 m_prefs.save();
                                 m_device.disconnectTcp();
                                 if (m_device.startServer(ser, m_preferAdbForward, true)) {
@@ -2659,14 +2751,18 @@ void App::renderDeviceBar() {
                                     m_leftPanel.needsRefresh = true;
                                     m_rightPanel.needsRefresh = true;
                                 } else {
+                                    std::string msg = "Root access was requested, but the device helper could not start as root.\n\n"
+                                        "Check that root access is granted to ADB for this device, then enable Root again.\n\n"
+                                        "Details: " + m_device.lastError();
+                                    showNotification("Root Startup Failed", msg, true);
                                     m_statusMessage = "Root server start failed: " + m_device.lastError();
-                                    m_prefs.useRoot = false;
+                                    m_prefs.setRootEnabledForSerial(ser, false);
                                     m_prefs.save();
                                 }
                                 m_statusTime = std::chrono::steady_clock::now();
                             });
                         } else {
-                            m_prefs.useRoot = false;
+                            m_prefs.setRootEnabledForSerial(ser, false);
                             m_prefs.save();
                             postAsync("Disabling root...", [this, ser]() {
                                 m_device.disconnectTcp();
@@ -2682,7 +2778,7 @@ void App::renderDeviceBar() {
                         }
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Run the on-device server as root via `su -c`.\nLets you access /root and other restricted paths\non rooted devices (Magisk/KernelSU).\nRestarts the server when toggled.");
+                        ImGui::SetTooltip("Run this device's helper as root via `su -c`.\nRequires a rooted device and granted ADB root permission.\nSaved separately for each device.");
                 }
 
                 // WiFi auto-connect toggle
@@ -2795,6 +2891,11 @@ void App::renderDeviceBar() {
 }
 
 void App::renderPanel(FilePanel& panel, PanelSide side) {
+    if (panel.isApps) {
+        renderAppsPanel(panel, side);
+        return;
+    }
+
     const char* label = panel.isAndroid ? "Android" : "Windows";
     ImVec4 labelColor = panel.isAndroid ? ImVec4(0.3f,0.85f,0.4f,1) : ImVec4(0.40f,0.65f,1,1);
 
@@ -2856,6 +2957,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         if (!m_prefs.savedWifiDevices.empty()) {
             ImGui::TextDisabled("Saved WiFi devices:");
             ImGui::Spacing();
+            int deleteSavedDevice = -1;
             for (int si = 0; si < (int)m_prefs.savedWifiDevices.size(); si++) {
                 auto& w = m_prefs.savedWifiDevices[si];
                 if (w.wifiIp.empty()) continue;
@@ -2901,7 +3003,25 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                     });
                 }
                 ImGui::SameLine();
+                std::string delLabel = "Delete##saved" + std::to_string(si);
+                if (ImGui::SmallButton(delLabel.c_str())) {
+                    deleteSavedDevice = si;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Remove this saved device");
+                ImGui::SameLine();
                 ImGui::Text("%s", displayLabel.c_str());
+            }
+            if (deleteSavedDevice >= 0 && deleteSavedDevice < (int)m_prefs.savedWifiDevices.size()) {
+                std::string removed = m_prefs.savedWifiDevices[deleteSavedDevice].model;
+                if (removed.empty()) {
+                    auto& w = m_prefs.savedWifiDevices[deleteSavedDevice];
+                    removed = w.wifiIp + ":" + std::to_string(w.port);
+                }
+                m_prefs.savedWifiDevices.erase(m_prefs.savedWifiDevices.begin() + deleteSavedDevice);
+                m_prefs.save();
+                m_statusMessage = "Removed saved device: " + removed;
+                m_statusTime = std::chrono::steady_clock::now();
             }
             ImGui::Spacing();
             ImGui::Separator();
@@ -3005,10 +3125,11 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
     if (ImGui::SmallButton(("^##U" + std::string(label)).c_str())) navigateUp(panel);
     ImGui::SameLine(0, 6);
 
-    // Panel mode toggle: Windows / Android
+    // Panel mode toggle: Windows / Android / Apps
     {
         std::string winId = std::string("PC##") + (side == PanelSide::Left ? "L" : "R");
         std::string andId = std::string("Android##") + (side == PanelSide::Left ? "L" : "R");
+        std::string appsId = std::string("Apps##") + (side == PanelSide::Left ? "L" : "R");
 
         if (!panel.isAndroid) {
             // Windows is active — show it highlighted, Android as clickable
@@ -3017,6 +3138,8 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
             ImGui::PopStyleColor();
             ImGui::SameLine(0, 2);
             if (ImGui::SmallButton(andId.c_str())) switchPanelMode(panel, true);
+            ImGui::SameLine(0, 2);
+            if (ImGui::SmallButton(appsId.c_str())) switchPanelToApps(panel);
         } else {
             // Android is active
             if (ImGui::SmallButton(winId.c_str())) switchPanelMode(panel, false);
@@ -3024,6 +3147,8 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.30f, 0.15f, 1));
             ImGui::SmallButton(andId.c_str());
             ImGui::PopStyleColor();
+            ImGui::SameLine(0, 2);
+            if (ImGui::SmallButton(appsId.c_str())) switchPanelToApps(panel);
 
             // Device indicator / selector - always visible when in Android mode
             {
@@ -3175,7 +3300,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                 if (next == std::string::npos) next = path.size();
                 std::string seg = path.substr(pos, next - pos);
                 if (!seg.empty()) {
-                    if (accum.back() != '\\') accum += "\\";
+                    appendPathSeparator(accum, '\\');
                     accum += seg;
                     crumbs.push_back({seg, accum});
                 }
@@ -3391,13 +3516,13 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                     if (isDir) {
                         std::string sep = panel.isAndroid ? "/" : "\\";
                         std::string np = panel.currentPath;
-                        if (np.back() != sep[0]) np += sep;
+                        appendPathSeparator(np, sep[0]);
                         np += name;
                         navigateToDirectory(panel, np);
                     } else if (endsWithCI(name, ".mcraw") && !panel.isAndroid) {
                         // Windows side: mount MCRAW via ProjFS and navigate to mount point
                         std::string mcrawFullPath = panel.currentPath;
-                        if (mcrawFullPath.back() != '\\') mcrawFullPath += "\\";
+                        appendPathSeparator(mcrawFullPath, '\\');
                         mcrawFullPath += name;
                         FilePanel* targetPanel = &panel;
                         postAsync("Mounting MCRAW...", [this, mcrawFullPath, targetPanel]() {
@@ -3414,7 +3539,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                     } else if (endsWithCI(name, ".mcraw") && panel.isAndroid) {
                         // Android side: navigate into MCRAW as virtual directory (protocol-based)
                         std::string np = panel.currentPath;
-                        if (np.back() != '/') np += "/";
+                        appendPathSeparator(np, '/');
                         np += name;
                         navigateToDirectory(panel, np);
                     } else if (panel.insideMcraw && panel.isAndroid) {
@@ -3436,9 +3561,12 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                     } else if (!panel.isAndroid) {
                         // Open file on Windows side
                         std::string fp = panel.currentPath;
-                        if (fp.back() != '\\') fp += "\\";
+                        appendPathSeparator(fp, '\\');
                         fp += name;
-                        ShellExecuteA(nullptr, "open", fp.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                        if (endsWithCI(name, ".apk"))
+                            requestApkInstall(fp);
+                        else
+                            ShellExecuteA(nullptr, "open", fp.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                     } else {
                         // Double-clicked a file on Android side — pull to temp and open
                         openAndroidFile(panel, i);
@@ -3687,34 +3815,9 @@ void App::renderTransferOverlay() {
     totalProg = std::clamp(totalProg, 0.0f, 1.0f);
     curFileProg = std::clamp(curFileProg, 0.0f, 1.0f);
 
-    static const TransferBatch* smoothedBatch = nullptr;
-    static double displayedTotalTxD = 0.0;
-    static double displayedLastFrameTime = 0.0;
-    double nowTime = ImGui::GetTime();
-    if (smoothedBatch != batch.get() || st == BatchState::Queued) {
-        smoothedBatch = batch.get();
-        displayedTotalTxD = (double)totalTx;
-        displayedLastFrameTime = nowTime;
-    } else if (st == BatchState::Completed) {
-        displayedTotalTxD = (double)totalBytes;
-    } else {
-        double dt = std::clamp(nowTime - displayedLastFrameTime, 0.0, 0.25);
-        displayedLastFrameTime = nowTime;
-        double targetTx = (double)totalTx;
-        if (targetTx >= displayedTotalTxD) {
-            double minRate = 64.0 * 1024.0 * 1024.0;
-            double catchupRate = totalBytes > 0 ? (double)totalBytes * 0.04 : minRate;
-            double maxStep = std::max(minRate, catchupRate) * dt;
-            displayedTotalTxD += std::min(targetTx - displayedTotalTxD, maxStep);
-        } else {
-            displayedTotalTxD = targetTx;
-        }
-    }
-    if (displayedTotalTxD < 0.0) displayedTotalTxD = 0.0;
-    if (totalBytes > 0 && displayedTotalTxD > (double)totalBytes) displayedTotalTxD = (double)totalBytes;
-    uint64_t totalDisplayTx = (uint64_t)std::round(displayedTotalTxD);
+    uint64_t totalDisplayTx = totalTx;
     float totalDisplayProg = totalBytes > 0
-        ? (float)std::clamp(displayedTotalTxD / (double)totalBytes, 0.0, 1.0)
+        ? (float)std::clamp((double)totalDisplayTx / (double)totalBytes, 0.0, 1.0)
         : totalProg;
     auto formatSizeFixed = [](uint64_t bytes, int decimals) {
         const char* u[] = {"B", "KB", "MB", "GB", "TB"};
@@ -4237,13 +4340,225 @@ static std::string buildLogText(const std::vector<LogEntry>& entries, const std:
     return text;
 }
 
+void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
+    if (!deviceFor(panel).isServerRunning()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.25f, 1), "No Android device connected");
+        ImGui::Spacing();
+        if (ImGui::SmallButton(("PC##AppsNoDev" + std::string(side == PanelSide::Left ? "L" : "R")).c_str()))
+            switchPanelMode(panel, false);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(("Android##AppsNoDev" + std::string(side == PanelSide::Left ? "L" : "R")).c_str()))
+            switchPanelMode(panel, true);
+        return;
+    }
+
+    std::string sideId = side == PanelSide::Left ? "L" : "R";
+    if (ImGui::SmallButton(("PC##Apps" + sideId).c_str())) switchPanelMode(panel, false);
+    ImGui::SameLine(0, 2);
+    if (ImGui::SmallButton(("Android##Apps" + sideId).c_str())) switchPanelMode(panel, true);
+    ImGui::SameLine(0, 2);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.26f, 0.08f, 1));
+    ImGui::SmallButton(("Apps##Apps" + sideId).c_str());
+    ImGui::PopStyleColor();
+
+    ImGui::SameLine(0, 10);
+    ImGui::TextColored(ImVec4(0.85f, 0.60f, 0.25f, 1), "Installed Apps");
+    {
+        std::lock_guard<std::mutex> lk(m_deviceMutex);
+        int onlineCount = 0;
+        for (auto& d : m_devices) if (d.state == "device") onlineCount++;
+        auto getSlotName = [&](int slot) -> std::string {
+            if (slot < 0 || slot >= 2 || !m_slotConnected[slot]) return "No device";
+            auto it = m_deviceDisplayNames.find(m_slotSerial[slot]);
+            if (it != m_deviceDisplayNames.end()) return it->second;
+            for (auto& d : m_devices) {
+                if (d.serial == m_slotSerial[slot])
+                    return d.model.empty() ? d.serial : d.model;
+            }
+            return m_slotSerial[slot];
+        };
+        if (onlineCount > 1) {
+            ImGui::SameLine(0, 8);
+            std::string comboId = "##AppsDevSlot" + sideId;
+            std::string currentName = getSlotName(panel.deviceSlot);
+            ImGui::SetNextItemWidth(200);
+            if (ImGui::BeginCombo(comboId.c_str(), currentName.c_str())) {
+                for (int di = 0; di < 2; di++) {
+                    if (!m_slotConnected[di]) continue;
+                    bool selected = panel.deviceSlot == di;
+                    std::string label = getSlotName(di) + " (" + m_slotSerial[di] + ")##appsSlot" + std::to_string(di);
+                    if (ImGui::Selectable(label.c_str(), selected)) {
+                        if (panel.deviceSlot != di) {
+                            panel.deviceSlot = di;
+                            panel.appEntries.clear();
+                            panel.selectedIndices.clear();
+                            panel.refreshInProgress = false;
+                            panel.needsRefresh = true;
+                        }
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Switch which device this app list uses");
+        } else {
+            ImGui::SameLine(0, 8);
+            ImGui::TextDisabled("%s", getSlotName(panel.deviceSlot).c_str());
+        }
+    }
+    ImGui::SameLine(0, 10);
+    if (ImGui::SmallButton(("Refresh##Apps" + sideId).c_str())) panel.needsRefresh = true;
+
+    ImGui::SameLine(0, 10);
+    bool hasSelection = !panel.selectedIndices.empty();
+    ImGui::BeginDisabled(!hasSelection || m_asyncBusy.load());
+    if (ImGui::SmallButton(("Uninstall##Apps" + sideId).c_str())) {
+        std::vector<std::string> packages;
+        for (int idx : panel.selectedIndices)
+            if (panel.validIndex(idx)) packages.push_back(panel.appEntries[idx].packageName);
+        std::string prompt = "Uninstall " + std::to_string(packages.size()) + " selected app(s) for the current Android user?";
+        if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Uninstall", MB_YESNO | MB_ICONWARNING) != IDYES)
+            packages.clear();
+        if (packages.empty()) { ImGui::EndDisabled(); return; }
+        int slot = panel.deviceSlot;
+        FilePanel* refreshPanel = &panel;
+        postAsync("Uninstalling app...", [this, packages, slot, refreshPanel]() {
+            int ok = 0;
+            std::string details;
+            std::string serial = m_slotSerial[slot];
+            for (const auto& pkg : packages) {
+                std::string out;
+                if (deviceForSlot(slot).uninstallPackage(serial, pkg, out, false, true, false)) ok++;
+                else details += pkg + ": " + out + "\n";
+            }
+            refreshPanel->needsRefresh = true;
+            if (ok == (int)packages.size()) {
+                showNotification("Uninstall Complete", "Removed " + std::to_string(ok) + " app(s) for the current Android user.", false);
+                m_statusMessage = "Uninstalled " + std::to_string(ok) + " app(s)";
+            } else {
+                showNotification("Uninstall Failed", details.empty() ? "No apps were removed." : details, true);
+                m_statusMessage = "Uninstall failed";
+            }
+            m_statusTime = std::chrono::steady_clock::now();
+        });
+    }
+    ImGui::SameLine(0, 4);
+    if (ImGui::SmallButton(("Root Uninstall##Apps" + sideId).c_str())) {
+        std::vector<std::string> packages;
+        for (int idx : panel.selectedIndices)
+            if (panel.validIndex(idx)) packages.push_back(panel.appEntries[idx].packageName);
+        std::string prompt = "Use root uninstall for " + std::to_string(packages.size()) + " selected app(s)?";
+        if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Root Uninstall", MB_YESNO | MB_ICONWARNING) != IDYES)
+            packages.clear();
+        if (packages.empty()) { ImGui::EndDisabled(); return; }
+        int slot = panel.deviceSlot;
+        FilePanel* refreshPanel = &panel;
+        postAsync("Root uninstalling app...", [this, packages, slot, refreshPanel]() {
+            int ok = 0;
+            std::string details;
+            std::string serial = m_slotSerial[slot];
+            if (!deviceForSlot(slot).isRootAvailable(serial)) {
+                showNotification("Root Access Unavailable",
+                    "Root uninstall requires a rooted device with ADB root permission granted for this device.", true);
+                return;
+            }
+            for (const auto& pkg : packages) {
+                std::string out;
+                if (deviceForSlot(slot).uninstallPackage(serial, pkg, out, false, true, true)) ok++;
+                else details += pkg + ": " + out + "\n";
+            }
+            refreshPanel->needsRefresh = true;
+            if (ok == (int)packages.size()) {
+                showNotification("Root Uninstall Complete", "Removed " + std::to_string(ok) + " app(s) for the current Android user.", false);
+                m_statusMessage = "Root uninstalled " + std::to_string(ok) + " app(s)";
+            } else {
+                showNotification("Root Uninstall Failed", details.empty() ? "No apps were removed." : details, true);
+                m_statusMessage = "Root uninstall failed";
+            }
+            m_statusTime = std::chrono::steady_clock::now();
+        });
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Uses root for the package manager command. System partitions may still be read-only.");
+
+    ImGui::SameLine(0, 10);
+    ImGui::SetNextItemWidth(220);
+    ImGui::InputText(("Search##AppsSearch" + sideId).c_str(), panel.searchFilter, sizeof(panel.searchFilter));
+    if (panel.refreshInProgress) {
+        ImGui::SameLine(0, 10);
+        ImGui::TextDisabled("Loading...");
+    }
+    ImGui::Separator();
+
+    std::string filter(panel.searchFilter);
+    std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+
+    ImGuiTableFlags tf = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable;
+    if (ImGui::BeginTable(("##AppsTbl" + sideId).c_str(), 3, tf)) {
+        ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_DefaultSort, 0.50f);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch, 0.12f);
+        ImGui::TableSetupColumn("APK Path", ImGuiTableColumnFlags_WidthStretch, 0.38f);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+
+        if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+            if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                int col = specs->Specs[0].ColumnIndex;
+                bool desc = specs->Specs[0].SortDirection == ImGuiSortDirection_Descending;
+                std::sort(panel.appEntries.begin(), panel.appEntries.end(),
+                    [col, desc](const InstalledAppEntry& a, const InstalledAppEntry& b) {
+                        int cmp = 0;
+                        if (col == 1) cmp = (int)a.isSystem - (int)b.isSystem;
+                        else if (col == 2) cmp = _stricmp(a.apkPath.c_str(), b.apkPath.c_str());
+                        else cmp = _stricmp(a.packageName.c_str(), b.packageName.c_str());
+                        return desc ? cmp > 0 : cmp < 0;
+                    });
+                specs->SpecsDirty = false;
+            }
+        }
+
+        for (int i = 0; i < (int)panel.appEntries.size(); i++) {
+            const auto& app = panel.appEntries[i];
+            std::string hay = app.packageName + " " + app.apkPath;
+            std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+            if (!filter.empty() && hay.find(filter) == std::string::npos) continue;
+
+            bool selected = panel.selectedIndices.count(i) > 0;
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            std::string rowId = app.packageName + "##app" + std::to_string(i);
+            if (ImGui::Selectable(rowId.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                ImGuiIO& io = ImGui::GetIO();
+                if (io.KeyCtrl) {
+                    if (selected) panel.selectedIndices.erase(i);
+                    else panel.selectedIndices.insert(i);
+                } else {
+                    panel.selectedIndices.clear();
+                    panel.selectedIndices.insert(i);
+                }
+                panel.focusedIndex = i;
+                m_lastFocusedPanel = &panel;
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextColored(app.isSystem ? ImVec4(1.0f, 0.72f, 0.34f, 1) : ImVec4(0.55f, 1.0f, 0.65f, 1),
+                "%s", app.isSystem ? "System" : "User");
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", app.apkPath.c_str());
+        }
+        ImGui::EndTable();
+    }
+}
+
 void App::openAndroidFile(FilePanel& panel, int index) {
     if (!panel.isAndroid || !panel.validIndex(index)) return;
     if (panel.entryIsDir(index)) return;
 
     std::string name = panel.entryName(index);
     std::string remotePath = panel.currentPath;
-    if (remotePath.back() != '/') remotePath += "/";
+    appendPathSeparator(remotePath, '/');
     remotePath += name;
 
     m_statusMessage = "Opening: " + name + "...";
@@ -4882,6 +5197,205 @@ void App::renderNotificationPopup() {
         ImGui::Spacing();
         ImGui::EndPopup();
     }
+}
+
+void App::showNotification(const std::string& title, const std::string& message, bool isError) {
+    m_notificationTitle = title;
+    m_notificationMessage = message;
+    m_notificationIsError = isError;
+    m_showNotification = true;
+}
+
+void App::requestApkInstall(const std::string& apkPath) {
+    if (apkPath.empty()) return;
+    m_pendingApkPath = apkPath;
+    m_pendingApkDeviceIndex = 0;
+    m_apkInstallGrantPermissions = false;
+    m_apkInstallAllowDowngrade = false;
+    m_showApkInstallDialog = true;
+}
+
+void App::renderApkInstallDialog() {
+    if (m_showApkInstallDialog) {
+        ImGui::OpenPopup("Install APK");
+        m_showApkInstallDialog = false;
+    }
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImVec2 center = viewport->GetCenter();
+    float maxW = std::max(420.0f, viewport->WorkSize.x - 32.0f);
+    float maxH = std::max(260.0f, viewport->WorkSize.y - 32.0f);
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(420, 0), ImVec2(maxW, maxH));
+    if (ImGui::BeginPopupModal("Install APK", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        std::string apkName = m_pendingApkPath;
+        auto slash = apkName.find_last_of("\\/");
+        if (slash != std::string::npos) apkName = apkName.substr(slash + 1);
+
+        float wrapW = std::min(560.0f, maxW - ImGui::GetStyle().WindowPadding.x * 2.0f);
+        ImGui::SetNextItemWidth(wrapW);
+        ImGui::TextColored(ImVec4(0.45f, 0.70f, 1.0f, 1), "Install APK");
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+        ImGui::TextWrapped("%s", apkName.c_str());
+        ImGui::TextWrapped("%s", m_pendingApkPath.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        std::vector<DeviceInfo> online;
+        {
+            std::lock_guard<std::mutex> lk(m_deviceMutex);
+            for (const auto& d : m_devices)
+                if (d.state == "device") online.push_back(d);
+        }
+
+        if (online.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1), "No Android device is connected.");
+            ImGui::TextWrapped("Connect a device with USB debugging enabled, then open this APK again.");
+        } else {
+            if (m_pendingApkDeviceIndex < 0 || m_pendingApkDeviceIndex >= (int)online.size())
+                m_pendingApkDeviceIndex = 0;
+            if (online.size() == 1) {
+                std::string name = online[0].model.empty() ? online[0].serial : online[0].model + " (" + online[0].serial + ")";
+                ImGui::Text("Device: %s", name.c_str());
+            } else {
+                ImGui::Text("Install to:");
+                ImGui::SetNextItemWidth(460);
+                std::string preview = online[m_pendingApkDeviceIndex].model.empty()
+                    ? online[m_pendingApkDeviceIndex].serial
+                    : online[m_pendingApkDeviceIndex].model + " (" + online[m_pendingApkDeviceIndex].serial + ")";
+                if (ImGui::BeginCombo("##ApkDevice", preview.c_str())) {
+                    for (int i = 0; i < (int)online.size(); i++) {
+                        std::string label = online[i].model.empty()
+                            ? online[i].serial
+                            : online[i].model + " (" + online[i].serial + ")";
+                        bool selected = i == m_pendingApkDeviceIndex;
+                        if (ImGui::Selectable(label.c_str(), selected))
+                            m_pendingApkDeviceIndex = i;
+                        if (selected) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+
+            ImGui::Spacing();
+            ImGui::Checkbox("Grant runtime permissions after install", &m_apkInstallGrantPermissions);
+            ImGui::Checkbox("Allow version downgrade", &m_apkInstallAllowDowngrade);
+            ImGui::Spacing();
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+            ImGui::TextWrapped("The install command will replace an existing copy of the same app while keeping its data.");
+            ImGui::PopTextWrapPos();
+        }
+
+        ImGui::Spacing();
+        float btnW = 110;
+        float totalW = online.empty() ? btnW : btnW * 2 + ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SetCursorPosX((ImGui::GetWindowSize().x - totalW) * 0.5f);
+        ImGui::BeginDisabled(online.empty() || m_asyncBusy.load());
+        if (ImGui::Button("Install", ImVec2(btnW, 0))) {
+            std::string apk = m_pendingApkPath;
+            DeviceInfo target = online[m_pendingApkDeviceIndex];
+            bool grant = m_apkInstallGrantPermissions;
+            bool downgrade = m_apkInstallAllowDowngrade;
+            ImGui::CloseCurrentPopup();
+            postAsync("Installing APK...", [this, apk, target, grant, downgrade]() {
+                std::string out;
+                bool ok = m_device.installApk(target.serial, apk, out, true, grant, downgrade);
+                std::string apkName = apk;
+                size_t slash = apkName.find_last_of("\\/");
+                if (slash != std::string::npos) apkName = apkName.substr(slash + 1);
+                std::string deviceName = target.model.empty() ? target.serial : target.model + " (" + target.serial + ")";
+                std::string flags = "-r";
+                if (grant) flags += " -g";
+                if (downgrade) flags += " -d";
+                std::string report =
+                    "APK: " + apkName + "\n"
+                    "Device: " + deviceName + "\n"
+                    "Serial: " + target.serial + "\n"
+                    "ADB command: install " + flags + "\n\n";
+                if (ok) {
+                    report += "Result: Installed successfully.\n\n";
+                    report += out.empty() ? "ADB output: Success" : "ADB output:\n" + out;
+                    showNotification("APK Installed", report, false);
+                    m_statusMessage = "APK installed";
+                    m_leftPanel.needsRefresh = true;
+                    m_rightPanel.needsRefresh = true;
+                } else {
+                    report += "Result: Install failed.\n\n";
+                    report += out.empty() ? "ADB did not return an error message." : "ADB output:\n" + out;
+                    report += "\n\nCommon causes include an older app version already installed, a signature mismatch, insufficient storage, device policy restrictions, or an APK built for an unsupported ABI or Android version.";
+                    showNotification("APK Install Failed", report, true);
+                    m_statusMessage = "APK install failed";
+                }
+                m_statusTime = std::chrono::steady_clock::now();
+            });
+        }
+        ImGui::EndDisabled();
+        if (!online.empty()) ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(btnW, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void App::registerApkAssociation() {
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::string exe = exePath;
+    std::string exeName = exe;
+    size_t slash = exeName.find_last_of("\\/");
+    if (slash != std::string::npos) exeName = exeName.substr(slash + 1);
+
+    const std::string progId = "FastEnough.apk";
+    const std::string appName = "Fast Enough Android File Manager";
+    const std::string command = "\"" + exe + "\" \"%1\"";
+
+    auto setStringValue = [](HKEY root, const std::string& subkey, const char* valueName, const std::string& value) {
+        HKEY key = nullptr;
+        if (RegCreateKeyExA(root, subkey.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+            RegSetValueExA(key, valueName, 0, REG_SZ, (const BYTE*)value.c_str(), (DWORD)value.size() + 1);
+            RegCloseKey(key);
+        }
+    };
+    auto setEmptyValue = [](HKEY root, const std::string& subkey, const std::string& valueName) {
+        HKEY key = nullptr;
+        if (RegCreateKeyExA(root, subkey.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+            RegSetValueExA(key, valueName.c_str(), 0, REG_NONE, nullptr, 0);
+            RegCloseKey(key);
+        }
+    };
+
+    // ProgID used by Open with and, when Windows allows it, as the per-user default.
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\.apk", nullptr, progId);
+    setEmptyValue(HKEY_CURRENT_USER, "Software\\Classes\\.apk\\OpenWithProgids", progId);
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\.apk\\OpenWithList\\" + exeName, nullptr, "");
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\" + progId, nullptr, "Android APK");
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\" + progId, "FriendlyTypeName", "Android APK");
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\" + progId + "\\DefaultIcon", nullptr, exe + ",0");
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\" + progId + "\\shell\\open", nullptr, "Install with Fast Enough");
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\" + progId + "\\shell\\open\\command", nullptr, command);
+
+    // Register as an application so it appears directly in Windows Open with.
+    std::string appKey = "Software\\Classes\\Applications\\" + exeName;
+    setStringValue(HKEY_CURRENT_USER, appKey, "FriendlyAppName", appName);
+    setStringValue(HKEY_CURRENT_USER, appKey + "\\shell\\open\\command", nullptr, command);
+    setStringValue(HKEY_CURRENT_USER, appKey + "\\SupportedTypes", ".apk", "");
+
+    // Register app capabilities for Default Apps UI.
+    std::string capKey = "Software\\FastEnough\\Capabilities";
+    setStringValue(HKEY_CURRENT_USER, capKey, "ApplicationName", appName);
+    setStringValue(HKEY_CURRENT_USER, capKey, "ApplicationDescription", "Install APK files on connected Android devices.");
+    setStringValue(HKEY_CURRENT_USER, capKey + "\\FileAssociations", ".apk", progId);
+    setStringValue(HKEY_CURRENT_USER, "Software\\RegisteredApplications", appName.c_str(), "Software\\FastEnough\\Capabilities");
+
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    showNotification("APK Handler Registered",
+        "Fast Enough was added to Windows Open with for APK files.\n\n"
+        "If APK files already have another default app, right-click an APK, choose Open with, then select Fast Enough Android File Manager and set it as the default.", false);
+    ShellExecuteA(nullptr, "open", "ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void App::renderCloseConfirmDialog() {
@@ -5728,14 +6242,14 @@ void App::renderContextMenu(FilePanel& panel) {
                 if (panel.entryIsDir(m_contextIndex)) {
                     std::string sep = panel.isAndroid ? "/" : "\\";
                     std::string np = panel.currentPath;
-                    if (np.back() != sep[0]) np += sep; np += name;
+                    appendPathSeparator(np, sep[0]); np += name;
                     navigateToDirectory(panel, np);
                 }
             }
             if (!panel.isAndroid && !panel.entryIsDir(m_contextIndex)) {
                 if (ImGui::MenuItem("Open with Default App")) {
                     std::string fp = panel.currentPath;
-                    if (fp.back() != '\\') fp += "\\"; fp += name;
+                    appendPathSeparator(fp, '\\'); fp += name;
                     ShellExecuteA(nullptr, "open", fp.c_str(), nullptr, nullptr, SW_SHOW);
                 }
             }
@@ -5746,7 +6260,7 @@ void App::renderContextMenu(FilePanel& panel) {
                 for (int idx : panel.selectedIndices) {
                     if (!panel.validIndex(idx)) continue;
                     std::string p = panel.currentPath;
-                    if (p.back() != sep[0]) p += sep;
+                    appendPathSeparator(p, sep[0]);
                     p += panel.entryName(idx);
                     m_clipboardPaths.push_back(p);
                 }
@@ -5760,7 +6274,7 @@ void App::renderContextMenu(FilePanel& panel) {
                 for (int idx : panel.selectedIndices) {
                     if (!panel.validIndex(idx)) continue;
                     std::string p = panel.currentPath;
-                    if (p.back() != sep[0]) p += sep;
+                    appendPathSeparator(p, sep[0]);
                     p += panel.entryName(idx);
                     m_clipboardPaths.push_back(p);
                 }
@@ -5810,7 +6324,7 @@ void App::renderNewFolderPopup() {
                 std::string mkdirPath = m_contextPanel->currentPath + "/" + m_newFolderName;
                 if (m_selectedDevice >= 0) { int slot = m_contextPanel->deviceSlot; postAsync("Creating folder...", [this, mkdirPath, slot]() { deviceForSlot(slot).createDirectory(mkdirPath); }); }
             } else {
-                std::string p = m_contextPanel->currentPath; if (p.back()!='\\') p+="\\"; p+=m_newFolderName;
+                std::string p = m_contextPanel->currentPath; appendPathSeparator(p, '\\'); p+=m_newFolderName;
                 std::filesystem::create_directories(p);
             }
             m_contextPanel->needsRefresh = true; ImGui::CloseCurrentPopup();
@@ -5849,7 +6363,7 @@ void App::renderRenamePopup() {
                     std::string fromP = m_contextPanel->currentPath+"/"+oldN, toP = m_contextPanel->currentPath+"/"+newN;
                     int slot = m_contextPanel->deviceSlot; postAsync("Renaming...", [this, fromP, toP, slot]() { deviceForSlot(slot).renameFile(fromP, toP); });
                 } else {
-                    std::string bp = m_contextPanel->currentPath; if (bp.back()!='\\') bp+="\\";
+                    std::string bp = m_contextPanel->currentPath; appendPathSeparator(bp, '\\');
                     try { std::filesystem::rename(toFsPath(bp+oldN), toFsPath(bp+newN)); } catch (const std::exception& e) {
                         m_statusMessage = std::string("Rename failed: ") + e.what(); m_statusTime = std::chrono::steady_clock::now();
                     }
@@ -5952,7 +6466,7 @@ void App::renderDeleteConfirmPopup() {
                     for (int idx : m_contextPanel->selectedIndices) {
                         if (!m_contextPanel->validIndex(idx)) continue;
                         std::string p = m_contextPanel->currentPath;
-                        if (p.back() != '\\') p += "\\";
+                        appendPathSeparator(p, '\\');
                         p += m_contextPanel->entryName(idx);
                         paths.push_back(p);
                     }
@@ -5985,6 +6499,11 @@ void App::renderDeleteConfirmPopup() {
 
 void App::performClipboardPaste(FilePanel& dstPanel) {
     if (m_clipboardPaths.empty()) return;
+    if (dstPanel.isApps) {
+        m_statusMessage = "App list does not accept file paste. Use APK install instead.";
+        m_statusTime = std::chrono::steady_clock::now();
+        return;
+    }
 
     bool dstIsAndroid = dstPanel.isAndroid;
     bool srcIsAndroid = m_clipboardIsAndroid;
@@ -6002,7 +6521,7 @@ void App::performClipboardPaste(FilePanel& dstPanel) {
                     auto srcPath = toFsPath(src);
                     std::string filename = pathToUtf8(srcPath.filename());
                     std::string dst = dstDir;
-                    if (dst.back() != '\\') dst += "\\";
+                    appendPathSeparator(dst, '\\');
                     dst += filename;
                     auto dstPath = toFsPath(dst);
                     if (isCut) {
@@ -6027,7 +6546,7 @@ void App::performClipboardPaste(FilePanel& dstPanel) {
             for (auto& src : paths) {
                 std::string filename = src.substr(src.rfind('/') + 1);
                 std::string dst = dstDir;
-                if (dst.back() != '/') dst += "/";
+                appendPathSeparator(dst, '/');
                 dst += filename;
                 if (isCut) {
                     deviceForSlot(srcSlot).renameFile(src, dst);
@@ -6122,6 +6641,26 @@ void App::refreshAndroidPanel(FilePanel& panel) {
     strcpy_s(panel.pathInput, panel.currentPath.c_str());
 }
 
+void App::refreshAppsPanel(FilePanel& panel) {
+    panel.appEntries.clear();
+    panel.selectedIndices.clear();
+    DeviceClient& dev = deviceFor(panel);
+    if (!dev.isServerRunning()) return;
+    std::string serial = m_slotSerial[panel.deviceSlot];
+    panel.appEntries = dev.listInstalledApps(serial, true);
+    int col = panel.sortColumn;
+    bool desc = panel.sortDescending;
+    std::sort(panel.appEntries.begin(), panel.appEntries.end(),
+        [col, desc](const InstalledAppEntry& a, const InstalledAppEntry& b) {
+            int cmp = 0;
+            if (col == 1) cmp = (int)a.isSystem - (int)b.isSystem;
+            else if (col == 2) cmp = _stricmp(a.apkPath.c_str(), b.apkPath.c_str());
+            else cmp = _stricmp(a.packageName.c_str(), b.packageName.c_str());
+            return desc ? cmp > 0 : cmp < 0;
+        });
+    strcpy_s(panel.pathInput, "Installed apps");
+}
+
 void App::navigateToDirectory(FilePanel& panel, const std::string& path) {
     // Push to navigation history (truncate forward history)
     if (panel.navHistoryPos < 0 || panel.navHistory.empty() || panel.navHistory[panel.navHistoryPos] != path) {
@@ -6165,8 +6704,9 @@ void App::navigateToDirectory(FilePanel& panel, const std::string& path) {
 }
 
 void App::switchPanelMode(FilePanel& panel, bool toAndroid) {
-    if (panel.isAndroid == toAndroid) return;
+    if (!panel.isApps && panel.isAndroid == toAndroid) return;
     panel.isAndroid = toAndroid;
+    panel.isApps = false;
     panel.selectedIndices.clear();
     panel.focusedIndex = -1;
     panel.searchFilter[0] = '\0';
@@ -6177,9 +6717,10 @@ void App::switchPanelMode(FilePanel& panel, bool toAndroid) {
     panel.navHistoryPos = -1;
     if (toAndroid) {
         panel.windowsEntries.clear();
+        panel.appEntries.clear();
         // If the other panel is already Android on slot 0, use slot 1
         FilePanel& other = (&panel == &m_leftPanel) ? m_rightPanel : m_leftPanel;
-        if (other.isAndroid && other.deviceSlot == 0 && m_slotConnected[1])
+        if ((other.isAndroid || other.isApps) && other.deviceSlot == 0 && m_slotConnected[1])
             panel.deviceSlot = 1;
         else
             panel.deviceSlot = 0;
@@ -6189,15 +6730,45 @@ void App::switchPanelMode(FilePanel& panel, bool toAndroid) {
         panel.needsRefresh = true;
     } else {
         panel.androidEntries.clear();
+        panel.appEntries.clear();
         panel.currentPath = "C:\\";
         strcpy_s(panel.pathInput, panel.currentPath.c_str());
         panel.needsRefresh = true;
     }
 }
 
+void App::switchPanelToApps(FilePanel& panel) {
+    if (panel.isApps) return;
+    panel.isAndroid = false;
+    panel.isApps = true;
+    panel.windowsEntries.clear();
+    panel.androidEntries.clear();
+    panel.selectedIndices.clear();
+    panel.focusedIndex = -1;
+    panel.searchFilter[0] = '\0';
+    if (panel.insideMcraw) McrawMountManager::instance().unmountAll();
+    panel.insideMcraw = false;
+    panel.mcrawFilePath.clear();
+    panel.navHistory.clear();
+    panel.navHistoryPos = -1;
+    FilePanel& other = (&panel == &m_leftPanel) ? m_rightPanel : m_leftPanel;
+    if ((other.isAndroid || other.isApps) && other.deviceSlot == 0 && m_slotConnected[1])
+        panel.deviceSlot = 1;
+    else
+        panel.deviceSlot = 0;
+    panel.currentPath = "apps://installed";
+    strcpy_s(panel.pathInput, "Installed apps");
+    panel.needsRefresh = true;
+}
+
 void App::forEachAndroidPanel(std::function<void(FilePanel&)> fn) {
     if (m_leftPanel.isAndroid) fn(m_leftPanel);
     if (m_rightPanel.isAndroid) fn(m_rightPanel);
+}
+
+void App::forEachDevicePanel(std::function<void(FilePanel&)> fn) {
+    if (m_leftPanel.isAndroid || m_leftPanel.isApps) fn(m_leftPanel);
+    if (m_rightPanel.isAndroid || m_rightPanel.isApps) fn(m_rightPanel);
 }
 
 void App::navigateUp(FilePanel& panel) {
@@ -6643,23 +7214,43 @@ void App::devicePollLoop() {
             m_slotSerial[1].clear();
             m_slotStorageRoot[1].clear();
             m_slotVolumes[1].clear();
-            forEachAndroidPanel([&](FilePanel& p) {
+            forEachDevicePanel([&](FilePanel& p) {
                 if (p.deviceSlot == 1) {
                     p.deviceSlot = 0;
-                    p.currentPath = m_slotStorageRoot[0].empty() ? "/" : m_slotStorageRoot[0];
-                    strcpy_s(p.pathInput, p.currentPath.c_str());
+                    if (p.isAndroid) {
+                        p.currentPath = m_slotStorageRoot[0].empty() ? "/" : m_slotStorageRoot[0];
+                        strcpy_s(p.pathInput, p.currentPath.c_str());
+                    } else if (p.isApps) {
+                        p.appEntries.clear();
+                        p.selectedIndices.clear();
+                    }
                     p.needsRefresh = true;
                 }
             });
         }
         if (!curSerial.empty() && m_device.isServerRunning() && !m_slotConnected[1] && !isBatchActive()) {
-            std::lock_guard<std::mutex> lk(m_deviceMutex);
-            for (int i = 0; i < (int)m_devices.size(); i++) {
-                if (primarySerials.count(m_devices[i].serial)) continue; // skip primary device (any serial)
-                if (m_devices[i].state != "device") continue;
-                std::string serial2 = m_devices[i].serial;
+            std::string serial2;
+            {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+                for (int i = 0; i < (int)m_devices.size(); i++) {
+                    if (primarySerials.count(m_devices[i].serial)) continue; // skip primary device (any serial)
+                    if (m_devices[i].state != "device") continue;
+                    serial2 = m_devices[i].serial;
+                    break; // only one secondary
+                }
+            }
+            if (!serial2.empty()) {
                 LOG_INFO("Poll", "Auto-connecting secondary device slot: " + serial2);
-                if (m_deviceSlots[1].startServer(serial2, true /*ADB forward*/)) {
+                auto startSecondary = [&](const std::string& s) {
+                    bool root = m_prefs.rootEnabledForSerial(s);
+                    if (m_deviceSlots[1].startServer(s, true /*ADB forward*/, root)) return true;
+                    if (!root) return false;
+                    LOG_WARN("Poll", "Secondary root start failed, retrying without root: " + m_deviceSlots[1].lastError());
+                    m_prefs.setRootEnabledForSerial(s, false);
+                    m_prefs.save();
+                    return m_deviceSlots[1].startServer(s, true /*ADB forward*/, false);
+                };
+                if (startSecondary(serial2)) {
                     m_slotSerial[1] = serial2;
                     m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
                     m_slotVolumes[1].clear();
@@ -6667,17 +7258,21 @@ void App::devicePollLoop() {
                     m_slotConnected[1] = true;
                     LOG_INFO("Poll", "Secondary slot connected: " + serial2 + " storage: " + m_slotStorageRoot[1]);
                     // Navigate any slot-1 panels
-                    forEachAndroidPanel([&](FilePanel& p) {
+                    forEachDevicePanel([&](FilePanel& p) {
                         if (p.deviceSlot == 1) {
-                            p.currentPath = m_slotStorageRoot[1];
-                            strcpy_s(p.pathInput, p.currentPath.c_str());
+                            if (p.isAndroid) {
+                                p.currentPath = m_slotStorageRoot[1];
+                                strcpy_s(p.pathInput, p.currentPath.c_str());
+                            } else if (p.isApps) {
+                                p.appEntries.clear();
+                                p.selectedIndices.clear();
+                            }
                             p.needsRefresh = true;
                         }
                     });
                 } else {
                     LOG_WARN("Poll", "Failed to start server on secondary: " + serial2 + ": " + m_deviceSlots[1].lastError());
                 }
-                break; // only one secondary
             }
         }
 
@@ -6697,11 +7292,16 @@ void App::devicePollLoop() {
                 m_slotStorageRoot[1].clear();
                 m_slotVolumes[1].clear();
                 // Move any slot-1 panels back to slot 0
-                forEachAndroidPanel([&](FilePanel& p) {
+                forEachDevicePanel([&](FilePanel& p) {
                     if (p.deviceSlot == 1) {
                         p.deviceSlot = 0;
-                        p.currentPath = m_slotStorageRoot[0].empty() ? "/" : m_slotStorageRoot[0];
-                        strcpy_s(p.pathInput, p.currentPath.c_str());
+                        if (p.isAndroid) {
+                            p.currentPath = m_slotStorageRoot[0].empty() ? "/" : m_slotStorageRoot[0];
+                            strcpy_s(p.pathInput, p.currentPath.c_str());
+                        } else if (p.isApps) {
+                            p.appEntries.clear();
+                            p.selectedIndices.clear();
+                        }
                         p.needsRefresh = true;
                     }
                 });
@@ -6737,7 +7337,18 @@ void App::devicePollLoop() {
                 std::string secondarySerial = m_slotSerial[1];
                 LOG_WARN("Poll", "Secondary health check failed, reconnecting: " + secondarySerial);
                 m_deviceSlots[1].disconnectTcp();
-                if (!secondarySerial.empty() && m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/)) {
+                bool secondaryStarted = false;
+                if (!secondarySerial.empty()) {
+                    bool root = m_prefs.rootEnabledForSerial(secondarySerial);
+                    secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, root);
+                    if (!secondaryStarted && root) {
+                        LOG_WARN("Poll", "Secondary root reconnect failed, retrying without root: " + m_deviceSlots[1].lastError());
+                        m_prefs.setRootEnabledForSerial(secondarySerial, false);
+                        m_prefs.save();
+                        secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, false);
+                    }
+                }
+                if (secondaryStarted) {
                     m_slotSerial[1] = secondarySerial;
                     m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
                     m_slotVolumes[1].clear();
@@ -6902,7 +7513,18 @@ void App::devicePollLoop() {
                             std::string secondarySerial = m_slotSerial[1];
                             LOG_WARN("Poll", "Secondary health check failed, reconnecting: " + secondarySerial);
                             m_deviceSlots[1].disconnectTcp();
-                            if (!secondarySerial.empty() && m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/)) {
+                            bool secondaryStarted = false;
+                            if (!secondarySerial.empty()) {
+                                bool root = m_prefs.rootEnabledForSerial(secondarySerial);
+                                secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, root);
+                                if (!secondaryStarted && root) {
+                                    LOG_WARN("Poll", "Secondary root reconnect failed, retrying without root: " + m_deviceSlots[1].lastError());
+                                    m_prefs.setRootEnabledForSerial(secondarySerial, false);
+                                    m_prefs.save();
+                                    secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, false);
+                                }
+                            }
+                            if (secondaryStarted) {
                                 m_slotSerial[1] = secondarySerial;
                                 m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
                                 m_slotVolumes[1].clear();
@@ -7055,18 +7677,42 @@ void App::onDeviceChanged() {
         serial = m_devices[m_selectedDevice].serial;
     }
 
+    bool useRootForDevice = m_prefs.rootEnabledForSerial(serial);
     // Start the TCP server on the device (status updates come from m_device.statusText())
-    if (!m_device.startServer(serial, m_preferAdbForward, m_prefs.useRoot)) {
+    if (!m_device.startServer(serial, m_preferAdbForward, useRootForDevice)) {
         LOG_ERROR("Poll", "startServer failed: " + m_device.lastError());
-        m_statusMessage = "Server failed: " + m_device.lastError();
-        m_statusTime = std::chrono::steady_clock::now();
-        return;
+        if (useRootForDevice) {
+            std::string rootError = m_device.lastError();
+            m_prefs.setRootEnabledForSerial(serial, false);
+            m_prefs.save();
+            LOG_WARN("Poll", "Root start failed, retrying without root: " + rootError);
+            if (!m_device.startServer(serial, m_preferAdbForward, false)) {
+                std::string msg = "Root access failed for this device, and the normal connection also failed.\n\n"
+                    "Check that the device is rooted, grant ADB root access in Magisk, KernelSU, or your root manager, then reconnect the device.\n\n"
+                    "Root details: " + rootError + "\n\n"
+                    "Reconnect details: " + m_device.lastError();
+                showNotification("Root Connection Failed", msg, true);
+                m_statusMessage = "Root failed and normal reconnect failed. Check root access for this device. " + m_device.lastError();
+                m_statusTime = std::chrono::steady_clock::now();
+                return;
+            }
+            std::string msg = "Root access was not available or was denied for this device.\n\n"
+                "Fast Enough connected without root and turned off Root for this device only. Check your root manager and grant ADB root access before enabling Root again.\n\n"
+                "Details: " + rootError;
+            showNotification("Connected Without Root", msg, true);
+            m_statusMessage = "Root not available or not granted. Connected without root.";
+        } else {
+            m_statusMessage = "Server failed: " + m_device.lastError();
+            m_statusTime = std::chrono::steady_clock::now();
+            return;
+        }
     }
     LOG_INFO("Poll", "startServer succeeded");
 
     std::string connMode = m_device.isDirectConnection()
         ? ("Direct TCP @ " + m_device.deviceIp()) : "ADB Forward";
-    m_statusMessage = "Connected via " + connMode + " - detecting storage...";
+    if (m_statusMessage.empty() || m_statusMessage.find("Root not available") == std::string::npos)
+        m_statusMessage = "Connected via " + connMode + " - detecting storage...";
     m_statusTime = std::chrono::steady_clock::now();
 
     // Detect storage root via TCP server
@@ -7095,41 +7741,46 @@ void App::onDeviceChanged() {
     m_slotConnected[0] = true;
 
     // Navigate slot-0 Android panels to the detected storage root
-    forEachAndroidPanel([&](FilePanel& p) {
+    forEachDevicePanel([&](FilePanel& p) {
         if ((p.deviceSlot < 0 || p.deviceSlot >= 2 || !m_slotConnected[p.deviceSlot]) && m_slotConnected[0]) {
             p.deviceSlot = 0;
             p.navHistory.clear();
             p.navHistoryPos = -1;
         }
         if (p.deviceSlot == 0) {
-            p.currentPath = m_androidStorageRoot;
-            strcpy_s(p.pathInput, p.currentPath.c_str());
+            if (p.isAndroid) {
+                p.currentPath = m_androidStorageRoot;
+                strcpy_s(p.pathInput, p.currentPath.c_str());
+            } else if (p.isApps) {
+                p.appEntries.clear();
+                p.selectedIndices.clear();
+            }
             p.needsRefresh = true;
         }
     });
 
-    // Try to connect a second device if available
+    // Try to connect a second device if available. Keep ADB/server work outside
+    // m_deviceMutex so the UI can keep drawing device selectors while detection runs.
+    std::set<std::string> primarySerials;
+    addKnownPrimarySerials(primarySerials, serial);
+    if (serial == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
+        primarySerials.insert(m_usbToWifiSerial);
+    if (serial == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
+        primarySerials.insert(m_wifiToUsbSerial);
+
+    if (m_slotConnected[1] && primarySerials.count(m_slotSerial[1])) {
+        LOG_INFO("Poll", "Clearing slot 1 because it is another path to the new primary device: " + m_slotSerial[1]);
+        m_deviceSlots[1].disconnectTcp();
+        m_slotConnected[1] = false;
+        m_slotSerial[1].clear();
+        m_slotStorageRoot[1].clear();
+        m_slotVolumes[1].clear();
+    }
+
+    std::string candidateSerial;
     {
         std::lock_guard<std::mutex> lk(m_deviceMutex);
-        // Build set of serials belonging to the primary device (USB + WiFi of same phone)
-        std::set<std::string> primarySerials;
-        addKnownPrimarySerials(primarySerials, serial);
-        if (serial == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
-            primarySerials.insert(m_usbToWifiSerial);
-        if (serial == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
-            primarySerials.insert(m_wifiToUsbSerial);
-
-        if (m_slotConnected[1] && primarySerials.count(m_slotSerial[1])) {
-            LOG_INFO("Poll", "Clearing slot 1 because it is another path to the new primary device: " + m_slotSerial[1]);
-            m_deviceSlots[1].disconnectTcp();
-            m_slotConnected[1] = false;
-            m_slotSerial[1].clear();
-            m_slotStorageRoot[1].clear();
-            m_slotVolumes[1].clear();
-        }
-
         // Prefer reassigning the old primary to slot 1 if it's still online
-        std::string candidateSerial;
         if (!oldSlot0Serial.empty() && !primarySerials.count(oldSlot0Serial)) {
             for (auto& d : m_devices) {
                 if (d.serial == oldSlot0Serial && d.state == "device") {
@@ -7147,28 +7798,42 @@ void App::onDeviceChanged() {
                 break;
             }
         }
+    }
 
-        if (!candidateSerial.empty() && (!m_slotConnected[1] || m_slotSerial[1] != candidateSerial)) {
-            LOG_INFO("Poll", "Starting server on second device: " + candidateSerial);
-            if (m_deviceSlots[1].startServer(candidateSerial, true /*ADB forward*/)) {
-                m_slotSerial[1] = candidateSerial;
-                m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
-                m_slotVolumes[1].clear();
-                m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
-                m_slotConnected[1] = true;
-                LOG_INFO("Poll", "Second device connected: " + candidateSerial + " storage: " + m_slotStorageRoot[1]);
+    if (!candidateSerial.empty() && (!m_slotConnected[1] || m_slotSerial[1] != candidateSerial)) {
+        LOG_INFO("Poll", "Starting server on second device: " + candidateSerial);
+        bool candidateStarted = false;
+        bool candidateRoot = m_prefs.rootEnabledForSerial(candidateSerial);
+        candidateStarted = m_deviceSlots[1].startServer(candidateSerial, true /*ADB forward*/, candidateRoot);
+        if (!candidateStarted && candidateRoot) {
+            LOG_WARN("Poll", "Second device root start failed, retrying without root: " + m_deviceSlots[1].lastError());
+            m_prefs.setRootEnabledForSerial(candidateSerial, false);
+            m_prefs.save();
+            candidateStarted = m_deviceSlots[1].startServer(candidateSerial, true /*ADB forward*/, false);
+        }
+        if (candidateStarted) {
+            m_slotSerial[1] = candidateSerial;
+            m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
+            m_slotVolumes[1].clear();
+            m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
+            m_slotConnected[1] = true;
+            LOG_INFO("Poll", "Second device connected: " + candidateSerial + " storage: " + m_slotStorageRoot[1]);
 
-                // Navigate slot-1 Android panels
-                forEachAndroidPanel([&](FilePanel& p) {
-                    if (p.deviceSlot == 1) {
+            // Navigate slot-1 Android panels
+            forEachDevicePanel([&](FilePanel& p) {
+                if (p.deviceSlot == 1) {
+                    if (p.isAndroid) {
                         p.currentPath = m_slotStorageRoot[1];
                         strcpy_s(p.pathInput, p.currentPath.c_str());
-                        p.needsRefresh = true;
+                    } else if (p.isApps) {
+                        p.appEntries.clear();
+                        p.selectedIndices.clear();
                     }
-                });
-            } else {
-                LOG_WARN("Poll", "Failed to start server on " + candidateSerial + ": " + m_deviceSlots[1].lastError());
-            }
+                    p.needsRefresh = true;
+                }
+            });
+        } else {
+            LOG_WARN("Poll", "Failed to start server on " + candidateSerial + ": " + m_deviceSlots[1].lastError());
         }
     }
 
@@ -7361,12 +8026,12 @@ static void buildBatchItems(FilePanel& srcPanel, FilePanel& dstPanel, bool isPul
             if (isPull) {
                 item.sourcePath = srcPanel.mcrawFilePath;
                 std::string lp = dstPanel.currentPath;
-                if (lp.back() != '\\') lp += "\\"; lp += item.displayName;
+                appendPathSeparator(lp, '\\'); lp += item.displayName;
                 item.destPath = lp;
             } else {
                 item.sourcePath = srcPanel.mcrawFilePath;
                 std::string rp = dstPanel.currentPath;
-                if (rp.back() != '/') rp += "/"; rp += item.displayName;
+                appendPathSeparator(rp, '/'); rp += item.displayName;
                 item.destPath = rp;
             }
             totalBytes += item.fileSize;
@@ -7376,17 +8041,17 @@ static void buildBatchItems(FilePanel& srcPanel, FilePanel& dstPanel, bool isPul
 
         if (isPull) {
             std::string rp = srcPanel.currentPath;
-            if (rp.back() != '/') rp += "/"; rp += item.displayName;
+            appendPathSeparator(rp, '/'); rp += item.displayName;
             item.sourcePath = rp;
             std::string lp = dstPanel.currentPath;
-            if (lp.back() != '\\') lp += "\\"; lp += item.displayName;
+            appendPathSeparator(lp, '\\'); lp += item.displayName;
             item.destPath = lp;
         } else {
             std::string lp = srcPanel.currentPath;
-            if (lp.back() != '\\') lp += "\\"; lp += item.displayName;
+            appendPathSeparator(lp, '\\'); lp += item.displayName;
             item.sourcePath = lp;
             std::string rp = dstPanel.currentPath;
-            if (rp.back() != '/') rp += "/"; rp += item.displayName;
+            appendPathSeparator(rp, '/'); rp += item.displayName;
             item.destPath = rp;
             if (!item.isDirectory) {
                 try { uint64_t ls = (uint64_t)std::filesystem::file_size(toFsPath(lp)); if (ls > 0) item.fileSize = ls; } catch (...) {}
@@ -7405,10 +8070,27 @@ static void buildBatchItems(FilePanel& srcPanel, FilePanel& dstPanel, bool isPul
     }
 }
 
-// Build batch items for local (Windows-to-Windows) copy
 // Build batch items for cross-device Android-to-Android transfer
-static void buildCrossDeviceBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
+static void addCrossDeviceDirRecursive(DeviceClient& srcDev, const std::string& srcDir, const std::string& dstDir,
                                         std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
+    auto entries = srcDev.listDirectory(srcDir);
+    for (auto& e : entries) {
+        BatchFileItem sub;
+        sub.displayName = e.name;
+        sub.isDirectory = e.isDirectory();
+        sub.fileSize = e.size;
+        sub.sourcePath = srcDir + "/" + e.name;
+        sub.destPath = dstDir + "/" + e.name;
+        totalBytes += sub.fileSize;
+        items.push_back(sub);
+        if (sub.isDirectory)
+            addCrossDeviceDirRecursive(srcDev, sub.sourcePath, sub.destPath, items, totalBytes);
+    }
+}
+
+static void buildCrossDeviceBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
+                                        std::vector<BatchFileItem>& items, uint64_t& totalBytes,
+                                        DeviceClient* srcDev = nullptr) {
     for (int idx : srcPanel.selectedIndices) {
         if (!srcPanel.validIndex(idx)) continue;
         BatchFileItem item;
@@ -7418,15 +8100,18 @@ static void buildCrossDeviceBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
 
         // Both source and dest are Android — use forward slashes
         std::string sp = srcPanel.currentPath;
-        if (sp.back() != '/') sp += "/"; sp += item.displayName;
+        appendPathSeparator(sp, '/'); sp += item.displayName;
         item.sourcePath = sp;
 
         std::string dp = dstPanel.currentPath;
-        if (dp.back() != '/') dp += "/"; dp += item.displayName;
+        appendPathSeparator(dp, '/'); dp += item.displayName;
         item.destPath = dp;
 
         totalBytes += item.fileSize;
-        items.push_back(std::move(item));
+        items.push_back(item);
+
+        if (item.isDirectory && srcDev)
+            addCrossDeviceDirRecursive(*srcDev, item.sourcePath, item.destPath, items, totalBytes);
     }
 }
 
@@ -7467,11 +8152,11 @@ static void buildLocalBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
         item.fileSize = srcPanel.entrySize(idx);
 
         std::string sp = srcPanel.currentPath;
-        if (sp.back() != '\\') sp += "\\"; sp += item.displayName;
+        appendPathSeparator(sp, '\\'); sp += item.displayName;
         item.sourcePath = sp;
 
         std::string dp = dstPanel.currentPath;
-        if (dp.back() != '\\') dp += "\\"; dp += item.displayName;
+        appendPathSeparator(dp, '\\'); dp += item.displayName;
         item.destPath = dp;
 
         if (!item.isDirectory) {
@@ -7486,6 +8171,12 @@ static void buildLocalBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
 }
 
 void App::startTransfer(bool pullFromAndroid) {
+    if (m_leftPanel.isApps || m_rightPanel.isApps) {
+        m_statusMessage = "App panels are for install and uninstall only";
+        m_statusTime = std::chrono::steady_clock::now();
+        return;
+    }
+
     // Determine source and destination panels based on their modes
     FilePanel* srcPtr = nullptr;
     FilePanel* dstPtr = nullptr;
@@ -7550,7 +8241,7 @@ void App::startTransfer(bool pullFromAndroid) {
     if (localCopy)
         buildLocalBatchItems(src, dst, batch->files, total);
     else if (batch->isCrossDevice)
-        buildCrossDeviceBatchItems(src, dst, batch->files, total);
+        buildCrossDeviceBatchItems(src, dst, batch->files, total, &deviceFor(src));
     else
         buildBatchItems(src, dst, batch->isPull, batch->files, total, &deviceFor(src));
     batch->totalBytes = total;
@@ -7627,14 +8318,14 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
         if (target->isAndroid) {
             // Explorer → Android: push
             std::string rp = target->currentPath;
-            if (rp.back() != '/') rp += "/";
+            appendPathSeparator(rp, '/');
             rp += item.displayName;
             item.destPath = rp;
             batch->isPull = false;
         } else {
             // Explorer → Windows panel: local copy
             std::string dp = target->currentPath;
-            if (dp.back() != '\\') dp += "\\";
+            appendPathSeparator(dp, '\\');
             dp += item.displayName;
             item.destPath = dp;
             batch->isLocalCopy = true;
@@ -7645,7 +8336,16 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
             if (ec) item.fileSize = 0;
         }
         total += item.fileSize;
+        bool isDir = item.isDirectory;
+        std::string dirSource = item.sourcePath;
+        std::string dirDest = item.destPath;
         batch->files.push_back(std::move(item));
+        if (isDir) {
+            if (target->isAndroid)
+                addPushDirRecursive(dirSource, dirDest, batch->files, total);
+            else
+                addLocalDirRecursive(dirSource, dirDest, batch->files, total);
+        }
     }
 
     batch->totalBytes = total;
@@ -7688,6 +8388,11 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
 
 void App::startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel) {
     if (srcPanel.selectedIndices.empty()) return;
+    if (srcPanel.isApps || dstPanel.isApps) {
+        m_statusMessage = "App panels are for install and uninstall only";
+        m_statusTime = std::chrono::steady_clock::now();
+        return;
+    }
 
     bool localCopy = !srcPanel.isAndroid && !dstPanel.isAndroid;
     bool isPull = srcPanel.isAndroid;
@@ -7717,7 +8422,7 @@ void App::startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel) {
     if (localCopy)
         buildLocalBatchItems(srcPanel, dstPanel, batch->files, total);
     else if (crossDevice)
-        buildCrossDeviceBatchItems(srcPanel, dstPanel, batch->files, total);
+        buildCrossDeviceBatchItems(srcPanel, dstPanel, batch->files, total, &deviceFor(srcPanel));
     else
         buildBatchItems(srcPanel, dstPanel, isPull, batch->files, total, &deviceFor(srcPanel));
     batch->totalBytes = total;
@@ -7961,7 +8666,7 @@ void App::processBatchQueue() {
 
             if (!batchSerial.empty()) {
                 std::string hwOut = batchDev.runAdbCommand("-s " + batchSerial + " shell getprop ro.serialno");
-                while (!hwOut.empty() && (hwOut.back() == '\n' || hwOut.back() == '\r' || hwOut.back() == ' '))
+                while (lastCharOr(hwOut) == '\n' || lastCharOr(hwOut) == '\r' || lastCharOr(hwOut) == ' ')
                     hwOut.pop_back();
                 batchHwSerial = hwOut;
             }
@@ -7991,7 +8696,7 @@ void App::processBatchQueue() {
                 for (auto& d : m_devices) {
                     if (d.state != "device" || isWifiSerial(d.serial)) continue;
                     std::string hw = batchDev.runAdbCommand("-s " + d.serial + " shell getprop ro.serialno");
-                    while (!hw.empty() && (hw.back() == '\n' || hw.back() == '\r' || hw.back() == ' '))
+                    while (lastCharOr(hw) == '\n' || lastCharOr(hw) == '\r' || lastCharOr(hw) == ' ')
                         hw.pop_back();
                     if (hw == batchHwSerial) {
                         batchUsbSerial = d.serial;
@@ -8102,16 +8807,44 @@ void App::processBatchQueue() {
             // Large files (>=200MB): split into 200MB blocks, go into a shared block queue
             // Both channels pull from the queue — faster channel naturally gets more work
 
-            // Scale block size by file size: larger files get bigger blocks to reduce
-            // per-block overhead at high transfer speeds (600+ MB/s)
+            // Queue large logical ranges to keep scheduling overhead low. Workers
+            // split those ranges at assignment time using their observed speed, so
+            // fast links receive larger slices and slow links do not own huge ranges.
             static const uint64_t MB = 1024ULL * 1024;
-            auto blockSizeFor = [](uint64_t fileSize) -> uint64_t {
+            auto largeBlockSizeFor = [](uint64_t fileSize) -> uint64_t {
                 const uint64_t MB = 1024ULL * 1024;
                 const uint64_t GB = 1024ULL * MB;
-                if (fileSize >= 10 * GB) return 2 * GB;   // 30GB file → 15 blocks instead of 150
-                if (fileSize >= 2 * GB)  return 1 * GB;   // 5GB file → 5 blocks instead of 25
-                if (fileSize >= 500 * MB) return 500 * MB; // 1GB file → 2 blocks instead of 5
-                return 200 * MB;                           // small files → 200MB blocks
+                if (fileSize >= 10 * GB) return 2 * GB;
+                if (fileSize >= 2 * GB)  return 1 * GB;
+                if (fileSize >= 500 * MB) return 500 * MB;
+                return 200 * MB;
+            };
+            auto tailBlockSizeFor = [](uint64_t fileSize) -> uint64_t {
+                const uint64_t MB = 1024ULL * 1024;
+                const uint64_t GB = 1024ULL * MB;
+                if (fileSize >= 2 * GB) return 256 * MB;
+                return 200 * MB;
+            };
+            auto blockSizeFor = [&](uint64_t fileSize, uint64_t remaining, int channels) -> uint64_t {
+                uint64_t largeBlock = largeBlockSizeFor(fileSize);
+                uint64_t tailBlock = tailBlockSizeFor(fileSize);
+                uint64_t tailWindow = largeBlock * (uint64_t)std::max(2, channels * 2);
+                return remaining > tailWindow ? largeBlock : tailBlock;
+            };
+            auto assignmentSliceFor = [&](uint64_t fileSize, uint64_t available, double channelSpeed) -> uint64_t {
+                const uint64_t MB = 1024ULL * 1024;
+                const uint64_t minSlice = 64 * MB;
+                const uint64_t probeSlice = 128 * MB;
+                const uint64_t align = 16 * MB;
+                uint64_t maxSlice = largeBlockSizeFor(fileSize);
+                double targetSec = 2.0;
+                uint64_t desired = probeSlice;
+                if (channelSpeed > 4.0 * (double)MB)
+                    desired = (uint64_t)(channelSpeed * targetSec);
+                desired = std::max(minSlice, std::min(desired, maxSlice));
+                desired = (desired / align) * align;
+                if (desired < minSlice) desired = minSlice;
+                return std::min(available, desired);
             };
 
             struct WorkBlock {
@@ -8193,6 +8926,7 @@ void App::processBatchQueue() {
             // Track per-file block completion for partial cleanup on cancel
             std::vector<int> totalBlocksPerFile(batch->totalFiles(), 0);
             std::vector<int> completedBlocksPerFile(batch->totalFiles(), 0);
+            std::vector<uint64_t> completedBytesPerFile(batch->totalFiles(), 0);
             std::set<int> completedFileIndices;
 
             // Pre-create output files for split files (both channels write via OVERLAPPED)
@@ -8206,6 +8940,7 @@ void App::processBatchQueue() {
             // Track CRC per block for combining later
             struct BlockCrc {
                 int blockId;
+                uint64_t offset;
                 uint32_t crc;
                 uint64_t length;
                 int fileIndex;
@@ -8217,6 +8952,8 @@ void App::processBatchQueue() {
             // so we capture them per-file for use during verification)
             std::unordered_map<std::string, uint32_t> wholeFileCrcs;  // destPath -> CRC
 
+            int schedulingChannels = useMultiNic ? batch->numChannels : (int)runtimeChannels.size();
+            schedulingChannels = std::max(1, schedulingChannels);
             for (int i = 0; i < batch->totalFiles(); i++) {
                 auto& item = batch->files[i];
                 if (item.isDirectory) {
@@ -8229,11 +8966,11 @@ void App::processBatchQueue() {
                     totalBlocksPerFile[i] = 1;
                 } else {
                     // Large file: split into blocks (size scales with file size)
-                    uint64_t blkSize = blockSizeFor(item.fileSize);
                     uint64_t remaining = item.fileSize;
                     uint64_t offset = 0;
                     int blockCount = 0;
                     while (remaining > 0) {
+                        uint64_t blkSize = blockSizeFor(item.fileSize, remaining, schedulingChannels);
                         uint64_t blockLen = std::min(remaining, blkSize);
                         workQueue.push_back({i, offset, blockLen, false, blockIdCounter++});
                         offset += blockLen;
@@ -8260,7 +8997,7 @@ void App::processBatchQueue() {
                         splitHandles.push_back({i, INVALID_HANDLE_VALUE, item.fileSize});
                     }
                     LOG_INFO("Transfer", "Splitting " + item.displayName + " (" + formatSize(item.fileSize) +
-                             ") into " + std::to_string(blockCount) + " x " + formatSize(blkSize) + " blocks");
+                             ") into " + std::to_string(blockCount) + " adaptive blocks");
                 }
             }
 
@@ -8357,7 +9094,7 @@ void App::processBatchQueue() {
                 if (!serial.empty()) {
                     std::string hwOut = m_device.runAdbCommand("-s " + serial + " shell getprop ro.serialno");
                     // Trim whitespace
-                    while (!hwOut.empty() && (hwOut.back() == '\n' || hwOut.back() == '\r' || hwOut.back() == ' '))
+                    while (lastCharOr(hwOut) == '\n' || lastCharOr(hwOut) == '\r' || lastCharOr(hwOut) == ' ')
                         hwOut.pop_back();
                     deviceHwSerial = hwOut;
                     LOG_INFO("Transfer", "Device hardware serial: " + deviceHwSerial);
@@ -8365,6 +9102,10 @@ void App::processBatchQueue() {
             }
 
             // (usbChannelCount removed — each channel independently restores its preferred transport)
+
+            std::mutex aggregateProgressMutex;
+            uint64_t aggregateLastBytes = 0;
+            auto aggregateLastTime = parallelStart;
 
             auto worker = [&, deviceHwSerial](DeviceClient& dev, TransferBatch::ChannelProgress& ch,
                               const std::string& reconnectIp, const std::string& bindLocalIp,
@@ -8414,7 +9155,7 @@ void App::processBatchQueue() {
                                         // Verify it's our device
                                         if (!deviceHwSerial.empty()) {
                                             std::string hw = dev.runAdbCommand("-s " + s + " shell getprop ro.serialno");
-                                            while (!hw.empty() && (hw.back() == '\n' || hw.back() == '\r' || hw.back() == ' ')) hw.pop_back();
+                                            while (lastCharOr(hw) == '\n' || lastCharOr(hw) == '\r' || lastCharOr(hw) == ' ') hw.pop_back();
                                             if (hw != deviceHwSerial) continue;
                                         }
                                         std::string fwd = dev.runAdbCommand("-s " + s + " forward tcp:" +
@@ -8478,13 +9219,26 @@ void App::processBatchQueue() {
                         }
                     }
 
-                    // Grab next work block
+                    // Grab a logical range, then split off only the slice this
+                    // channel should own based on its current measured speed.
                     WorkBlock block;
                     {
                         std::lock_guard<std::mutex> lk(workMutex);
                         if (workQueue.empty()) break;
                         block = workQueue.front();
                         workQueue.pop_front();
+                        if (!block.isWholeFile && block.length > 0) {
+                            auto& queuedItem = batch->files[block.fileIndex];
+                            uint64_t assignLen = assignmentSliceFor(
+                                queuedItem.fileSize, block.length, ch.speed.load());
+                            if (assignLen < block.length) {
+                                WorkBlock remainder = block;
+                                remainder.offset += assignLen;
+                                remainder.length -= assignLen;
+                                workQueue.push_front(remainder);
+                                block.length = assignLen;
+                            }
+                        }
                     }
 
                     auto& item = batch->files[block.fileIndex];
@@ -8521,13 +9275,11 @@ void App::processBatchQueue() {
                             lastSpeedBytes = ch.bytesTransferred.load();
                             lastSpeedTime = now;
                         }
-                        // Combined progress across all channels
+                        // Effective batch progress and speed across all channels.
+                        std::lock_guard<std::mutex> progressLk(aggregateProgressMutex);
                         uint64_t combined = 0;
-                        double combinedSpeed = 0;
-                        for (int c = 0; c < numCh; c++) {
+                        for (int c = 0; c < numCh; c++)
                             combined += batch->channels[c].bytesTransferred.load();
-                            combinedSpeed += batch->channels[c].speed.load();
-                        }
                         uint64_t tb = batch->totalBytes.load();
                         if (tb > 0 && combined > tb)
                             combined = tb;
@@ -8535,9 +9287,20 @@ void App::processBatchQueue() {
                         if (combined < currentTotal) combined = currentTotal;
                         batch->totalTransferred = combined;
                         if (tb > 0) batch->totalProgress = (float)((double)combined / (double)tb);
-                        batch->speedBytesPerSec = combinedSpeed;
-                        batch->etaSeconds = (combinedSpeed > 0 && tb > combined)
-                            ? (double)(tb - combined) / combinedSpeed : -1.0;
+
+                        auto totalNow = std::chrono::steady_clock::now();
+                        double totalDt = std::chrono::duration<double>(totalNow - aggregateLastTime).count();
+                        if (totalDt >= 0.5) {
+                            double instant = (double)(combined - aggregateLastBytes) / totalDt;
+                            if (instant < 0 || instant > 10e9) instant = 0;
+                            double prev = batch->speedBytesPerSec.load();
+                            double effectiveSpeed = prev > 0 ? prev * 0.8 + instant * 0.2 : instant;
+                            batch->speedBytesPerSec = effectiveSpeed;
+                            batch->etaSeconds = (effectiveSpeed > 0 && tb > combined)
+                                ? (double)(tb - combined) / effectiveSpeed : -1.0;
+                            aggregateLastBytes = combined;
+                            aggregateLastTime = totalNow;
+                        }
                     };
 
                     auto progressCb = [&](uint64_t transferred, uint64_t total) -> bool {
@@ -8605,7 +9368,7 @@ void App::processBatchQueue() {
                         ok = (got >= block.length) || batch->stopRequested.load();
                         if (ok && !batch->stopRequested.load()) {
                             std::lock_guard<std::mutex> lk(crcMutex);
-                            allBlockCrcs.push_back({block.blockId, ~blockCrc, block.length, block.fileIndex});
+                            allBlockCrcs.push_back({block.blockId, block.offset, ~blockCrc, block.length, block.fileIndex});
                         }
                     } else {
                         // Push block: stream local file range to device via single writeRangeStreaming call
@@ -8633,7 +9396,7 @@ void App::processBatchQueue() {
                                 }
                                 CloseHandle(hCrc);
                                 std::lock_guard<std::mutex> lk(crcMutex);
-                                allBlockCrcs.push_back({block.blockId, ~blockCrc, block.length, block.fileIndex});
+                                allBlockCrcs.push_back({block.blockId, block.offset, ~blockCrc, block.length, block.fileIndex});
                             }
                         }
                     }
@@ -8668,8 +9431,13 @@ void App::processBatchQueue() {
                             {
                                 std::lock_guard<std::mutex> lk(workMutex);
                                 completedBlocksPerFile[block.fileIndex]++;
-                                if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
+                                completedBytesPerFile[block.fileIndex] += block.length;
+                                if (block.isWholeFile || item.isDirectory) {
+                                    if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
+                                        completedFileIndices.insert(block.fileIndex);
+                                } else if (completedBytesPerFile[block.fileIndex] >= item.fileSize) {
                                     completedFileIndices.insert(block.fileIndex);
+                                }
                             }
                             continue; // grab next block from queue
                         }
@@ -8692,8 +9460,13 @@ void App::processBatchQueue() {
                             {
                                 std::lock_guard<std::mutex> lk(workMutex);
                                 completedBlocksPerFile[block.fileIndex]++;
-                                if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
+                                completedBytesPerFile[block.fileIndex] += block.length;
+                                if (block.isWholeFile || item.isDirectory) {
+                                    if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
+                                        completedFileIndices.insert(block.fileIndex);
+                                } else if (completedBytesPerFile[block.fileIndex] >= item.fileSize) {
                                     completedFileIndices.insert(block.fileIndex);
+                                }
                             }
                             continue;
                         }
@@ -8774,7 +9547,7 @@ void App::processBatchQueue() {
                                     for (auto& cand : candidates) {
                                         if (!deviceHwSerial.empty()) {
                                             std::string hwCheck = dev.runAdbCommand("-s " + cand + " shell getprop ro.serialno");
-                                            while (!hwCheck.empty() && (hwCheck.back() == '\n' || hwCheck.back() == '\r' || hwCheck.back() == ' '))
+                                            while (lastCharOr(hwCheck) == '\n' || lastCharOr(hwCheck) == '\r' || lastCharOr(hwCheck) == ' ')
                                                 hwCheck.pop_back();
                                             if (hwCheck != deviceHwSerial) continue;
                                         }
@@ -8833,8 +9606,13 @@ void App::processBatchQueue() {
                     {
                         std::lock_guard<std::mutex> lk(workMutex);
                         completedBlocksPerFile[block.fileIndex]++;
-                        if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
+                        completedBytesPerFile[block.fileIndex] += block.length;
+                        if (block.isWholeFile || item.isDirectory) {
+                            if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
+                                completedFileIndices.insert(block.fileIndex);
+                        } else if (completedBytesPerFile[block.fileIndex] >= item.fileSize) {
                             completedFileIndices.insert(block.fileIndex);
+                        }
                     }
 
                     if (block.isWholeFile)
@@ -8879,10 +9657,13 @@ void App::processBatchQueue() {
                 m_prefs.enableCrcVerification) {
                 batch->state = BatchState::Verifying;
 
-                // Combine block CRCs for split files — sort by blockId and chain crc32Combine
+                // Combine block CRCs for split files in file-offset order.
                 if (!allBlockCrcs.empty()) {
                     std::sort(allBlockCrcs.begin(), allBlockCrcs.end(),
-                              [](auto& a, auto& b) { return a.blockId < b.blockId; });
+                              [](const BlockCrc& a, const BlockCrc& b) {
+                                  if (a.fileIndex != b.fileIndex) return a.fileIndex < b.fileIndex;
+                                  return a.offset < b.offset;
+                              });
 
                     // Group by file and combine
                     std::unordered_map<int, std::vector<BlockCrc*>> fileBlocks;
@@ -9069,7 +9850,7 @@ void App::processBatchQueue() {
 
             if (!serial.empty()) {
                 std::string hwOut = baseDev.runAdbCommand("-s " + serial + " shell getprop ro.serialno");
-                while (!hwOut.empty() && (hwOut.back() == '\n' || hwOut.back() == '\r' || hwOut.back() == ' '))
+                while (lastCharOr(hwOut) == '\n' || lastCharOr(hwOut) == '\r' || lastCharOr(hwOut) == ' ')
                     hwOut.pop_back();
                 hwSerial = hwOut;
             }
@@ -9099,7 +9880,7 @@ void App::processBatchQueue() {
                 for (auto& d : m_devices) {
                     if (d.state != "device" || isWifiSerial(d.serial)) continue;
                     std::string hw = baseDev.runAdbCommand("-s " + d.serial + " shell getprop ro.serialno");
-                    while (!hw.empty() && (hw.back() == '\n' || hw.back() == '\r' || hw.back() == ' '))
+                    while (lastCharOr(hw) == '\n' || lastCharOr(hw) == '\r' || lastCharOr(hw) == ' ')
                         hw.pop_back();
                     if (hw == hwSerial) {
                         usbSerial = d.serial;
@@ -10341,7 +11122,7 @@ void App::processBatchQueue() {
                             }
                         }
 
-                        if (batchDev.startServer(foundSerial, m_preferAdbForward)) {
+                        if (batchDev.startServer(foundSerial, m_preferAdbForward, m_prefs.rootEnabledForSerial(foundSerial))) {
                             std::string connMode = batchDev.isDirectConnection()
                                 ? "Direct TCP: " + batchDev.deviceIp() : "ADB Forward";
                             m_statusMessage = "Reconnected via " + connMode + " - resuming transfer";
@@ -10505,7 +11286,7 @@ void App::processBatchQueue() {
                         // Try to reconnect
                         batch->errorMessage = "CRC check failed - reconnecting...";
                         std::this_thread::sleep_for(std::chrono::seconds(2));
-                        batchDev.startServer(originalSerial);
+                        batchDev.startServer(originalSerial, m_preferAdbForward, m_prefs.rootEnabledForSerial(originalSerial));
                         if (!batchDev.isServerRunning()) break;
                         batch->errorMessage = "Retrying CRC verification: " + item.displayName;
                     }
@@ -10621,14 +11402,14 @@ std::string App::queryDeviceDisplayName(const std::string& serial) {
     };
     for (auto prop : props) {
         std::string val = m_device.runAdbCommand("-s " + serial + " shell getprop " + prop);
-        while (!val.empty() && (val.back() == '\r' || val.back() == '\n')) val.pop_back();
+        while (lastCharOr(val) == '\r' || lastCharOr(val) == '\n') val.pop_back();
         if (!val.empty() && val.find("error") == std::string::npos) return val;
     }
     // Fallback: "Brand Model" e.g. "Samsung SM-S911B"
     std::string brand = m_device.runAdbCommand("-s " + serial + " shell getprop ro.product.brand");
     std::string model = m_device.runAdbCommand("-s " + serial + " shell getprop ro.product.model");
-    while (!brand.empty() && (brand.back() == '\r' || brand.back() == '\n')) brand.pop_back();
-    while (!model.empty() && (model.back() == '\r' || model.back() == '\n')) model.pop_back();
+    while (lastCharOr(brand) == '\r' || lastCharOr(brand) == '\n') brand.pop_back();
+    while (lastCharOr(model) == '\r' || lastCharOr(model) == '\n') model.pop_back();
     if (!brand.empty() && brand.find("error") == std::string::npos) {
         // Capitalize first letter
         if (!brand.empty()) brand[0] = (char)toupper((unsigned char)brand[0]);

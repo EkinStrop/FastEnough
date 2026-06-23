@@ -10,6 +10,8 @@
 #include <shellapi.h>
 #include <fstream>
 #include <string>
+#include <vector>
+#include <cwctype>
 
 // System tray
 #define WM_TRAYICON (WM_APP + 1)
@@ -189,13 +191,54 @@ static void EnableDpiAwareness() {
     }
 }
 
+static std::string WideToUtf8(const std::wstring& value) {
+    if (value.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 1) return "";
+    std::string out(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+static bool EndsWithApk(const std::wstring& path) {
+    if (path.size() < 4) return false;
+    std::wstring ext = path.substr(path.size() - 4);
+    std::transform(ext.begin(), ext.end(), ext.begin(), towlower);
+    return ext == L".apk";
+}
+
+static std::string GetLaunchApkPath() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::string apk;
+    if (argv) {
+        for (int i = 1; i < argc; i++) {
+            if (EndsWithApk(argv[i])) {
+                apk = WideToUtf8(argv[i]);
+                break;
+            }
+        }
+        LocalFree(argv);
+    }
+    return apk;
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    std::string launchApkPath = GetLaunchApkPath();
+
     // Single instance — if already running, bring existing window to front
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"FastEnough_SingleInstance_Mutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         // Find and restore the existing window
         HWND existing = FindWindowW(L"FastEnoughClass", nullptr);
         if (existing) {
+            if (!launchApkPath.empty()) {
+                COPYDATASTRUCT cds{};
+                cds.dwData = 0x41504B31; // APK1
+                cds.cbData = (DWORD)launchApkPath.size() + 1;
+                cds.lpData = (void*)launchApkPath.c_str();
+                SendMessage(existing, WM_COPYDATA, 0, (LPARAM)&cds);
+            }
             ShowWindow(existing, SW_SHOW);
             SetForegroundWindow(existing);
         }
@@ -304,6 +347,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     App app;
     app.m_systemDpiScale = dpiScale;
     app.applyScale(app.m_theme.userScale);
+    if (!launchApkPath.empty())
+        app.requestApkInstall(launchApkPath);
     g_pApp = &app;
 
     // Main loop
@@ -445,13 +490,13 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (!PtInRect(&clientRect, clientPt)) {
             g_pApp->m_isDragging = false;
             FilePanel* src = g_pApp->m_dragSourcePanel;
-            if (src && !src->isAndroid) {
+            if (src && !src->isAndroid && !src->isApps) {
                 // Windows panel: use local file paths directly
                 std::vector<std::string> paths;
                 for (int idx : src->selectedIndices) {
                     if (!src->validIndex(idx)) continue;
                     std::string fp = src->currentPath;
-                    if (fp.back() != '\\') fp += "\\";
+                    if (!fp.empty() && fp.back() != '\\') fp += "\\";
                     fp += src->entryName(idx);
                     paths.push_back(fp);
                 }
@@ -488,6 +533,18 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DragFinish(hDrop);
         g_pApp->handleExternalFileDrop(paths, pt.x, pt.y);
         return 0;
+    }
+
+    if (msg == WM_COPYDATA && g_pApp) {
+        COPYDATASTRUCT* cds = reinterpret_cast<COPYDATASTRUCT*>(lParam);
+        if (cds && cds->dwData == 0x41504B31 && cds->lpData && cds->cbData > 1) {
+            std::string apkPath(static_cast<const char*>(cds->lpData));
+            g_pApp->requestApkInstall(apkPath);
+            ShowWindow(hWnd, SW_SHOW);
+            SetForegroundWindow(hWnd);
+            RemoveTrayIcon();
+            return TRUE;
+        }
     }
 
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))

@@ -23,6 +23,12 @@ struct DeviceInfo {
     std::string state;
 };
 
+struct InstalledAppEntry {
+    std::string packageName;
+    std::string apkPath;
+    bool isSystem = false;
+};
+
 // Progress callback: (bytesTransferred, totalBytes) -> return false to cancel
 using ProgressCallback = std::function<bool(uint64_t transferred, uint64_t total)>;
 
@@ -56,6 +62,11 @@ public:
     bool useRoot() const { return m_useRoot; }
     // Probe whether `su -c id` returns uid=0 on the given device.
     bool isRootAvailable(const std::string& serial);
+    std::vector<InstalledAppEntry> listInstalledApps(const std::string& serial, bool includeSystem = true);
+    bool installApk(const std::string& serial, const std::string& apkPath, std::string& output,
+                    bool reinstall = true, bool grantRuntimePermissions = false, bool allowDowngrade = false);
+    bool uninstallPackage(const std::string& serial, const std::string& packageName, std::string& output,
+                          bool keepData = false, bool userOnly = true, bool useRoot = false);
     void stopServer();
     bool isServerRunning() const { return m_connected; }
     const std::string& connectedSerial() const { return m_serial; }

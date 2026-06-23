@@ -407,11 +407,103 @@ static std::string sanitizeAdbOutput(std::string text) {
     return text;
 }
 
+static std::string quoteCmdArg(const std::string& s) {
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"') out += "\\\"";
+        else out += c;
+    }
+    out += "\"";
+    return out;
+}
+
+static bool isAdbSuccess(const std::string& out) {
+    return out.find("Success") != std::string::npos &&
+           out.find("Failure") == std::string::npos &&
+           out.find("Exception") == std::string::npos &&
+           out.find("Error") == std::string::npos;
+}
+
+std::vector<InstalledAppEntry> DeviceClient::listInstalledApps(const std::string& serial, bool includeSystem) {
+    std::vector<InstalledAppEntry> apps;
+    if (serial.empty()) return apps;
+
+    auto parseList = [&](const std::string& out, bool isSystem) {
+        std::istringstream ss(out);
+        std::string line;
+        while (std::getline(ss, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            const std::string prefix = "package:";
+            if (line.rfind(prefix, 0) != 0) continue;
+            std::string val = line.substr(prefix.size());
+            auto eq = val.rfind('=');
+            if (eq == std::string::npos) continue;
+            InstalledAppEntry app;
+            app.apkPath = val.substr(0, eq);
+            app.packageName = val.substr(eq + 1);
+            app.isSystem = isSystem;
+            if (!app.packageName.empty()) apps.push_back(std::move(app));
+        }
+    };
+
+    parseList(runAdbCommand("-s " + serial + " shell pm list packages -f -3"), false);
+    if (includeSystem)
+        parseList(runAdbCommand("-s " + serial + " shell pm list packages -f -s"), true);
+
+    std::sort(apps.begin(), apps.end(), [](const InstalledAppEntry& a, const InstalledAppEntry& b) {
+        return _stricmp(a.packageName.c_str(), b.packageName.c_str()) < 0;
+    });
+    return apps;
+}
+
+bool DeviceClient::installApk(const std::string& serial, const std::string& apkPath, std::string& output,
+                              bool reinstall, bool grantRuntimePermissions, bool allowDowngrade) {
+    if (serial.empty() || apkPath.empty()) {
+        output = "No device or APK path was provided.";
+        return false;
+    }
+    std::string args = "-s " + serial + " install";
+    if (reinstall) args += " -r";
+    if (grantRuntimePermissions) args += " -g";
+    if (allowDowngrade) args += " -d";
+    args += " " + quoteCmdArg(apkPath);
+    output = runAdbCommand(args);
+    return isAdbSuccess(output);
+}
+
+bool DeviceClient::uninstallPackage(const std::string& serial, const std::string& packageName, std::string& output,
+                                    bool keepData, bool userOnly, bool useRoot) {
+    if (serial.empty() || packageName.empty()) {
+        output = "No device or package was provided.";
+        return false;
+    }
+
+    std::string flags;
+    if (keepData) flags += " -k";
+    if (userOnly) flags += " --user 0";
+
+    if (useRoot) {
+        std::string inner = "pm uninstall" + flags + " " + packageName;
+        output = runAdbCommand("-s " + serial + " shell \"su -c '" + inner + "'\"");
+    } else if (userOnly) {
+        output = runAdbCommand("-s " + serial + " shell pm uninstall" + flags + " " + packageName);
+    } else {
+        output = runAdbCommand("-s " + serial + " uninstall" + (keepData ? " -k " : " ") + packageName);
+    }
+    return isAdbSuccess(output);
+}
+
 bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward, bool useRoot) {
     std::lock_guard<std::mutex> serverLk(m_serverMutex);
     m_useRoot = useRoot;
     LOG_INFO("Server", std::string("startServer(serial=") + serial + " prefer=" + (preferAdbForward ? "ADBForward" : "DirectTCP") + " root=" + (useRoot ? "Y" : "N") + ") begin");
     if (m_connected && m_serial == serial) { LOG_INFO("Server", "Already connected to " + serial); return true; }
+    if (m_useRoot && !isRootAvailable(serial)) {
+        m_lastError = "Root access is not available or was denied. Check that this device is rooted and grant root access to ADB in Magisk or KernelSU.";
+        LOG_ERROR("Server", m_lastError);
+        m_statusText = "ERROR: " + m_lastError;
+        return false;
+    }
 
     // If we previously had a connection to this device that died, kill the old server
     // so it releases its dead client socket and can accept new connections
@@ -423,6 +515,12 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
     LOG_DEBUG("Server", "savedIp from tethering: '" + savedIp + "'");
     m_deviceIp.clear();
     m_serial = serial;
+
+    if (m_useRoot) {
+        LOG_INFO("Server", "Root mode requested - restarting helper as root");
+        runAdbCommand("-s " + serial + " shell \"killall afm-server 2>/dev/null; su -c 'killall afm-server' 2>/dev/null\"");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
 
     if (wasConnectedToSameDevice) {
         LOG_INFO("Server", "Reconnecting to same device - killing old server to clear dead sockets");
@@ -449,12 +547,15 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
         }
     }
 
-    // 1. Try connecting to an already-running server
+    // 1. Try connecting to an already-running server. Root mode skips this so
+    // we do not accidentally attach to an old shell-user helper.
     m_statusText = "Checking for existing server...";
     std::string deviceIp = detectDeviceIp(serial);
     LOG_INFO("Server", "detectDeviceIp -> '" + deviceIp + "'");
     if (deviceIp.empty() && !savedIp.empty()) { deviceIp = savedIp; LOG_INFO("Server", "Using savedIp: " + savedIp); }
-    if (!deviceIp.empty() && !preferAdbForward) {
+    if (m_useRoot) {
+        LOG_INFO("Server", "Skipping existing-server probe (root restart required)");
+    } else if (!deviceIp.empty() && !preferAdbForward) {
         LOG_INFO("Server", "Step 1a: Trying existing server via Direct TCP (" + deviceIp + ")");
         m_statusText = "Trying Direct TCP (" + deviceIp + ")...";
         if (tryDirectConnect(deviceIp)) {
@@ -470,20 +571,22 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
         LOG_WARN("Server", "No device IP available, skipping direct TCP");
     }
 
-    LOG_INFO("Server", "Step 1b: Trying existing server via ADB Forward");
-    m_statusText = "Trying ADB Forward...";
-    runAdbCommand("-s " + serial + " forward --remove tcp:" + std::to_string(m_localPort));
-    runAdbCommand("-s " + serial + " forward tcp:" + std::to_string(m_localPort) +
-                  " tcp:" + std::to_string(AFM_PORT));
-    if (connectTcp("127.0.0.1", m_localPort) && verifyConnection()) {
-        LOG_INFO("Server", "Connected to existing server via ADB Forward");
-        m_statusText = "Connected via ADB Forward";
-        m_directConnection = false;
-        m_connected = true;
-        return true;
+    if (!m_useRoot) {
+        LOG_INFO("Server", "Step 1b: Trying existing server via ADB Forward");
+        m_statusText = "Trying ADB Forward...";
+        runAdbCommand("-s " + serial + " forward --remove tcp:" + std::to_string(m_localPort));
+        runAdbCommand("-s " + serial + " forward tcp:" + std::to_string(m_localPort) +
+                      " tcp:" + std::to_string(AFM_PORT));
+        if (connectTcp("127.0.0.1", m_localPort) && verifyConnection()) {
+            LOG_INFO("Server", "Connected to existing server via ADB Forward");
+            m_statusText = "Connected via ADB Forward";
+            m_directConnection = false;
+            m_connected = true;
+            return true;
+        }
+        LOG_WARN("Server", "ADB Forward to existing server failed");
+        disconnectTcp();
     }
-    LOG_WARN("Server", "ADB Forward to existing server failed");
-    disconnectTcp();
 
     // 2. Server not running - push and start it
     m_statusText = "Pushing server binary to device...";
