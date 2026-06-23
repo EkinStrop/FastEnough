@@ -6051,14 +6051,27 @@ void App::performClipboardPaste(FilePanel& dstPanel) {
 
 void App::refreshWindowsPanel(FilePanel& panel) {
     panel.windowsEntries.clear(); panel.selectedIndices.clear();
-    try {
-        for (const auto& entry : std::filesystem::directory_iterator(toFsPath(panel.currentPath), std::filesystem::directory_options::skip_permission_denied)) {
+    std::error_code iterEc;
+    std::filesystem::directory_iterator it(toFsPath(panel.currentPath), std::filesystem::directory_options::skip_permission_denied, iterEc);
+    if (iterEc) {
+        m_statusMessage = "Error: " + iterEc.message();
+        m_statusTime = std::chrono::steady_clock::now();
+    } else {
+        for (const auto end = std::filesystem::directory_iterator(); it != end; it.increment(iterEc)) {
+            if (iterEc) { iterEc.clear(); continue; }
+            const auto& entry = *it;
             WindowsFileEntry fe;
             fe.name = pathToUtf8(entry.path().filename());
-            fe.isDirectory = entry.is_directory();
+            std::error_code ec;
+            fe.isDirectory = entry.is_directory(ec);
+            if (ec) fe.isDirectory = false;
             DWORD attrs = GetFileAttributesW(entry.path().wstring().c_str());
             fe.isHidden = (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_HIDDEN);
-            if (!fe.isDirectory) { try { fe.size = entry.file_size(); } catch (...) { fe.size = 0; } }
+            if (!fe.isDirectory) {
+                ec.clear();
+                fe.size = entry.file_size(ec);
+                if (ec) fe.size = 0;
+            }
             try {
                 auto ft = entry.last_write_time();
                 auto sc = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
@@ -6070,7 +6083,7 @@ void App::refreshWindowsPanel(FilePanel& panel) {
             } catch (...) { fe.dateModified = ""; }
             panel.windowsEntries.push_back(std::move(fe));
         }
-    } catch (const std::exception& e) { m_statusMessage = std::string("Error: ")+e.what(); m_statusTime = std::chrono::steady_clock::now(); }
+    }
     int col = panel.sortColumn;
     bool desc = panel.sortDescending;
     std::sort(panel.windowsEntries.begin(), panel.windowsEntries.end(),
@@ -7305,22 +7318,28 @@ static void addPullDirRecursive(DeviceClient& dev, const std::string& srcDir, co
 // Recursively add directory contents for push (Windows → Android)
 static void addPushDirRecursive(const std::string& srcDir, const std::string& dstDir,
                                  std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
-    try {
-        for (auto& entry : std::filesystem::directory_iterator(toFsPath(srcDir), std::filesystem::directory_options::skip_permission_denied)) {
-            BatchFileItem sub;
-            sub.displayName = pathToUtf8(entry.path().filename());
-            sub.isDirectory = entry.is_directory();
-            sub.sourcePath = pathToUtf8(entry.path());
-            sub.destPath = dstDir + "/" + sub.displayName;
-            if (!sub.isDirectory) {
-                try { sub.fileSize = (uint64_t)entry.file_size(); } catch (...) {}
-            }
-            totalBytes += sub.fileSize;
-            items.push_back(sub);
-            if (sub.isDirectory)
-                addPushDirRecursive(sub.sourcePath, sub.destPath, items, totalBytes);
+    std::error_code iterEc;
+    std::filesystem::directory_iterator it(toFsPath(srcDir), std::filesystem::directory_options::skip_permission_denied, iterEc);
+    if (iterEc) return;
+    for (const auto end = std::filesystem::directory_iterator(); it != end; it.increment(iterEc)) {
+        if (iterEc) { iterEc.clear(); continue; }
+        auto& entry = *it;
+        BatchFileItem sub;
+        sub.displayName = pathToUtf8(entry.path().filename());
+        std::error_code ec;
+        sub.isDirectory = entry.is_directory(ec);
+        if (ec) sub.isDirectory = false;
+        sub.sourcePath = pathToUtf8(entry.path());
+        sub.destPath = dstDir + "/" + sub.displayName;
+        if (!sub.isDirectory) {
+            sub.fileSize = (uint64_t)entry.file_size(ec);
+            if (ec) sub.fileSize = 0;
         }
-    } catch (...) {}
+        totalBytes += sub.fileSize;
+        items.push_back(sub);
+        if (sub.isDirectory)
+            addPushDirRecursive(sub.sourcePath, sub.destPath, items, totalBytes);
+    }
 }
 
 static void buildBatchItems(FilePanel& srcPanel, FilePanel& dstPanel, bool isPull,
@@ -7414,22 +7433,28 @@ static void buildCrossDeviceBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
 // Recursively add local directory contents
 static void addLocalDirRecursive(const std::string& srcDir, const std::string& dstDir,
                                   std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
-    try {
-        for (auto& entry : std::filesystem::directory_iterator(toFsPath(srcDir), std::filesystem::directory_options::skip_permission_denied)) {
-            BatchFileItem sub;
-            sub.displayName = pathToUtf8(entry.path().filename());
-            sub.isDirectory = entry.is_directory();
-            sub.sourcePath = pathToUtf8(entry.path());
-            sub.destPath = dstDir + "\\" + sub.displayName;
-            if (!sub.isDirectory) {
-                try { sub.fileSize = (uint64_t)entry.file_size(); } catch (...) {}
-            }
-            totalBytes += sub.fileSize;
-            items.push_back(sub);
-            if (sub.isDirectory)
-                addLocalDirRecursive(sub.sourcePath, sub.destPath, items, totalBytes);
+    std::error_code iterEc;
+    std::filesystem::directory_iterator it(toFsPath(srcDir), std::filesystem::directory_options::skip_permission_denied, iterEc);
+    if (iterEc) return;
+    for (const auto end = std::filesystem::directory_iterator(); it != end; it.increment(iterEc)) {
+        if (iterEc) { iterEc.clear(); continue; }
+        auto& entry = *it;
+        BatchFileItem sub;
+        sub.displayName = pathToUtf8(entry.path().filename());
+        std::error_code ec;
+        sub.isDirectory = entry.is_directory(ec);
+        if (ec) sub.isDirectory = false;
+        sub.sourcePath = pathToUtf8(entry.path());
+        sub.destPath = dstDir + "\\" + sub.displayName;
+        if (!sub.isDirectory) {
+            sub.fileSize = (uint64_t)entry.file_size(ec);
+            if (ec) sub.fileSize = 0;
         }
-    } catch (...) {}
+        totalBytes += sub.fileSize;
+        items.push_back(sub);
+        if (sub.isDirectory)
+            addLocalDirRecursive(sub.sourcePath, sub.destPath, items, totalBytes);
+    }
 }
 
 static void buildLocalBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
@@ -7595,7 +7620,9 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
         auto p = toFsPath(srcPath);
         item.displayName = pathToUtf8(p.filename());
         item.sourcePath = srcPath;
-        item.isDirectory = std::filesystem::is_directory(p);
+        std::error_code ec;
+        item.isDirectory = std::filesystem::is_directory(p, ec);
+        if (ec) item.isDirectory = false;
 
         if (target->isAndroid) {
             // Explorer → Android: push
@@ -7614,7 +7641,8 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
         }
 
         if (!item.isDirectory) {
-            try { item.fileSize = (uint64_t)std::filesystem::file_size(p); } catch (...) {}
+            item.fileSize = (uint64_t)std::filesystem::file_size(p, ec);
+            if (ec) item.fileSize = 0;
         }
         total += item.fileSize;
         batch->files.push_back(std::move(item));

@@ -397,6 +397,16 @@ static std::string wrapSu(const std::string& innerCmd, bool useRoot) {
     return "su -c '" + innerCmd + "'";
 }
 
+static std::string serverLaunchCommand(int port, bool useRoot) {
+    return wrapSu("nohup /data/local/tmp/afm-server " + std::to_string(port) +
+        " > /data/local/tmp/afm-server.log 2>&1 &", useRoot);
+}
+
+static std::string sanitizeAdbOutput(std::string text) {
+    while (!text.empty() && (text.back() == '\r' || text.back() == '\n')) text.pop_back();
+    return text;
+}
+
 bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward, bool useRoot) {
     std::lock_guard<std::mutex> serverLk(m_serverMutex);
     m_useRoot = useRoot;
@@ -424,8 +434,8 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
         if (std::filesystem::exists(serverBin)) {
             runAdbCommand("-s " + serial + " push \"" + serverBin + "\" /data/local/tmp/afm-server");
             runAdbCommand("-s " + serial + " shell chmod 755 /data/local/tmp/afm-server");
-            std::string launchInner = wrapSu("nohup /data/local/tmp/afm-server " +
-                std::to_string(AFM_PORT) + " > /dev/null 2>&1 &", m_useRoot);
+            runAdbCommand("-s " + serial + " shell rm -f /data/local/tmp/afm-server.log");
+            std::string launchInner = serverLaunchCommand(AFM_PORT, m_useRoot);
             std::string cmd = "\"" + m_adbPath + "\" -s " + serial +
                 " shell \"" + launchInner + "\"";
             std::string cmdBuf = cmd;
@@ -462,6 +472,7 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
 
     LOG_INFO("Server", "Step 1b: Trying existing server via ADB Forward");
     m_statusText = "Trying ADB Forward...";
+    runAdbCommand("-s " + serial + " forward --remove tcp:" + std::to_string(m_localPort));
     runAdbCommand("-s " + serial + " forward tcp:" + std::to_string(m_localPort) +
                   " tcp:" + std::to_string(AFM_PORT));
     if (connectTcp("127.0.0.1", m_localPort) && verifyConnection()) {
@@ -499,11 +510,11 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
     runAdbCommand("-s " + serial + " shell chmod 755 /data/local/tmp/afm-server");
     // Kill any prior server, whether it was started as shell or root.
     runAdbCommand("-s " + serial + " shell \"killall afm-server 2>/dev/null; su -c 'killall afm-server' 2>/dev/null\"");
+    runAdbCommand("-s " + serial + " shell rm -f /data/local/tmp/afm-server.log");
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     // Start server in background - use runProcess directly to avoid ADB shell hanging
-    std::string launchInner = wrapSu("nohup /data/local/tmp/afm-server " +
-        std::to_string(AFM_PORT) + " > /dev/null 2>&1 &", m_useRoot);
+    std::string launchInner = serverLaunchCommand(AFM_PORT, m_useRoot);
     std::string cmd = "\"" + m_adbPath + "\" -s " + serial +
         " shell \"" + launchInner + "\"";
     LOG_DEBUG("Server", "Launch cmd: " + cmd);
@@ -526,6 +537,16 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
     std::string psCheck = runAdbCommand("-s " + serial + " shell \"pidof afm-server 2>/dev/null\"");
     bool serverPidFound = !psCheck.empty() && psCheck.find_first_of("0123456789") != std::string::npos;
     LOG_INFO("Server", "pidof afm-server: '" + psCheck + "' -> " + std::string(serverPidFound ? "FOUND" : "NOT FOUND"));
+    if (!serverPidFound) {
+        std::string startupLog = sanitizeAdbOutput(runAdbCommand("-s " + serial + " shell \"cat /data/local/tmp/afm-server.log 2>/dev/null\""));
+        if (!startupLog.empty()) {
+            LOG_ERROR("Server", "afm-server startup log: " + startupLog);
+            m_lastError = "Device helper failed to start: " + startupLog;
+        } else {
+            std::string fileInfo = sanitizeAdbOutput(runAdbCommand("-s " + serial + " shell \"ls -l /data/local/tmp/afm-server 2>/dev/null; getprop ro.product.cpu.abi; getprop ro.build.version.sdk\""));
+            if (!fileInfo.empty()) LOG_ERROR("Server", "afm-server not running, device info: " + fileInfo);
+        }
+    }
 
     // 3. Try direct TCP — use savedIp if detectDeviceIp fails (ADB may be flaky after tethering)
     std::string retryIp = detectDeviceIp(serial);
@@ -561,8 +582,9 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
                 if (!serverPidFound) {
                     LOG_WARN("Server", "Server not running - restarting...");
                     m_statusText = "Server not running - restarting...";
+                    runAdbCommand("-s " + serial + " shell rm -f /data/local/tmp/afm-server.log");
                     std::string restartCmd = "\"" + m_adbPath + "\" -s " + serial +
-                        " shell \"nohup /data/local/tmp/afm-server " + std::to_string(AFM_PORT) + " > /dev/null 2>&1 &\"";
+                        " shell \"" + serverLaunchCommand(AFM_PORT, m_useRoot) + "\"";
                     std::string restartBuf = restartCmd;
                     STARTUPINFOA rsi{}; rsi.cb = sizeof(rsi);
                     rsi.dwFlags = STARTF_USESHOWWINDOW; rsi.wShowWindow = SW_HIDE;
@@ -581,6 +603,7 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
     // 4. ADB forward (reliable fallback)
     LOG_INFO("Server", "Step 6: ADB Forward fallback");
     m_statusText = "Setting up ADB Forward...";
+    runAdbCommand("-s " + serial + " forward --remove tcp:" + std::to_string(m_localPort));
     runAdbCommand("-s " + serial + " forward tcp:" + std::to_string(m_localPort) +
                   " tcp:" + std::to_string(AFM_PORT));
 
