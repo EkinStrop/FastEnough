@@ -28,6 +28,8 @@ enum {
     CMD_WRITE_RANGE = 18, // payload: [8B offset][8B length][path string] then RSP_DATA chunks, RSP_DONE
     CMD_CREATE_FILE = 19, // payload: [8B total_size][path string] - create/truncate file
     CMD_SHA256      = 20, // payload: path string - returns 32B SHA-256
+    CMD_ARCHIVE_PATH = 21, // payload: [4B exclude_cache][path string] - returns tar archive stream
+    CMD_EXTRACT_ARCHIVE = 22, // payload: [4B target_len][4B archive_len][target][archive_path]
 };
 
 enum {

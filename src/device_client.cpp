@@ -17,6 +17,9 @@
 #include <deque>
 #include <atomic>
 #include <mutex>
+#include <fstream>
+#include <iomanip>
+#include <nlohmann/json.hpp>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -34,10 +37,21 @@ static std::filesystem::path toFsPath(const std::string& utf8) {
     return std::filesystem::path(toWide(utf8));
 }
 
+static std::string pathToUtf8(const std::filesystem::path& p) {
+    auto ws = p.wstring();
+    if (ws.empty()) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
+    std::string utf8(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), utf8.data(), len, nullptr, nullptr);
+    return utf8;
+}
+
 static struct WsaInit {
     WsaInit() { WSADATA d; WSAStartup(MAKEWORD(2,2), &d); }
     ~WsaInit() { WSACleanup(); }
 } g_wsaInit;
+
+static std::string sanitizeAdbOutput(std::string text);
 
 DeviceClient::DeviceClient() {
     // Don't call findAdb() here - it runs a process which blocks
@@ -107,6 +121,173 @@ std::string DeviceClient::runProcess(const std::string& command) {
     WaitForSingleObject(pi.hProcess, 30000);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     return output;
+}
+
+static std::string lastWin32ErrorText() {
+    DWORD err = GetLastError();
+    if (err == 0) return "Windows process error";
+    char* msg = nullptr;
+    FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                   nullptr, err, 0, (LPSTR)&msg, 0, nullptr);
+    std::string out = msg ? msg : "Windows process error";
+    if (msg) LocalFree(msg);
+    while (!out.empty() && (out.back() == '\r' || out.back() == '\n' || out.back() == '.')) out.pop_back();
+    return out;
+}
+
+bool DeviceClient::runProcessToFile(const std::string& command, const std::string& outputPath, std::string& output,
+                                    uint32_t timeoutMs, ProgressCallback progress, uint64_t totalBytes) {
+    output.clear();
+    LOG_INFO("Process", "Streaming command output to file: " + outputPath);
+    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
+    HANDLE hRead = nullptr, hWrite = nullptr;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+        output = lastWin32ErrorText();
+        LOG_ERROR("Process", "CreatePipe failed: " + output);
+        return false;
+    }
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    HANDLE hErrRead = nullptr, hErrWrite = nullptr;
+    if (!CreatePipe(&hErrRead, &hErrWrite, &sa, 0)) {
+        output = lastWin32ErrorText();
+        LOG_ERROR("Process", "CreatePipe stderr failed: " + output);
+        CloseHandle(hRead); CloseHandle(hWrite);
+        return false;
+    }
+    SetHandleInformation(hErrRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    si.hStdOutput = hWrite;
+    si.hStdError = hErrWrite;
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::string cmd = command;
+    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        output = lastWin32ErrorText();
+        LOG_ERROR("Process", "CreateProcess failed: " + output);
+        CloseHandle(hRead); CloseHandle(hWrite); CloseHandle(hErrRead); CloseHandle(hErrWrite);
+        return false;
+    }
+    CloseHandle(hWrite);
+    CloseHandle(hErrWrite);
+
+    HANDLE hOut = CreateFileW(toWide(outputPath).c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hOut == INVALID_HANDLE_VALUE) {
+        output = "Could not create output file: " + outputPath;
+        LOG_ERROR("Process", output);
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(hRead); CloseHandle(hErrRead); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+        return false;
+    }
+
+    std::string errSample;
+    std::vector<char> buf(1024 * 1024);
+    DWORD n = 0;
+    uint64_t transferred = 0;
+    while (ReadFile(hRead, buf.data(), (DWORD)buf.size(), &n, nullptr) && n > 0) {
+        DWORD written = 0;
+        if (!WriteFile(hOut, buf.data(), n, &written, nullptr) || written != n) {
+            output = "Could not write output file: " + outputPath;
+            LOG_ERROR("Process", output);
+            TerminateProcess(pi.hProcess, 1);
+            break;
+        }
+        transferred += written;
+        if (progress && !progress(transferred, totalBytes)) {
+            output = "Operation cancelled.";
+            TerminateProcess(pi.hProcess, 1);
+            break;
+        }
+    }
+    CloseHandle(hOut);
+    CloseHandle(hRead);
+
+    char errBuf[4096];
+    DWORD errN = 0;
+    while (ReadFile(hErrRead, errBuf, sizeof(errBuf), &errN, nullptr) && errN > 0) {
+        if (errSample.size() < 8192) {
+            size_t take = std::min<size_t>(errN, 8192 - errSample.size());
+            errSample.append(errBuf, errBuf + take);
+        }
+    }
+    CloseHandle(hErrRead);
+
+    DWORD wait = WaitForSingleObject(pi.hProcess, timeoutMs ? timeoutMs : INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    if (wait == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        output = "Command timed out.";
+        LOG_ERROR("Process", "Streaming command timed out: " + outputPath);
+        exitCode = 1;
+    } else if (exitCode != 0 && output.empty()) {
+        output = errSample.empty() ? ("Command failed with exit code " + std::to_string(exitCode)) : errSample;
+    }
+    if (exitCode != 0) LOG_ERROR("Process", "Streaming command failed for " + outputPath + ": " + sanitizeAdbOutput(output));
+    else LOG_INFO("Process", "Streaming command completed: " + outputPath);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return exitCode == 0;
+}
+
+bool DeviceClient::runProcessFromFile(const std::string& command, const std::string& inputPath, std::string& output,
+                                      uint32_t timeoutMs) {
+    output.clear();
+    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
+    HANDLE hChildStdoutRd = nullptr, hChildStdoutWr = nullptr;
+    if (!CreatePipe(&hChildStdoutRd, &hChildStdoutWr, &sa, 0)) {
+        output = lastWin32ErrorText();
+        return false;
+    }
+    SetHandleInformation(hChildStdoutRd, HANDLE_FLAG_INHERIT, 0);
+
+    HANDLE hInput = CreateFileW(toWide(inputPath).c_str(), GENERIC_READ, FILE_SHARE_READ, &sa,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hInput == INVALID_HANDLE_VALUE) {
+        output = "Could not open input file: " + inputPath;
+        CloseHandle(hChildStdoutRd); CloseHandle(hChildStdoutWr);
+        return false;
+    }
+
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    si.hStdInput = hInput;
+    si.hStdOutput = hChildStdoutWr;
+    si.hStdError = hChildStdoutWr;
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::string cmd = command;
+    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        output = lastWin32ErrorText();
+        CloseHandle(hInput); CloseHandle(hChildStdoutRd); CloseHandle(hChildStdoutWr);
+        return false;
+    }
+    CloseHandle(hInput);
+    CloseHandle(hChildStdoutWr);
+
+    char buf[4096];
+    DWORD n = 0;
+    while (ReadFile(hChildStdoutRd, buf, sizeof(buf) - 1, &n, nullptr) && n > 0) {
+        buf[n] = 0;
+        output += buf;
+        if (output.size() > 32768) output.erase(0, output.size() - 32768);
+    }
+    CloseHandle(hChildStdoutRd);
+
+    DWORD wait = WaitForSingleObject(pi.hProcess, timeoutMs ? timeoutMs : INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    if (wait == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        output += "\nCommand timed out.";
+        exitCode = 1;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return exitCode == 0;
 }
 
 std::string DeviceClient::runAdbCommand(const std::string& args) {
@@ -417,6 +598,58 @@ static std::string quoteCmdArg(const std::string& s) {
     return out;
 }
 
+static std::string shellQuote(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
+static std::string sanitizePathPart(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (char c : value) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') out.push_back(c);
+        else out.push_back('_');
+    }
+    return out.empty() ? "unknown" : out;
+}
+
+static std::string nowBackupStamp() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t tt = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_s(&tm, &tt);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S", &tm);
+    return buf;
+}
+
+static uint64_t directorySizeBytes(const std::filesystem::path& dir) {
+    uint64_t total = 0;
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(dir, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (it->is_regular_file(ec)) total += it->file_size(ec);
+    }
+    return total;
+}
+
+static std::vector<std::string> splitLines(std::string text) {
+    std::vector<std::string> lines;
+    std::istringstream ss(text);
+    std::string line;
+    while (std::getline(ss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (!line.empty()) lines.push_back(line);
+    }
+    return lines;
+}
+
 static bool isAdbSuccess(const std::string& out) {
     return out.find("Success") != std::string::npos &&
            out.find("Failure") == std::string::npos &&
@@ -491,6 +724,404 @@ bool DeviceClient::uninstallPackage(const std::string& serial, const std::string
         output = runAdbCommand("-s " + serial + " uninstall" + (keepData ? " -k " : " ") + packageName);
     }
     return isAdbSuccess(output);
+}
+
+bool DeviceClient::backupApp(const std::string& serial, const std::string& packageName, const std::string& backupRoot,
+                             const AppBackupOptions& options, AppBackupRecord& outRecord, std::string& output,
+                             BackupProgressCallback progress) {
+    LOG_INFO("BackupEngine", "backupApp begin package=" + packageName + " serial=" + serial);
+    auto emitProgress = [&](const std::string& stage, int stageIndex, int stageCount,
+                            uint64_t bytesDone = 0, uint64_t bytesTotal = 0) -> bool {
+        if (!progress) return true;
+        AppBackupProgress p;
+        p.packageName = packageName;
+        p.stageLabel = stage;
+        p.stageIndex = stageIndex;
+        p.stageCount = std::max(1, stageCount);
+        p.bytesTransferred = bytesDone;
+        p.bytesTotal = bytesTotal;
+        return progress(p);
+    };
+    auto enabledStageCount = [&]() {
+        int count = 4; // prepare, package query, permissions, metadata
+        if (options.includeApk) count++;
+        if (options.includeData) count++;
+        if (options.includeDeviceProtectedData) count++;
+        if (options.includeExternalData) count++;
+        if (options.includeObb) count++;
+        if (options.includeMedia) count++;
+        return count;
+    };
+    int stageTotal = enabledStageCount();
+    int stageIndex = 0;
+    emitProgress("Preparing backup", stageIndex, stageTotal);
+    output.clear();
+    outRecord = {};
+    if (serial.empty() || packageName.empty()) {
+        output = "No device or package was provided.";
+        LOG_ERROR("BackupEngine", output);
+        return false;
+    }
+    if (!isRootAvailable(serial)) {
+        output = "Root access is required for app and data backups.";
+        LOG_ERROR("BackupEngine", output);
+        return false;
+    }
+
+    std::filesystem::path root = toFsPath(backupRoot);
+    std::string stamp = nowBackupStamp();
+    std::filesystem::path appDir = root / sanitizePathPart(packageName) / stamp;
+    std::error_code ec;
+    std::filesystem::create_directories(appDir, ec);
+    if (ec) {
+        output = "Could not create backup folder.";
+        LOG_ERROR("BackupEngine", output + " " + pathToUtf8(appDir));
+        return false;
+    }
+    LOG_INFO("BackupEngine", "Backup folder: " + pathToUtf8(appDir));
+
+    stageIndex++;
+    emitProgress("Reading APK paths", stageIndex, stageTotal);
+    LOG_INFO("BackupEngine", "Querying APK paths for " + packageName);
+    std::string apkOut = runAdbCommand("-s " + serial + " shell pm path " + packageName);
+    std::vector<std::string> apkPaths;
+    for (auto& line : splitLines(apkOut)) {
+        const std::string prefix = "package:";
+        if (line.rfind(prefix, 0) == 0) apkPaths.push_back(line.substr(prefix.size()));
+    }
+    if (apkPaths.empty()) {
+        output = "Package is not installed or Package Manager did not return APK paths.";
+        LOG_ERROR("BackupEngine", output + " pm path output: " + sanitizeAdbOutput(apkOut));
+        return false;
+    }
+    LOG_INFO("BackupEngine", "APK path count for " + packageName + ": " + std::to_string(apkPaths.size()));
+
+    stageIndex++;
+    emitProgress("Reading permissions", stageIndex, stageTotal);
+    LOG_INFO("BackupEngine", "Reading package permissions for " + packageName);
+    std::string dumpsys = runAdbCommand("-s " + serial + " shell dumpsys package " + packageName);
+    std::vector<std::string> grantedPerms;
+    for (auto& line : splitLines(dumpsys)) {
+        auto p = line.find("android.permission.");
+        if (p != std::string::npos && line.find("granted=true") != std::string::npos) {
+            std::string perm = line.substr(p);
+            auto colon = perm.find(':');
+            if (colon != std::string::npos) perm = perm.substr(0, colon);
+            auto sp = perm.find(' ');
+            if (sp != std::string::npos) perm = perm.substr(0, sp);
+            if (std::find(grantedPerms.begin(), grantedPerms.end(), perm) == grantedPerms.end())
+                grantedPerms.push_back(perm);
+        }
+    }
+
+    auto adbExecOutRootToFile = [&](const std::string& rootCmd, const std::filesystem::path& localFile, std::string& err,
+                                    ProgressCallback streamProgress = nullptr, uint64_t totalBytes = 0) {
+        std::string cmd = "\"" + m_adbPath + "\" -s " + serial + " exec-out su -c " + quoteCmdArg(rootCmd);
+        return runProcessToFile(cmd, pathToUtf8(localFile), err, 0, streamProgress, totalBytes);
+    };
+    auto rootTestDir = [&](const std::string& path) {
+        std::string out = runAdbCommand("-s " + serial + " shell \"su -c " + quoteCmdArg("test -d " + shellQuote(path) + " && echo yes") + "\"");
+        return out.find("yes") != std::string::npos;
+    };
+    auto remoteFileSize = [&](const std::string& path) -> uint64_t {
+        std::string out = runAdbCommand("-s " + serial + " shell \"su -c " + quoteCmdArg("stat -c %s " + shellQuote(path) + " 2>/dev/null") + "\"");
+        try {
+            return std::stoull(sanitizeAdbOutput(out));
+        } catch (...) {
+            return 0;
+        }
+    };
+    auto backupTar = [&](const std::string& key, const std::string& source, const char* filename, bool enabled, bool& hasFlag) -> bool {
+        hasFlag = false;
+        if (!enabled) {
+            LOG_INFO("BackupEngine", key + " disabled");
+            return true;
+        }
+        if (!rootTestDir(source)) {
+            LOG_INFO("BackupEngine", key + " skipped, missing path: " + source);
+            return true;
+        }
+        std::string excludes;
+        if (options.excludeCache) excludes = " --exclude=cache --exclude=code_cache --exclude=no_backup";
+        std::string cmd = "cd " + shellQuote(source) + " && tar -cpf -" + excludes + " .";
+        std::string err;
+        std::filesystem::path outPath = appDir / filename;
+        stageIndex++;
+        emitProgress(key, stageIndex, stageTotal);
+        LOG_INFO("BackupEngine", key + " tar start: " + source);
+        auto streamProgress = [&](uint64_t done, uint64_t total) {
+            return emitProgress(key, stageIndex, stageTotal, done, total);
+        };
+        bool archived = false;
+        if (m_connected) {
+            uint64_t outSize = 0;
+            archived = archiveRemoteDirectory(source, pathToUtf8(outPath), options.excludeCache, outSize, streamProgress);
+            if (!archived) err = m_lastError;
+        } else {
+            archived = adbExecOutRootToFile(cmd, outPath, err, streamProgress, 0);
+        }
+        if (!archived) {
+            output += key + " failed: " + sanitizeAdbOutput(err) + "\n";
+            LOG_ERROR("BackupEngine", key + " tar failed: " + sanitizeAdbOutput(err));
+            std::filesystem::remove(outPath, ec);
+            return false;
+        }
+        if (std::filesystem::file_size(outPath, ec) == 0) {
+            LOG_INFO("BackupEngine", key + " produced empty archive, removing: " + source);
+            std::filesystem::remove(outPath, ec);
+            return true;
+        }
+        hasFlag = true;
+        LOG_INFO("BackupEngine", key + " tar complete: " + pathToUtf8(outPath));
+        return true;
+    };
+
+    bool ok = true;
+    nlohmann::json apkList = nlohmann::json::array();
+    if (options.includeApk) {
+        stageIndex++;
+        for (const auto& apk : apkPaths) {
+            std::string name = apk.substr(apk.find_last_of('/') + 1);
+            if (name.empty()) name = "base.apk";
+            std::filesystem::path target = appDir / sanitizePathPart(name);
+            std::string err;
+            uint64_t apkSize = remoteFileSize(apk);
+            emitProgress("APK: " + name, stageIndex, stageTotal, 0, apkSize);
+            LOG_INFO("BackupEngine", "APK stream start: " + apk);
+            auto streamProgress = [&](uint64_t done, uint64_t total) {
+                return emitProgress("APK: " + name, stageIndex, stageTotal, done, total);
+            };
+            bool apkOk = false;
+            if (m_connected) {
+                uint64_t outSize = 0;
+                apkOk = pullFile(apk, pathToUtf8(target), outSize, streamProgress);
+                if (!apkOk) err = m_lastError;
+            } else {
+                apkOk = adbExecOutRootToFile("cat " + shellQuote(apk), target, err, streamProgress, apkSize);
+            }
+            if (apkOk) {
+                apkList.push_back({{"name", pathToUtf8(target.filename())}, {"source", apk}});
+                outRecord.hasApk = true;
+                LOG_INFO("BackupEngine", "APK stream complete: " + pathToUtf8(target));
+            } else {
+                ok = false;
+                output += "APK backup failed for " + apk + ": " + sanitizeAdbOutput(err) + "\n";
+                LOG_ERROR("BackupEngine", "APK stream failed: " + apk + ": " + sanitizeAdbOutput(err));
+            }
+        }
+    }
+
+    std::string dataPath = "/data/data/" + packageName;
+    std::string dePath = "/data/user_de/0/" + packageName;
+    std::string extPath = "/sdcard/Android/data/" + packageName;
+    std::string obbPath = "/sdcard/Android/obb/" + packageName;
+    std::string mediaPath = "/sdcard/Android/media/" + packageName;
+
+    ok = backupTar("App data", dataPath, "data.tar", options.includeData, outRecord.hasData) && ok;
+    ok = backupTar("Device protected data", dePath, "data_de.tar", options.includeDeviceProtectedData, outRecord.hasDeviceProtectedData) && ok;
+    ok = backupTar("External data", extPath, "external.tar", options.includeExternalData, outRecord.hasExternalData) && ok;
+    ok = backupTar("OBB data", obbPath, "obb.tar", options.includeObb, outRecord.hasObb) && ok;
+    ok = backupTar("Media data", mediaPath, "media.tar", options.includeMedia, outRecord.hasMedia) && ok;
+
+    outRecord.packageName = packageName;
+    outRecord.serial = serial;
+    outRecord.backupPath = pathToUtf8(appDir);
+    outRecord.created = stamp;
+    outRecord.sizeBytes = directorySizeBytes(appDir);
+
+    nlohmann::json meta;
+    meta["format"] = "FastEnoughAppBackup";
+    meta["formatVersion"] = 1;
+    meta["packageName"] = packageName;
+    meta["serial"] = serial;
+    meta["created"] = stamp;
+    meta["apkFiles"] = apkList;
+    meta["permissions"] = grantedPerms;
+    meta["paths"] = {
+        {"data", dataPath},
+        {"data_de", dePath},
+        {"external", extPath},
+        {"obb", obbPath},
+        {"media", mediaPath}
+    };
+    meta["has"] = {
+        {"apk", outRecord.hasApk},
+        {"data", outRecord.hasData},
+        {"data_de", outRecord.hasDeviceProtectedData},
+        {"external", outRecord.hasExternalData},
+        {"obb", outRecord.hasObb},
+        {"media", outRecord.hasMedia}
+    };
+    meta["source"] = "Root APK plus tar archive backup";
+    stageIndex++;
+    emitProgress("Writing metadata", stageIndex, stageTotal);
+    LOG_INFO("BackupEngine", "Writing backup metadata for " + packageName);
+    std::ofstream mf(appDir / "backup.json", std::ios::binary);
+    mf << meta.dump(2);
+
+    if (!ok) {
+        LOG_ERROR("BackupEngine", "backupApp finished with errors for " + packageName + ": " + sanitizeAdbOutput(output));
+        return false;
+    }
+    output = "Backup saved to " + outRecord.backupPath;
+    emitProgress("Complete", stageTotal, stageTotal);
+    LOG_INFO("BackupEngine", "backupApp complete package=" + packageName + " size=" + std::to_string(outRecord.sizeBytes));
+    return true;
+}
+
+bool DeviceClient::restoreAppBackup(const std::string& serial, const std::string& backupPath, const AppBackupOptions& options,
+                                    std::string& output, BackupProgressCallback progress) {
+    output.clear();
+    if (serial.empty() || backupPath.empty()) {
+        output = "No device or backup was provided.";
+        return false;
+    }
+    if (!isRootAvailable(serial)) {
+        output = "Root access is required for app data restore.";
+        return false;
+    }
+
+    std::filesystem::path dir = toFsPath(backupPath);
+    std::ifstream mf(dir / "backup.json", std::ios::binary);
+    if (!mf) {
+        output = "Backup metadata is missing.";
+        return false;
+    }
+    nlohmann::json meta = nlohmann::json::parse(mf, nullptr, false);
+    if (meta.is_discarded()) {
+        output = "Backup metadata is not valid JSON.";
+        return false;
+    }
+    std::string packageName = meta.value("packageName", "");
+    if (packageName.empty()) {
+        output = "Backup metadata has no package name.";
+        return false;
+    }
+
+    auto paths = meta["paths"];
+    auto has = meta["has"];
+    int stageTotal = 0;
+    if (options.includeApk && has.value("apk", false)) stageTotal++;
+    if (options.includeData && has.value("data", false)) stageTotal++;
+    if (options.includeDeviceProtectedData && has.value("data_de", false)) stageTotal++;
+    if (options.includeExternalData && has.value("external", false)) stageTotal++;
+    if (options.includeObb && has.value("obb", false)) stageTotal++;
+    if (options.includeMedia && has.value("media", false)) stageTotal++;
+    if (options.grantRuntimePermissions && meta.contains("permissions")) stageTotal++;
+    if (stageTotal <= 0) stageTotal = 1;
+    int stageIndex = 0;
+    auto emitProgress = [&](const std::string& label, int stage, uint64_t done = 0, uint64_t total = 0) {
+        if (!progress) return true;
+        AppBackupProgress p;
+        p.packageName = packageName;
+        p.stageLabel = label;
+        p.stageIndex = stage;
+        p.stageCount = stageTotal;
+        p.bytesTransferred = done;
+        p.bytesTotal = total;
+        return progress(p);
+    };
+
+    if (options.includeApk && meta["has"].value("apk", false)) {
+        stageIndex++;
+        emitProgress("Installing APK", stageIndex);
+        std::string args = "-s " + serial + " install";
+        if (options.reinstall) args += " -r";
+        if (options.grantRuntimePermissions) args += " -g";
+        if (options.allowDowngrade) args += " -d";
+        auto apkFiles = meta.value("apkFiles", nlohmann::json::array());
+        if (apkFiles.size() > 1) args = "-s " + serial + " install-multiple" + (options.reinstall ? " -r" : "") +
+            (options.grantRuntimePermissions ? " -g" : "") + (options.allowDowngrade ? " -d" : "");
+        for (auto& apk : apkFiles) {
+            std::filesystem::path p = dir / apk.value("name", "");
+            args += " " + quoteCmdArg(pathToUtf8(p));
+        }
+        std::string installOut = runAdbCommand(args);
+        output += installOut + "\n";
+        if (!isAdbSuccess(installOut)) return false;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    auto rootPathExists = [&](const std::string& path) {
+        std::string out = runAdbCommand("-s " + serial + " shell su -c " + quoteCmdArg("test -d " + path + " && echo yes"));
+        return out.find("yes") != std::string::npos;
+    };
+    auto ownerContext = [&](const std::string& path) {
+        std::string out = runAdbCommand("-s " + serial + " shell su -c " + quoteCmdArg("stat -c '%u:%g %C' " + path + " 2>/dev/null"));
+        return sanitizeAdbOutput(out);
+    };
+    auto restoreTar = [&](const char* label, const char* filename, const std::string& target, bool enabled, bool present) -> bool {
+        if (!enabled || !present) return true;
+        stageIndex++;
+        std::filesystem::path archive = dir / filename;
+        if (!std::filesystem::exists(archive)) {
+            output += std::string(label) + " archive is missing.\n";
+            return false;
+        }
+        std::error_code archiveEc;
+        uint64_t archiveSize = std::filesystem::file_size(archive, archiveEc);
+        if (archiveEc) archiveSize = 0;
+        emitProgress(std::string(label) + ": pushing archive", stageIndex, 0, archiveSize);
+        std::string uidgidcon;
+        bool existed = rootPathExists(target);
+        if (existed) uidgidcon = ownerContext(target);
+        std::string remote = "/data/local/tmp/afm-" + sanitizePathPart(packageName) + "-" + filename;
+        if (m_connected) {
+            auto transferProgress = [&](uint64_t done, uint64_t total) {
+                return emitProgress(std::string(label) + ": pushing archive", stageIndex, done, total);
+            };
+            if (!extractRemoteArchive(pathToUtf8(archive), target, transferProgress)) {
+                output += std::string(label) + " extract failed: " + m_lastError + "\n";
+                return false;
+            }
+            emitProgress(std::string(label) + ": extracting archive", stageIndex, archiveSize, archiveSize);
+        } else {
+            std::string pushOut = runAdbCommand("-s " + serial + " push " + quoteCmdArg(pathToUtf8(archive)) + " " + remote);
+            output += pushOut + "\n";
+            if (pushOut.find("error") != std::string::npos || pushOut.find("failed") != std::string::npos) return false;
+            std::string cmd =
+                "mkdir -p " + target +
+                " && rm -rf " + target + "/*" +
+                " && tar -xpf " + remote + " -C " + target +
+                " && rm -f " + remote;
+            std::string out = runAdbCommand("-s " + serial + " shell su -c " + quoteCmdArg(cmd));
+            output += out + "\n";
+            std::string low = out;
+            std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+            if (low.find("error") != std::string::npos || low.find("failed") != std::string::npos || low.find("cannot") != std::string::npos) return false;
+        }
+        if (!uidgidcon.empty()) {
+            std::istringstream iss(uidgidcon);
+            std::string owner, context;
+            iss >> owner >> context;
+            if (!owner.empty()) {
+                std::string fix = "chown -R " + owner + " " + target + " ; restorecon -RF " + target + " 2>/dev/null";
+                if (!context.empty() && context != "?") fix += " ; chcon -R -h " + context + " " + target + " 2>/dev/null";
+                output += runAdbCommand("-s " + serial + " shell su -c " + quoteCmdArg(fix)) + "\n";
+            }
+        }
+        emitProgress(std::string(label) + ": restored", stageIndex, archiveSize, archiveSize);
+        return true;
+    };
+    bool ok = true;
+    ok = restoreTar("App data", "data.tar", paths.value("data", "/data/data/" + packageName), options.includeData, has.value("data", false)) && ok;
+    ok = restoreTar("Device protected data", "data_de.tar", paths.value("data_de", "/data/user_de/0/" + packageName), options.includeDeviceProtectedData, has.value("data_de", false)) && ok;
+    ok = restoreTar("External data", "external.tar", paths.value("external", "/sdcard/Android/data/" + packageName), options.includeExternalData, has.value("external", false)) && ok;
+    ok = restoreTar("OBB data", "obb.tar", paths.value("obb", "/sdcard/Android/obb/" + packageName), options.includeObb, has.value("obb", false)) && ok;
+    ok = restoreTar("Media data", "media.tar", paths.value("media", "/sdcard/Android/media/" + packageName), options.includeMedia, has.value("media", false)) && ok;
+
+    if (options.grantRuntimePermissions && meta.contains("permissions")) {
+        stageIndex++;
+        emitProgress("Restoring permissions", stageIndex);
+        for (auto& p : meta["permissions"]) {
+            if (!p.is_string()) continue;
+            runAdbCommand("-s " + serial + " shell su -c " + quoteCmdArg("pm grant --user 0 " + packageName + " " + p.get<std::string>() + " 2>/dev/null"));
+        }
+    }
+
+    if (ok) output += "Restore complete.";
+    emitProgress("Complete", stageTotal, 0, 0);
+    return ok;
 }
 
 bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward, bool useRoot) {
@@ -1416,7 +2047,13 @@ bool DeviceClient::pullFile(const std::string& remotePath, const std::string& lo
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     }
     if (hFile == INVALID_HANDLE_VALUE) {
-        m_lastError = "Failed to create local file: " + localPath;
+        m_lastError = "Failed to create local file: " + localPath + " (" + lastWin32ErrorText() + ")";
+        while (recvAll(&hdr, sizeof(hdr))) {
+            if (hdr.cmd == RSP_DONE) break;
+            if (hdr.cmd != RSP_DATA || hdr.length == 0) break;
+            if (m_transferBuf.size() < hdr.length) m_transferBuf.resize(hdr.length);
+            if (!recvAll(m_transferBuf.data(), hdr.length)) break;
+        }
         return false;
     }
 
@@ -1493,6 +2130,122 @@ bool DeviceClient::pullFile(const std::string& remotePath, const std::string& lo
         LOG_ERROR("Transfer", "pullFile FAILED: " + m_lastError);
     }
     return success;
+}
+
+bool DeviceClient::archiveRemoteDirectory(const std::string& remotePath, const std::string& localTarPath, bool excludeCache,
+                                          uint64_t& outFileSize, ProgressCallback progress) {
+    if (!m_connected) { m_lastError = "Not connected"; return false; }
+    LOG_INFO("BackupServer", "Archive START: " + remotePath + " -> " + localTarPath);
+    std::lock_guard<std::mutex> lk(m_mutex);
+
+    SOCKET sock = (SOCKET)m_socket;
+    DWORD longTimeout = 300000;
+    DWORD origTimeout = 10000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&longTimeout, sizeof(longTimeout));
+
+    uint32_t exclude = excludeCache ? 1u : 0u;
+    std::vector<char> request(4 + remotePath.size());
+    memcpy(request.data(), &exclude, 4);
+    memcpy(request.data() + 4, remotePath.data(), remotePath.size());
+    if (!sendMsg(CMD_ARCHIVE_PATH, request.data(), (uint32_t)request.size())) {
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+        return false;
+    }
+
+    MsgHeader hdr; std::vector<char> payload;
+    if (!recvMsg(hdr, payload)) {
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+        return false;
+    }
+    if (hdr.cmd == RSP_ERROR) {
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+        m_lastError = std::string(payload.data(), payload.size());
+        return false;
+    }
+    if (hdr.cmd != RSP_OK || payload.size() < sizeof(PullHeader)) {
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+        m_lastError = "Invalid archive response";
+        return false;
+    }
+
+    PullHeader ph;
+    memcpy(&ph, payload.data(), sizeof(ph));
+    outFileSize = ph.file_size;
+
+    try { std::filesystem::create_directories(toFsPath(localTarPath).parent_path()); } catch (...) {}
+    HANDLE hFile = CreateFileW(toWide(localTarPath).c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        m_lastError = "Failed to create local archive: " + localTarPath;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+        return false;
+    }
+
+    uint64_t received = 0;
+    bool success = true;
+    std::vector<char> buf(AFM_CHUNK_SIZE);
+    while (true) {
+        if (!recvAll(&hdr, sizeof(hdr))) { success = false; break; }
+        if (hdr.cmd == RSP_DONE) break;
+        if (hdr.cmd != RSP_DATA || hdr.length == 0 || hdr.length > AFM_CHUNK_SIZE) { success = false; break; }
+        if (!recvAll(buf.data(), hdr.length)) { success = false; break; }
+        DWORD written = 0;
+        if (!WriteFile(hFile, buf.data(), hdr.length, &written, nullptr) || written != hdr.length) {
+            m_lastError = "Failed to write local archive";
+            success = false;
+            break;
+        }
+        received += hdr.length;
+        if (progress && !progress(received, outFileSize)) {
+            m_lastError = "Cancelled";
+            success = false;
+            break;
+        }
+    }
+    CloseHandle(hFile);
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+
+    if (success) LOG_INFO("BackupServer", "Archive OK: " + std::to_string(received) + " bytes");
+    else LOG_ERROR("BackupServer", "Archive FAILED: " + m_lastError);
+    return success;
+}
+
+bool DeviceClient::extractRemoteArchive(const std::string& localTarPath, const std::string& remoteTarget,
+                                        ProgressCallback progress) {
+    if (!m_connected) { m_lastError = "Not connected"; return false; }
+    std::filesystem::path localPath = toFsPath(localTarPath);
+    std::error_code ec;
+    uint64_t size = std::filesystem::file_size(localPath, ec);
+    if (ec) {
+        m_lastError = "Could not read local archive size";
+        return false;
+    }
+    std::string remoteArchive = "/data/local/tmp/afm-restore-" + sanitizePathPart(remoteTarget) + ".tar";
+    if (!pushFile(localTarPath, remoteArchive, size, progress)) return false;
+
+    std::lock_guard<std::mutex> lk(m_mutex);
+    uint32_t targetLen = (uint32_t)remoteTarget.size();
+    uint32_t archiveLen = (uint32_t)remoteArchive.size();
+    std::vector<char> payload(8 + targetLen + archiveLen);
+    memcpy(payload.data(), &targetLen, 4);
+    memcpy(payload.data() + 4, &archiveLen, 4);
+    memcpy(payload.data() + 8, remoteTarget.data(), targetLen);
+    memcpy(payload.data() + 8 + targetLen, remoteArchive.data(), archiveLen);
+
+    SOCKET sock = (SOCKET)m_socket;
+    DWORD longTimeout = 300000;
+    DWORD origTimeout = 10000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&longTimeout, sizeof(longTimeout));
+    bool sent = sendMsg(CMD_EXTRACT_ARCHIVE, payload.data(), (uint32_t)payload.size());
+    MsgHeader hdr; std::vector<char> resp;
+    bool got = sent && recvMsg(hdr, resp);
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&origTimeout, sizeof(origTimeout));
+    if (!got) return false;
+    if (hdr.cmd == RSP_ERROR) {
+        m_lastError = std::string(resp.data(), resp.size());
+        return false;
+    }
+    return hdr.cmd == RSP_OK;
 }
 
 bool DeviceClient::pushFile(const std::string& localPath, const std::string& remotePath,

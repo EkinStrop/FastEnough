@@ -16,6 +16,8 @@
 #include <ctime>
 #include <iomanip>
 #include <cctype>
+#include <cfloat>
+#include <cstdio>
 #include <cmath>
 #include <fstream>
 #include <set>
@@ -26,6 +28,7 @@
 #include <ole2.h>
 #include <shlobj.h>
 #include <shlwapi.h>
+#include <nlohmann/json.hpp>
 #include <iphlpapi.h>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -142,6 +145,26 @@ static bool computeCompareLocalSha256(const std::string& path, std::string& outS
     CryptDestroyHash(hash);
     CryptReleaseContext(prov, 0);
     return true;
+}
+
+static uint64_t directorySizeBytes(const std::filesystem::path& dir) {
+    uint64_t total = 0;
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(dir, std::filesystem::directory_options::skip_permission_denied, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (it->is_regular_file(ec)) total += it->file_size(ec);
+    }
+    return total;
+}
+
+static std::string backupJobStamp() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    std::ostringstream ss;
+    ss << std::put_time(&tm, "%Y%m%d-%H%M%S");
+    return ss.str();
 }
 
 static std::vector<DetectedNic> enumerateNics() {
@@ -1158,7 +1181,25 @@ void App::asyncWorkerLoop() {
             m_asyncQueue.pop_front();
         }
         m_asyncBusy = true;
-        action();
+        try {
+            action();
+        } catch (const std::exception& e) {
+            LOG_ERROR("Async", std::string("Background task failed: ") + e.what());
+            UiMessage message;
+            message.hasNotification = true;
+            message.notificationTitle = "Operation Failed";
+            message.notificationMessage = e.what();
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        } catch (...) {
+            LOG_ERROR("Async", "Background task failed with an unknown exception");
+            UiMessage message;
+            message.hasNotification = true;
+            message.notificationTitle = "Operation Failed";
+            message.notificationMessage = "Unexpected background task failure.";
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        }
         m_asyncBusy = false;
         m_asyncStatus.clear();
     }
@@ -1171,6 +1212,53 @@ void App::postAsync(const std::string& statusMsg, std::function<void()> action) 
         m_asyncQueue.push_back(std::move(action));
     }
     m_asyncCV.notify_one();
+}
+
+void App::postUiMessage(UiMessage message) {
+    std::lock_guard<std::mutex> lk(m_uiMessageMutex);
+    m_uiMessages.push_back(std::move(message));
+}
+
+void App::drainUiMessages() {
+    std::deque<UiMessage> messages;
+    {
+        std::lock_guard<std::mutex> lk(m_uiMessageMutex);
+        messages.swap(m_uiMessages);
+    }
+
+    for (auto& message : messages) {
+        if (message.setBackupApps) {
+            m_backupManagerApps = std::move(message.backupApps);
+        }
+        if (message.markBackupAppsFresh) {
+            m_backupManagerNeedsAppRefresh = false;
+        }
+        if (message.refreshBackupList) {
+            m_backupManagerNeedsBackupRefresh = true;
+        }
+        if (message.refreshAppList) {
+            m_backupManagerNeedsAppRefresh = true;
+        }
+        if (message.hasBackupProgress) {
+            m_backupProgressActive = message.backupProgressActive;
+            m_backupProgressIsRestore = message.backupProgressIsRestore;
+            m_backupProgressCurrent = message.backupProgressCurrent;
+            m_backupProgressTotal = message.backupProgressTotal;
+            m_backupProgressStage = message.backupProgressStage;
+            m_backupProgressStageTotal = message.backupProgressStageTotal;
+            m_backupProgressBytes = message.backupProgressBytes;
+            m_backupProgressTotalBytes = message.backupProgressTotalBytes;
+            m_backupProgressPackage = std::move(message.backupProgressPackage);
+            m_backupProgressStageLabel = std::move(message.backupProgressStageLabel);
+        }
+        if (message.hasStatus) {
+            m_statusMessage = std::move(message.status);
+            m_statusTime = std::chrono::steady_clock::now();
+        }
+        if (message.hasNotification) {
+            showNotification(message.notificationTitle, message.notificationMessage, message.notificationIsError);
+        }
+    }
 }
 
 bool App::selectDeviceBySerial(const std::string& serial, const std::vector<DeviceInfo>* refreshedDevices) {
@@ -1312,6 +1400,7 @@ void App::setupStyle() {
 
 void App::render() {
     ImGuiIO& io = ImGui::GetIO();
+    drainUiMessages();
 
     // Reset drag state when mouse button released
     if (m_isDragging && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
@@ -1437,6 +1526,10 @@ void App::render() {
         }
     }
 
+    if (m_showBackupManager && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A) && !anyModalOpen && !ImGui::IsAnyItemActive()) {
+        setBackupManagerAppSelection(true, true);
+    }
+
     // Escape — cancel confirm dialogs
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         if (m_confirmStopTransfer) m_confirmStopTransfer = false;
@@ -1554,46 +1647,51 @@ void App::render() {
 
     renderDeviceBar();
     renderWifiBanner();
-    renderCompareToolbar();
 
-    float availW = ImGui::GetContentRegionAvail().x;
-    float availH = ImGui::GetContentRegionAvail().y;
-    float statusBarH = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2.0f;
-    float panelHeight = availH - statusBarH - ImGui::GetStyle().ItemSpacing.y;
-    float panelWidth = (availW - 12.0f) * 0.5f;
+    if (m_showBackupManager) {
+        renderBackupManagerWindow();
+    } else {
+        renderCompareToolbar();
 
-    // Left panel
-    ImGui::BeginChild("##LeftPanel", ImVec2(panelWidth, panelHeight), ImGuiChildFlags_Borders);
-    m_leftPanelMin = ImGui::GetWindowPos();
-    m_leftPanelMax = ImVec2(m_leftPanelMin.x + ImGui::GetWindowSize().x, m_leftPanelMin.y + ImGui::GetWindowSize().y);
-    renderPanel(m_leftPanel, PanelSide::Left);
-    // Drop target — accept drops from the other panel
-    if (ImGui::BeginDragDropTarget()) {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_DRAG")) {
-            startTransferFromDrag(m_rightPanel, m_leftPanel);
+        float availW = ImGui::GetContentRegionAvail().x;
+        float availH = ImGui::GetContentRegionAvail().y;
+        float statusBarH = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2.0f;
+        float panelHeight = availH - statusBarH - ImGui::GetStyle().ItemSpacing.y;
+        float panelWidth = (availW - 12.0f) * 0.5f;
+
+        // Left panel
+        ImGui::BeginChild("##LeftPanel", ImVec2(panelWidth, panelHeight), ImGuiChildFlags_Borders);
+        m_leftPanelMin = ImGui::GetWindowPos();
+        m_leftPanelMax = ImVec2(m_leftPanelMin.x + ImGui::GetWindowSize().x, m_leftPanelMin.y + ImGui::GetWindowSize().y);
+        renderPanel(m_leftPanel, PanelSide::Left);
+        // Drop target — accept drops from the other panel
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_DRAG")) {
+                startTransferFromDrag(m_rightPanel, m_leftPanel);
+            }
+            ImGui::EndDragDropTarget();
         }
-        ImGui::EndDragDropTarget();
-    }
-    ImGui::EndChild();
+        ImGui::EndChild();
 
-    ImGui::SameLine(0, 4.0f);
-    ImGui::BeginChild("##CenterDiv", ImVec2(4.0f, panelHeight)); ImGui::EndChild();
-    ImGui::SameLine(0, 4.0f);
+        ImGui::SameLine(0, 4.0f);
+        ImGui::BeginChild("##CenterDiv", ImVec2(4.0f, panelHeight)); ImGui::EndChild();
+        ImGui::SameLine(0, 4.0f);
 
-    // Right panel
-    ImGui::BeginChild("##RightPanel", ImVec2(panelWidth, panelHeight), ImGuiChildFlags_Borders);
-    m_rightPanelMin = ImGui::GetWindowPos();
-    m_rightPanelMax = ImVec2(m_rightPanelMin.x + ImGui::GetWindowSize().x, m_rightPanelMin.y + ImGui::GetWindowSize().y);
-    renderPanel(m_rightPanel, PanelSide::Right);
-    if (ImGui::BeginDragDropTarget()) {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_DRAG")) {
-            startTransferFromDrag(m_leftPanel, m_rightPanel);
+        // Right panel
+        ImGui::BeginChild("##RightPanel", ImVec2(panelWidth, panelHeight), ImGuiChildFlags_Borders);
+        m_rightPanelMin = ImGui::GetWindowPos();
+        m_rightPanelMax = ImVec2(m_rightPanelMin.x + ImGui::GetWindowSize().x, m_rightPanelMin.y + ImGui::GetWindowSize().y);
+        renderPanel(m_rightPanel, PanelSide::Right);
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_DRAG")) {
+                startTransferFromDrag(m_leftPanel, m_rightPanel);
+            }
+            ImGui::EndDragDropTarget();
         }
-        ImGui::EndDragDropTarget();
+        ImGui::EndChild();
     }
-    ImGui::EndChild();
 
-    renderStatusBar();
+    if (!m_showBackupManager) renderStatusBar();
 
     ImGui::PopStyleVar();
     ImGui::End();
@@ -1907,6 +2005,11 @@ void App::renderMenuBar() {
             }
             ImGui::MenuItem("Debug Log", "F12", &m_showDebugWindow);
             ImGui::EndMenu();
+        }
+        if (ImGui::MenuItem("Backup Manager")) {
+            m_showBackupManager = true;
+            m_backupManagerNeedsAppRefresh = true;
+            m_backupManagerNeedsBackupRefresh = true;
         }
         if (ImGui::BeginMenu("Transfer")) {
             if (ImGui::MenuItem("Copy to Android  >>", "F6")) startTransfer(false);
@@ -4552,6 +4655,923 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
     }
 }
 
+std::string App::getBackupsRootPath() const {
+    char exePath[MAX_PATH];
+    DWORD len = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::filesystem::path dir = (len > 0 && len < MAX_PATH)
+        ? std::filesystem::path(exePath).parent_path()
+        : std::filesystem::current_path();
+    return pathToUtf8(dir / "Backups");
+}
+
+void App::refreshBackupManagerApps() {
+    int slot = m_backupManagerSlot & 1;
+    if (!m_slotConnected[slot] || m_slotSerial[slot].empty()) {
+        m_backupManagerApps.clear();
+        m_backupManagerNeedsAppRefresh = false;
+        return;
+    }
+    std::string serial = m_slotSerial[slot];
+    postAsync("Loading backup app list...", [this, slot, serial]() {
+        std::vector<InstalledAppEntry> apps = deviceForSlot(slot).listInstalledApps(serial, true);
+        std::vector<BackupManagerAppRow> rows;
+        rows.reserve(apps.size());
+        for (auto& app : apps) rows.push_back({ app, false });
+        UiMessage message;
+        message.setBackupApps = true;
+        message.backupApps = std::move(rows);
+        message.markBackupAppsFresh = true;
+        postUiMessage(std::move(message));
+    });
+}
+
+void App::refreshBackupManagerBackups() {
+    std::vector<BackupManagerBackupRow> rows;
+    std::filesystem::path root = toFsPath(getBackupsRootPath());
+    std::error_code ec;
+    std::filesystem::path jobsRoot = root / "Jobs";
+    if (std::filesystem::exists(jobsRoot, ec)) {
+        for (auto jobIt = std::filesystem::directory_iterator(jobsRoot, ec);
+             !ec && jobIt != std::filesystem::directory_iterator(); jobIt.increment(ec)) {
+            if (!jobIt->is_directory(ec)) continue;
+            std::ifstream jf(jobIt->path() / "job.json", std::ios::binary);
+            if (!jf) continue;
+            nlohmann::json meta = nlohmann::json::parse(jf, nullptr, false);
+            if (meta.is_discarded()) continue;
+            BackupManagerBackupRow row;
+            row.isJob = true;
+            row.record.packageName = meta.value("name", "Backup job");
+            row.record.serial = meta.value("serial", "");
+            row.record.created = meta.value("created", pathToUtf8(jobIt->path().filename()));
+            row.record.backupPath = pathToUtf8(jobIt->path());
+            row.appCount = meta.value("appCount", 0);
+            row.record.sizeBytes = directorySizeBytes(jobIt->path());
+            row.contentsSummary = std::to_string(row.appCount) + " app";
+            if (row.appCount != 1) row.contentsSummary += "s";
+            if (meta.contains("contents") && meta["contents"].is_array()) {
+                std::string parts;
+                for (auto& item : meta["contents"]) {
+                    std::string s = item.get<std::string>();
+                    if (s.empty()) continue;
+                    if (!parts.empty()) parts += " ";
+                    parts += s;
+                }
+                if (!parts.empty()) row.contentsSummary += "  " + parts;
+            }
+            rows.push_back(std::move(row));
+        }
+    }
+
+    if (std::filesystem::exists(root, ec)) {
+        for (auto pkgIt = std::filesystem::directory_iterator(root, ec);
+             !ec && pkgIt != std::filesystem::directory_iterator(); pkgIt.increment(ec)) {
+            if (!pkgIt->is_directory(ec)) continue;
+            if (_stricmp(pathToUtf8(pkgIt->path().filename()).c_str(), "Jobs") == 0) continue;
+            for (auto bakIt = std::filesystem::directory_iterator(pkgIt->path(), ec);
+                 !ec && bakIt != std::filesystem::directory_iterator(); bakIt.increment(ec)) {
+                if (!bakIt->is_directory(ec)) continue;
+                std::ifstream mf(bakIt->path() / "backup.json", std::ios::binary);
+                if (!mf) continue;
+                nlohmann::json meta = nlohmann::json::parse(mf, nullptr, false);
+                if (meta.is_discarded()) continue;
+                AppBackupRecord rec;
+                rec.packageName = meta.value("packageName", "");
+                rec.serial = meta.value("serial", "");
+                rec.created = meta.value("created", "");
+                rec.backupPath = pathToUtf8(bakIt->path());
+                if (meta.contains("has")) {
+                    rec.hasApk = meta["has"].value("apk", false);
+                    rec.hasData = meta["has"].value("data", false);
+                    rec.hasDeviceProtectedData = meta["has"].value("data_de", false);
+                    rec.hasExternalData = meta["has"].value("external", false);
+                    rec.hasObb = meta["has"].value("obb", false);
+                    rec.hasMedia = meta["has"].value("media", false);
+                }
+                rec.sizeBytes = directorySizeBytes(bakIt->path());
+                if (!rec.packageName.empty()) {
+                    BackupManagerBackupRow row;
+                    row.record = rec;
+                    row.contentsSummary = "";
+                    if (rec.hasApk) row.contentsSummary += "APK ";
+                    if (rec.hasData) row.contentsSummary += "Data ";
+                    if (rec.hasDeviceProtectedData) row.contentsSummary += "DE ";
+                    if (rec.hasExternalData) row.contentsSummary += "Ext ";
+                    if (rec.hasObb) row.contentsSummary += "OBB ";
+                    if (rec.hasMedia) row.contentsSummary += "Media ";
+                    rows.push_back(std::move(row));
+                }
+            }
+        }
+    }
+    std::sort(rows.begin(), rows.end(), [](const BackupManagerBackupRow& a, const BackupManagerBackupRow& b) {
+        if (a.record.created != b.record.created) return a.record.created > b.record.created;
+        return _stricmp(a.record.packageName.c_str(), b.record.packageName.c_str()) < 0;
+    });
+    m_backupManagerBackups = std::move(rows);
+    m_backupManagerNeedsBackupRefresh = false;
+}
+
+bool App::backupManagerAppVisible(const BackupManagerAppRow& row) const {
+    if (row.app.isSystem && !m_backupShowSystemApps) return false;
+    std::string filter(m_backupManagerSearch);
+    std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+    if (filter.empty()) return true;
+    std::string hay = row.app.packageName + " " + row.app.apkPath;
+    std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+    return hay.find(filter) != std::string::npos;
+}
+
+void App::setBackupManagerAppSelection(bool selected, bool visibleOnly) {
+    for (auto& row : m_backupManagerApps) {
+        if (!visibleOnly || backupManagerAppVisible(row))
+            row.selected = selected;
+    }
+}
+
+void App::invertBackupManagerAppSelection(bool visibleOnly) {
+    for (auto& row : m_backupManagerApps) {
+        if (!visibleOnly || backupManagerAppVisible(row))
+            row.selected = !row.selected;
+    }
+}
+
+void App::openBackupManagerJob(const BackupManagerBackupRow& row) {
+    m_backupManagerJobApps.clear();
+    m_backupManagerJobOpen = true;
+    m_backupManagerOpenJobPath = row.record.backupPath;
+    m_backupManagerOpenJobTitle = row.record.packageName;
+
+    std::filesystem::path appsRoot = toFsPath(row.record.backupPath);
+    if (row.isJob) appsRoot /= "Apps";
+    std::error_code ec;
+    for (auto pkgIt = std::filesystem::directory_iterator(appsRoot, ec);
+         !ec && pkgIt != std::filesystem::directory_iterator(); pkgIt.increment(ec)) {
+        if (!pkgIt->is_directory(ec)) continue;
+        for (auto bakIt = std::filesystem::directory_iterator(pkgIt->path(), ec);
+             !ec && bakIt != std::filesystem::directory_iterator(); bakIt.increment(ec)) {
+            if (!bakIt->is_directory(ec)) continue;
+            std::ifstream mf(bakIt->path() / "backup.json", std::ios::binary);
+            if (!mf) continue;
+            nlohmann::json meta = nlohmann::json::parse(mf, nullptr, false);
+            if (meta.is_discarded()) continue;
+            AppBackupRecord rec;
+            rec.packageName = meta.value("packageName", "");
+            rec.serial = meta.value("serial", "");
+            rec.created = meta.value("created", "");
+            rec.backupPath = pathToUtf8(bakIt->path());
+            if (meta.contains("has")) {
+                rec.hasApk = meta["has"].value("apk", false);
+                rec.hasData = meta["has"].value("data", false);
+                rec.hasDeviceProtectedData = meta["has"].value("data_de", false);
+                rec.hasExternalData = meta["has"].value("external", false);
+                rec.hasObb = meta["has"].value("obb", false);
+                rec.hasMedia = meta["has"].value("media", false);
+            }
+            rec.sizeBytes = directorySizeBytes(bakIt->path());
+            if (!rec.packageName.empty()) m_backupManagerJobApps.push_back({ rec, false });
+        }
+    }
+    std::sort(m_backupManagerJobApps.begin(), m_backupManagerJobApps.end(), [](const BackupManagerJobAppRow& a, const BackupManagerJobAppRow& b) {
+        return _stricmp(a.record.packageName.c_str(), b.record.packageName.c_str()) < 0;
+    });
+
+    if (!row.isJob && m_backupManagerJobApps.empty()) {
+        m_backupManagerJobApps.push_back({ row.record, false });
+    }
+}
+
+void App::closeBackupManagerJob() {
+    m_backupManagerJobOpen = false;
+    m_backupManagerOpenJobPath.clear();
+    m_backupManagerOpenJobTitle.clear();
+    m_backupManagerJobApps.clear();
+}
+
+void App::startBackupManagerBackup() {
+    int slot = m_backupManagerSlot & 1;
+    std::vector<std::string> packages;
+    for (const auto& row : m_backupManagerApps)
+        if (row.selected) packages.push_back(row.app.packageName);
+    if (packages.empty()) return;
+    LOG_INFO("BackupManager", "Backup requested for " + std::to_string(packages.size()) + " package(s)");
+    std::string prompt = "Back up " + std::to_string(packages.size()) + " selected app(s) to the PC?";
+    if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Backup", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+
+    std::string serial = m_slotSerial[slot];
+    std::string adbPath = deviceForSlot(slot).getAdbPath();
+    AppBackupOptions options;
+    options.includeApk = m_backupIncludeApk;
+    options.includeData = m_backupIncludeData;
+    options.includeDeviceProtectedData = m_backupIncludeDeData;
+    options.includeExternalData = m_backupIncludeExternalData;
+    options.includeObb = m_backupIncludeObb;
+    options.includeMedia = m_backupIncludeMedia;
+    options.excludeCache = m_backupExcludeCache;
+    std::string created = backupJobStamp();
+    std::filesystem::path jobDir = toFsPath(getBackupsRootPath()) / "Jobs" / created;
+    std::filesystem::path appsDir = jobDir / "Apps";
+    std::error_code ec;
+    std::filesystem::create_directories(appsDir, ec);
+    std::string root = pathToUtf8(appsDir);
+    LOG_INFO("BackupManager", "Backup confirmed. serial=" + serial + " job=" + pathToUtf8(jobDir));
+    m_backupProgressActive = true;
+    m_backupProgressCurrent = 0;
+    m_backupProgressTotal = (int)packages.size();
+    m_backupProgressStage = 0;
+    m_backupProgressStageTotal = 1;
+    m_backupProgressBytes = 0;
+    m_backupProgressTotalBytes = 0;
+    m_backupProgressPackage.clear();
+    m_backupProgressStageLabel = "Starting backup";
+
+    postAsync("Backing up apps...", [this, slot, serial, adbPath, packages, root, created, jobPath = pathToUtf8(jobDir), options]() {
+        int ok = 0;
+        std::string details;
+        std::vector<std::string> successfulPackages;
+        try {
+            if (serial.empty()) {
+                LOG_ERROR("BackupManager", "Backup aborted. Selected device serial was empty.");
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = false;
+                message.hasNotification = true;
+                message.notificationTitle = "Backup Failed";
+                message.notificationMessage = "The selected device is no longer connected.";
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+            DeviceClient backupClient;
+            if (!adbPath.empty()) backupClient.setAdbPath(adbPath);
+            if (backupClient.getAdbPath().empty() && !backupClient.findAdb()) {
+                LOG_ERROR("BackupManager", "Backup aborted. ADB was not found.");
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = false;
+                message.hasNotification = true;
+                message.notificationTitle = "Backup Failed";
+                message.notificationMessage = "ADB was not found.";
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+
+            LOG_INFO("BackupManager", "Checking root access for " + serial);
+            if (!backupClient.isRootAvailable(serial)) {
+                LOG_ERROR("BackupManager", "Root access check failed for " + serial);
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = false;
+                message.hasNotification = true;
+                message.notificationTitle = "Root Access Required";
+                message.notificationMessage = "Backup requires a rooted device with root access granted for ADB.";
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+            LOG_INFO("BackupManager", "Root access confirmed for " + serial);
+            DeviceClient& slotClient = deviceForSlot(slot);
+            if (!slotClient.isServerRunning() || !slotClient.useRoot()) {
+                LOG_INFO("BackupManager", "Starting root device server for backup on " + serial);
+                slotClient.startServer(serial, m_preferAdbForward, true);
+            }
+            DeviceClient& backupWorkClient = slotClient.isServerRunning() && slotClient.useRoot() ? slotClient : backupClient;
+            for (int packageIndex = 0; packageIndex < (int)packages.size(); packageIndex++) {
+                const auto& pkg = packages[packageIndex];
+                AppBackupRecord rec;
+                std::string out;
+                try {
+                    LOG_INFO("BackupManager", "Starting package backup: " + pkg);
+                    auto progressCb = [this, packageIndex, totalPackages = (int)packages.size()](const AppBackupProgress& progress) {
+                        UiMessage message;
+                        message.hasBackupProgress = true;
+                        message.backupProgressActive = true;
+                        message.backupProgressCurrent = packageIndex;
+                        message.backupProgressTotal = totalPackages;
+                        message.backupProgressStage = progress.stageIndex;
+                        message.backupProgressStageTotal = progress.stageCount;
+                        message.backupProgressBytes = progress.bytesTransferred;
+                        message.backupProgressTotalBytes = progress.bytesTotal;
+                        message.backupProgressPackage = progress.packageName;
+                        message.backupProgressStageLabel = progress.stageLabel;
+                        postUiMessage(std::move(message));
+                        return true;
+                    };
+                    if (backupWorkClient.backupApp(serial, pkg, root, options, rec, out, progressCb)) {
+                        ok++;
+                        successfulPackages.push_back(pkg);
+                        LOG_INFO("BackupManager", "Package backup complete: " + pkg + " -> " + rec.backupPath);
+                    } else {
+                        details += pkg + ": " + out + "\n";
+                        LOG_ERROR("BackupManager", "Package backup failed: " + pkg + ": " + out);
+                    }
+                } catch (const std::exception& e) {
+                    details += pkg + ": " + e.what() + "\n";
+                    LOG_ERROR("BackupManager", "Package backup exception: " + pkg + ": " + e.what());
+                } catch (...) {
+                    details += pkg + ": Unexpected backup failure.\n";
+                    LOG_ERROR("BackupManager", "Package backup unknown exception: " + pkg);
+                }
+            }
+            LOG_INFO("BackupManager", "Backup finished. ok=" + std::to_string(ok) + " total=" + std::to_string(packages.size()));
+            nlohmann::json job;
+            job["format"] = "FastEnoughBackupJob";
+            job["formatVersion"] = 1;
+            job["name"] = "Backup job " + created;
+            job["created"] = created;
+            job["serial"] = serial;
+            job["appCount"] = ok;
+            job["requestedAppCount"] = packages.size();
+            job["packages"] = successfulPackages;
+            nlohmann::json contents = nlohmann::json::array();
+            if (options.includeApk) contents.push_back("APK");
+            if (options.includeData) contents.push_back("Data");
+            if (options.includeDeviceProtectedData) contents.push_back("DE");
+            if (options.includeExternalData) contents.push_back("External");
+            if (options.includeObb) contents.push_back("OBB");
+            if (options.includeMedia) contents.push_back("Media");
+            job["contents"] = contents;
+            std::ofstream jf(toFsPath(jobPath) / "job.json", std::ios::binary);
+            jf << job.dump(2);
+            UiMessage message;
+            message.refreshBackupList = true;
+            message.hasStatus = true;
+            message.status = "Backed up " + std::to_string(ok) + " app(s)";
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.backupProgressCurrent = ok;
+            message.backupProgressTotal = (int)packages.size();
+            message.backupProgressStageLabel = "Backup finished";
+            message.hasNotification = true;
+            if (ok == (int)packages.size()) {
+                message.notificationTitle = "Backup Complete";
+                message.notificationMessage = "Saved " + std::to_string(ok) + " app backup(s) to the Backups folder.";
+                message.notificationIsError = false;
+            } else {
+                if (details.size() > 3000) details = details.substr(0, 3000) + "\nMore errors were omitted.";
+                message.notificationTitle = "Backup Finished With Errors";
+                message.notificationMessage = details.empty() ? "Some backups failed." : details;
+                message.notificationIsError = true;
+            }
+            postUiMessage(std::move(message));
+        } catch (const std::exception& e) {
+            LOG_ERROR("BackupManager", std::string("Backup task exception: ") + e.what());
+            UiMessage message;
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.hasNotification = true;
+            message.notificationTitle = "Backup Failed";
+            message.notificationMessage = e.what();
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        } catch (...) {
+            LOG_ERROR("BackupManager", "Backup task unknown exception");
+            UiMessage message;
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.hasNotification = true;
+            message.notificationTitle = "Backup Failed";
+            message.notificationMessage = "Unexpected backup failure.";
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        }
+    });
+}
+
+void App::startBackupManagerRestore() {
+    std::vector<std::string> backups;
+    if (m_backupManagerJobOpen) {
+        for (const auto& row : m_backupManagerJobApps) {
+            if (row.selected) backups.push_back(row.record.backupPath);
+        }
+        if (backups.empty()) {
+            for (const auto& row : m_backupManagerJobApps)
+                backups.push_back(row.record.backupPath);
+        }
+    } else {
+        for (const auto& row : m_backupManagerBackups) {
+            if (!row.selected) continue;
+            if (!row.isJob) {
+                backups.push_back(row.record.backupPath);
+                continue;
+            }
+            std::filesystem::path appsRoot = toFsPath(row.record.backupPath) / "Apps";
+            std::error_code ec;
+            for (auto pkgIt = std::filesystem::directory_iterator(appsRoot, ec);
+                 !ec && pkgIt != std::filesystem::directory_iterator(); pkgIt.increment(ec)) {
+                if (!pkgIt->is_directory(ec)) continue;
+                for (auto bakIt = std::filesystem::directory_iterator(pkgIt->path(), ec);
+                     !ec && bakIt != std::filesystem::directory_iterator(); bakIt.increment(ec)) {
+                    if (bakIt->is_directory(ec) && std::filesystem::exists(bakIt->path() / "backup.json", ec))
+                        backups.push_back(pathToUtf8(bakIt->path()));
+                }
+            }
+        }
+    }
+    startBackupManagerRestorePaths(std::move(backups));
+}
+
+void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
+    int slot = m_backupManagerSlot & 1;
+    if (backups.empty()) return;
+    LOG_INFO("BackupManager", "Restore requested for " + std::to_string(backups.size()) + " backup(s)");
+    std::string prompt = "Restore " + std::to_string(backups.size()) + " selected backup(s) to the selected device?";
+    if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Restore", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+
+    std::string serial = m_slotSerial[slot];
+    std::string adbPath = deviceForSlot(slot).getAdbPath();
+    AppBackupOptions options;
+    options.includeApk = m_backupIncludeApk;
+    options.includeData = m_backupIncludeData;
+    options.includeDeviceProtectedData = m_backupIncludeDeData;
+    options.includeExternalData = m_backupIncludeExternalData;
+    options.includeObb = m_backupIncludeObb;
+    options.includeMedia = m_backupIncludeMedia;
+    options.grantRuntimePermissions = m_backupRestorePermissions;
+    options.allowDowngrade = m_backupAllowDowngrade;
+
+    LOG_INFO("BackupManager", "Restore confirmed. serial=" + serial);
+    m_backupProgressActive = true;
+    m_backupProgressIsRestore = true;
+    m_backupProgressCurrent = 0;
+    m_backupProgressTotal = (int)backups.size();
+    m_backupProgressStage = 0;
+    m_backupProgressStageTotal = 1;
+    m_backupProgressBytes = 0;
+    m_backupProgressTotalBytes = 0;
+    m_backupProgressPackage.clear();
+    m_backupProgressStageLabel = "Starting restore";
+
+    postAsync("Restoring backups...", [this, slot, serial, adbPath, backups, options]() {
+        int ok = 0;
+        std::string details;
+        try {
+            DeviceClient restoreClient;
+            if (!adbPath.empty()) restoreClient.setAdbPath(adbPath);
+            if (restoreClient.getAdbPath().empty() && !restoreClient.findAdb()) {
+                LOG_ERROR("BackupManager", "Restore aborted. ADB was not found.");
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = false;
+                message.backupProgressIsRestore = true;
+                message.hasNotification = true;
+                message.notificationTitle = "Restore Failed";
+                message.notificationMessage = "ADB was not found.";
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+
+            LOG_INFO("BackupManager", "Checking root access for restore on " + serial);
+            if (serial.empty() || !restoreClient.isRootAvailable(serial)) {
+                LOG_ERROR("BackupManager", "Restore root access check failed for " + serial);
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = false;
+                message.backupProgressIsRestore = true;
+                message.hasNotification = true;
+                message.notificationTitle = "Root Access Required";
+                message.notificationMessage = "Restore requires a rooted device with root access granted for ADB.";
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+            DeviceClient& slotClient = deviceForSlot(slot);
+            if (!slotClient.isServerRunning() || !slotClient.useRoot()) {
+                LOG_INFO("BackupManager", "Starting root device server for restore on " + serial);
+                slotClient.startServer(serial, m_preferAdbForward, true);
+            }
+            DeviceClient& restoreWorkClient = slotClient.isServerRunning() && slotClient.useRoot() ? slotClient : restoreClient;
+            for (int backupIndex = 0; backupIndex < (int)backups.size(); backupIndex++) {
+                const auto& backup = backups[backupIndex];
+                std::string out;
+                std::string packageName;
+                {
+                    std::ifstream mf(toFsPath(backup) / "backup.json", std::ios::binary);
+                    nlohmann::json meta = nlohmann::json::parse(mf, nullptr, false);
+                    if (!meta.is_discarded()) packageName = meta.value("packageName", "");
+                }
+                UiMessage progressMessage;
+                progressMessage.hasBackupProgress = true;
+                progressMessage.backupProgressActive = true;
+                progressMessage.backupProgressIsRestore = true;
+                progressMessage.backupProgressCurrent = backupIndex;
+                progressMessage.backupProgressTotal = (int)backups.size();
+                progressMessage.backupProgressStage = 0;
+                progressMessage.backupProgressStageTotal = 1;
+                progressMessage.backupProgressPackage = packageName.empty() ? backup : packageName;
+                progressMessage.backupProgressStageLabel = "Restoring app";
+                postUiMessage(std::move(progressMessage));
+                LOG_INFO("BackupManager", "Starting restore: " + backup);
+                auto progressCb = [this, backupIndex, totalBackups = (int)backups.size()](const AppBackupProgress& progress) {
+                    UiMessage message;
+                    message.hasBackupProgress = true;
+                    message.backupProgressActive = true;
+                    message.backupProgressIsRestore = true;
+                    message.backupProgressCurrent = backupIndex;
+                    message.backupProgressTotal = totalBackups;
+                    message.backupProgressStage = progress.stageIndex;
+                    message.backupProgressStageTotal = progress.stageCount;
+                    message.backupProgressBytes = progress.bytesTransferred;
+                    message.backupProgressTotalBytes = progress.bytesTotal;
+                    message.backupProgressPackage = progress.packageName;
+                    message.backupProgressStageLabel = progress.stageLabel;
+                    postUiMessage(std::move(message));
+                    return true;
+                };
+                if (restoreWorkClient.restoreAppBackup(serial, backup, options, out, progressCb)) {
+                    ok++;
+                    LOG_INFO("BackupManager", "Restore complete: " + backup);
+                } else {
+                    details += backup + ":\n" + out + "\n";
+                    LOG_ERROR("BackupManager", "Restore failed: " + backup + ": " + out);
+                }
+            }
+            LOG_INFO("BackupManager", "Restore finished. ok=" + std::to_string(ok) + " total=" + std::to_string(backups.size()));
+            UiMessage message;
+            message.refreshAppList = true;
+            message.hasStatus = true;
+            message.status = "Restored " + std::to_string(ok) + " backup(s)";
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.backupProgressIsRestore = true;
+            message.backupProgressCurrent = ok;
+            message.backupProgressTotal = (int)backups.size();
+            message.backupProgressStageLabel = "Restore finished";
+            message.hasNotification = true;
+            if (ok == (int)backups.size()) {
+                message.notificationTitle = "Restore Complete";
+                message.notificationMessage = "Restored " + std::to_string(ok) + " backup(s).";
+                message.notificationIsError = false;
+            } else {
+                message.notificationTitle = "Restore Finished With Errors";
+                message.notificationMessage = details.empty() ? "Some restores failed." : details;
+                message.notificationIsError = true;
+            }
+            postUiMessage(std::move(message));
+        } catch (const std::exception& e) {
+            LOG_ERROR("BackupManager", std::string("Restore task exception: ") + e.what());
+            UiMessage message;
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.backupProgressIsRestore = true;
+            message.hasNotification = true;
+            message.notificationTitle = "Restore Failed";
+            message.notificationMessage = e.what();
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        } catch (...) {
+            LOG_ERROR("BackupManager", "Restore task unknown exception");
+            UiMessage message;
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.backupProgressIsRestore = true;
+            message.hasNotification = true;
+            message.notificationTitle = "Restore Failed";
+            message.notificationMessage = "Unexpected restore failure.";
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        }
+    });
+}
+
+void App::renderBackupManagerWindow() {
+    if (m_backupManagerNeedsBackupRefresh) refreshBackupManagerBackups();
+    if (m_backupManagerNeedsAppRefresh && !m_asyncBusy.load()) refreshBackupManagerApps();
+
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.85f, 0.60f, 0.25f, 1), "Backup Manager");
+    ImGui::SameLine();
+    if (ImGui::Button("Back to File Manager")) {
+        m_showBackupManager = false;
+        return;
+    }
+
+    std::string root = getBackupsRootPath();
+    ImGui::SameLine();
+    ImGui::TextDisabled("Storage: %s", root.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Open Folder")) {
+        CreateDirectoryW(toWide(root).c_str(), nullptr);
+        ShellExecuteA(nullptr, "explore", root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Device");
+    ImGui::SameLine();
+    auto slotLabel = [&](int slot) -> std::string {
+        if (!m_slotConnected[slot]) return "No device";
+        auto it = m_deviceDisplayNames.find(m_slotSerial[slot]);
+        if (it != m_deviceDisplayNames.end()) return it->second;
+        return m_slotSerial[slot];
+    };
+    ImGui::SetNextItemWidth(260);
+    if (ImGui::BeginCombo("##BackupDevice", slotLabel(m_backupManagerSlot).c_str())) {
+        for (int slot = 0; slot < 2; slot++) {
+            bool enabled = m_slotConnected[slot];
+            ImGui::BeginDisabled(!enabled);
+            bool selected = m_backupManagerSlot == slot;
+            std::string label = slotLabel(slot) + "##backupSlot" + std::to_string(slot);
+            if (ImGui::Selectable(label.c_str(), selected)) {
+                m_backupManagerSlot = slot;
+                m_backupManagerNeedsAppRefresh = true;
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+            ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Refresh")) {
+        m_backupManagerNeedsAppRefresh = true;
+        m_backupManagerNeedsBackupRefresh = true;
+    }
+
+    ImGui::Separator();
+    ImGui::Checkbox("APK", &m_backupIncludeApk);
+    ImGui::SameLine();
+    ImGui::Checkbox("App data", &m_backupIncludeData);
+    ImGui::SameLine();
+    ImGui::Checkbox("Device protected", &m_backupIncludeDeData);
+    ImGui::SameLine();
+    ImGui::Checkbox("External", &m_backupIncludeExternalData);
+    ImGui::SameLine();
+    ImGui::Checkbox("OBB", &m_backupIncludeObb);
+    ImGui::SameLine();
+    ImGui::Checkbox("Media", &m_backupIncludeMedia);
+    ImGui::Checkbox("Skip cache folders", &m_backupExcludeCache);
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Show system apps", &m_backupShowSystemApps) && !m_backupShowSystemApps) {
+        for (auto& row : m_backupManagerApps)
+            if (row.app.isSystem) row.selected = false;
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Restore permissions", &m_backupRestorePermissions);
+    ImGui::SameLine();
+    ImGui::Checkbox("Allow downgrade", &m_backupAllowDowngrade);
+
+    bool hasDevice = m_slotConnected[m_backupManagerSlot & 1];
+    ImGui::Separator();
+    bool anyApp = false;
+    for (const auto& row : m_backupManagerApps) if (row.selected) { anyApp = true; break; }
+    bool anyBackup = false;
+    for (const auto& row : m_backupManagerBackups) if (row.selected) { anyBackup = true; break; }
+
+    bool showBackupProgress = m_backupProgressActive || (!m_backupProgressStageLabel.empty() && m_asyncBusy.load());
+    float bottomBarH = showBackupProgress
+        ? (ImGui::GetFrameHeightWithSpacing() * 4.0f + 18.0f)
+        : (ImGui::GetFrameHeightWithSpacing() + 12.0f);
+    float availableY = ImGui::GetContentRegionAvail().y;
+    float bodyH = availableY - bottomBarH - ImGui::GetStyle().ItemSpacing.y;
+    if (bodyH < 80.0f) bodyH = 80.0f;
+    float columnW = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
+
+    std::string filter(m_backupManagerSearch);
+    std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+    std::string backupFilter(m_backupManagerBackupSearch);
+    std::transform(backupFilter.begin(), backupFilter.end(), backupFilter.begin(), ::tolower);
+
+    ImGui::BeginChild("##BackupAppsPane", ImVec2(columnW, bodyH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+        ImGui::TextColored(ImVec4(0.85f, 0.60f, 0.25f, 1), "Installed Apps");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputText("##BackupAppSearch", m_backupManagerSearch, sizeof(m_backupManagerSearch));
+        if (ImGui::SmallButton("Select Visible")) setBackupManagerAppSelection(true, true);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Select All")) setBackupManagerAppSelection(true, false);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear")) setBackupManagerAppSelection(false, false);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Invert Visible")) invertBackupManagerAppSelection(true);
+        if (!hasDevice) ImGui::TextDisabled("Connect a device to list installed apps.");
+        float tableH = ImGui::GetContentRegionAvail().y;
+        if (tableH < 80.0f) tableH = 80.0f;
+        if (ImGui::BeginTable("##BackupAppsTable", 3,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_Borders |
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                ImVec2(0, tableH))) {
+            ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch, 0.55f);
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableSetupColumn("APK Path", ImGuiTableColumnFlags_WidthStretch, 0.45f);
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableHeadersRow();
+            for (int i = 0; i < (int)m_backupManagerApps.size(); i++) {
+                auto& row = m_backupManagerApps[i];
+                if (row.app.isSystem && !m_backupShowSystemApps) continue;
+                std::string hay = row.app.packageName + " " + row.app.apkPath;
+                std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+                if (!filter.empty() && hay.find(filter) == std::string::npos) continue;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                std::string id = row.app.packageName + "##bmapp" + std::to_string(i);
+                ImGui::Selectable(id.c_str(), &row.selected, ImGuiSelectableFlags_SpanAllColumns);
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", row.app.isSystem ? "System" : "User");
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", row.app.apkPath.c_str());
+            }
+            ImGui::EndTable();
+        }
+    ImGui::EndChild();
+
+    ImGui::SameLine(0, 12.0f);
+
+    ImGui::BeginChild("##BackupRestorePane", ImVec2(0, bodyH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+        if (m_backupManagerJobOpen) {
+            ImGui::TextColored(ImVec4(0.55f, 0.75f, 1.0f, 1), "Backup Job");
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", m_backupManagerOpenJobTitle.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Back to Jobs")) closeBackupManagerJob();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Select All Apps")) {
+                for (auto& row : m_backupManagerJobApps) row.selected = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Clear")) {
+                for (auto& row : m_backupManagerJobApps) row.selected = false;
+            }
+            bool anyJobApp = false;
+            for (const auto& row : m_backupManagerJobApps) if (row.selected) { anyJobApp = true; break; }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!hasDevice || m_asyncBusy.load() || m_backupManagerJobApps.empty());
+            if (ImGui::SmallButton("Restore Whole Job")) {
+                std::vector<std::string> paths;
+                for (const auto& row : m_backupManagerJobApps) paths.push_back(row.record.backupPath);
+                startBackupManagerRestorePaths(std::move(paths));
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!hasDevice || m_asyncBusy.load() || !anyJobApp);
+            if (ImGui::SmallButton("Restore Selected Apps")) {
+                std::vector<std::string> paths;
+                for (const auto& row : m_backupManagerJobApps)
+                    if (row.selected) paths.push_back(row.record.backupPath);
+                startBackupManagerRestorePaths(std::move(paths));
+            }
+            ImGui::EndDisabled();
+
+            tableH = ImGui::GetContentRegionAvail().y;
+            if (tableH < 80.0f) tableH = 80.0f;
+            if (ImGui::BeginTable("##BackupJobAppsTable", 4,
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_Borders |
+                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                    ImVec2(0, tableH))) {
+                ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch, 0.44f);
+                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                ImGui::TableSetupColumn("Contents", ImGuiTableColumnFlags_WidthStretch, 0.32f);
+                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableHeadersRow();
+                for (int i = 0; i < (int)m_backupManagerJobApps.size(); i++) {
+                    auto& row = m_backupManagerJobApps[i];
+                    std::string contents;
+                    if (row.record.hasApk) contents += "APK ";
+                    if (row.record.hasData) contents += "Data ";
+                    if (row.record.hasDeviceProtectedData) contents += "DE ";
+                    if (row.record.hasExternalData) contents += "Ext ";
+                    if (row.record.hasObb) contents += "OBB ";
+                    if (row.record.hasMedia) contents += "Media ";
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    std::string id = row.record.packageName + "##bmjobapp" + std::to_string(i);
+                    ImGui::Selectable(id.c_str(), &row.selected, ImGuiSelectableFlags_SpanAllColumns);
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", row.record.created.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", contents.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", formatSize(row.record.sizeBytes).c_str());
+                }
+                ImGui::EndTable();
+            }
+        } else {
+            ImGui::TextColored(ImVec4(0.55f, 0.75f, 1.0f, 1), "Saved Backups");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("##BackupSearch", m_backupManagerBackupSearch, sizeof(m_backupManagerBackupSearch));
+            if (ImGui::SmallButton("Open Job")) {
+                for (const auto& row : m_backupManagerBackups) {
+                    if (!row.selected) continue;
+                    openBackupManagerJob(row);
+                    break;
+                }
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!hasDevice || !anyBackup || m_asyncBusy.load());
+            if (ImGui::SmallButton("Restore Selected Jobs")) startBackupManagerRestore();
+            ImGui::EndDisabled();
+            tableH = ImGui::GetContentRegionAvail().y;
+            if (tableH < 80.0f) tableH = 80.0f;
+            if (ImGui::BeginTable("##BackupsTable", 4,
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_Borders |
+                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                    ImVec2(0, tableH))) {
+                ImGui::TableSetupColumn("Backup", ImGuiTableColumnFlags_WidthStretch, 0.42f);
+                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                ImGui::TableSetupColumn("Contents", ImGuiTableColumnFlags_WidthStretch, 0.35f);
+                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableHeadersRow();
+                for (int i = 0; i < (int)m_backupManagerBackups.size(); i++) {
+                    auto& row = m_backupManagerBackups[i];
+                    std::string hay = row.record.packageName + " " + row.record.created + " " + row.record.backupPath;
+                    std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+                    if (!backupFilter.empty() && hay.find(backupFilter) == std::string::npos) continue;
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    std::string id = row.record.packageName + "##bmbak" + std::to_string(i);
+                    if (ImGui::Selectable(id.c_str(), &row.selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                        if (!ImGui::GetIO().KeyCtrl) {
+                            for (int j = 0; j < (int)m_backupManagerBackups.size(); j++)
+                                if (j != i) m_backupManagerBackups[j].selected = false;
+                            row.selected = true;
+                        }
+                    }
+                    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        openBackupManagerJob(row);
+                    }
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", row.record.created.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", row.contentsSummary.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", formatSize(row.record.sizeBytes).c_str());
+                }
+                ImGui::EndTable();
+            }
+        }
+    ImGui::EndChild();
+
+    float backupButtonW = ImGui::CalcTextSize("Back Up Selected Apps").x + ImGui::GetStyle().FramePadding.x * 2.0f + 28.0f;
+    float restoreButtonW = ImGui::CalcTextSize("Restore Selected Backups").x + ImGui::GetStyle().FramePadding.x * 2.0f + 28.0f;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.02f,0.02f,0.03f,1));
+    ImGui::BeginChild("##BackupManagerBottomBar", ImVec2(0, bottomBarH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+    ImGui::SetCursorPosX(8.0f);
+    ImGui::BeginDisabled(!hasDevice || !anyApp || m_asyncBusy.load());
+    if (ImGui::Button("Back Up Selected Apps", ImVec2(backupButtonW, 0))) startBackupManagerBackup();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!hasDevice || !anyBackup || m_asyncBusy.load());
+    if (ImGui::Button("Restore Selected Backups", ImVec2(restoreButtonW, 0))) startBackupManagerRestore();
+    ImGui::EndDisabled();
+
+    std::string statusText;
+    if (m_asyncBusy.load()) {
+        statusText = m_asyncStatus;
+    } else {
+        auto elapsed = std::chrono::steady_clock::now() - m_statusTime;
+        if (!m_statusMessage.empty() && elapsed < std::chrono::seconds(15))
+            statusText = m_statusMessage;
+        else if (hasDevice)
+            statusText = "Ready";
+        else
+            statusText = "No device connected";
+    }
+    float statusW = ImGui::CalcTextSize(statusText.c_str()).x;
+    float rightX = ImGui::GetWindowWidth() - statusW - 16.0f;
+    if (rightX > ImGui::GetCursorPosX() + 20.0f) ImGui::SameLine(rightX);
+    else ImGui::SameLine(0, 20);
+    ImGui::TextColored(hasDevice ? ImVec4(0.3f, 0.9f, 0.5f, 1) : ImVec4(0.9f, 0.65f, 0.25f, 1),
+        "%s", statusText.c_str());
+
+    if (showBackupProgress) {
+        int totalApps = std::max(1, m_backupProgressTotal);
+        int stageTotal = std::max(1, m_backupProgressStageTotal);
+        float stageFraction = (float)std::clamp(m_backupProgressStage, 0, stageTotal) / (float)stageTotal;
+        if (m_backupProgressTotalBytes > 0) {
+            stageFraction = ((float)m_backupProgressStage + std::clamp((float)m_backupProgressBytes / (float)m_backupProgressTotalBytes, 0.0f, 1.0f)) / (float)stageTotal;
+        }
+        float overallFraction = ((float)std::clamp(m_backupProgressCurrent, 0, totalApps) + std::clamp(stageFraction, 0.0f, 1.0f)) / (float)totalApps;
+        overallFraction = std::clamp(overallFraction, 0.0f, 1.0f);
+
+        ImGui::SetCursorPosX(8.0f);
+        std::string line = std::string(m_backupProgressIsRestore ? "Restore " : "Backup ") +
+            std::to_string(std::min(m_backupProgressCurrent + 1, totalApps)) + " of " +
+            std::to_string(totalApps);
+        if (!m_backupProgressPackage.empty()) line += "  " + m_backupProgressPackage;
+        ImGui::TextDisabled("%s", line.c_str());
+
+        ImGui::SetCursorPosX(8.0f);
+        char overallText[64];
+        snprintf(overallText, sizeof(overallText), "%.0f%%", overallFraction * 100.0f);
+        ImGui::ProgressBar(overallFraction, ImVec2(-8.0f, 22.0f), overallText);
+
+        ImGui::SetCursorPosX(8.0f);
+        std::string stageLine;
+        if (!m_backupProgressStageLabel.empty()) stageLine = m_backupProgressStageLabel;
+        if (m_backupProgressBytes > 0) {
+            if (!stageLine.empty()) stageLine += "  ";
+            stageLine += formatSize(m_backupProgressBytes);
+            if (m_backupProgressTotalBytes > 0) stageLine += " / " + formatSize(m_backupProgressTotalBytes);
+        }
+        if (!stageLine.empty()) ImGui::TextDisabled("%s", stageLine.c_str());
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+}
+
 void App::openAndroidFile(FilePanel& panel, int index) {
     if (!panel.isAndroid || !panel.validIndex(index)) return;
     if (panel.entryIsDir(index)) return;
@@ -5173,21 +6193,34 @@ void App::renderAboutPopup() {
 }
 
 void App::renderNotificationPopup() {
-    if (m_showNotification) {
+    bool show = false;
+    std::string title;
+    std::string message;
+    bool isError = false;
+    {
+        std::lock_guard<std::mutex> lk(m_notificationMutex);
+        show = m_showNotification;
+        title = m_notificationTitle;
+        message = m_notificationMessage;
+        isError = m_notificationIsError;
+        if (show) {
+            m_showNotification = false;
+        }
+    }
+    if (show) {
         ImGui::OpenPopup("##NotificationPopup");
-        m_showNotification = false;
     }
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(420, 0));
     if (ImGui::BeginPopupModal("##NotificationPopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
         ImGui::Spacing();
-        ImVec4 titleColor = m_notificationIsError ? ImVec4(1, 0.4f, 0.4f, 1) : ImVec4(0.3f, 1, 0.5f, 1);
-        ImGui::TextColored(titleColor, "%s", m_notificationTitle.c_str());
+        ImVec4 titleColor = isError ? ImVec4(1, 0.4f, 0.4f, 1) : ImVec4(0.3f, 1, 0.5f, 1);
+        ImGui::TextColored(titleColor, "%s", title.c_str());
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
-        ImGui::TextWrapped("%s", m_notificationMessage.c_str());
+        ImGui::TextWrapped("%s", message.c_str());
         ImGui::Spacing();
         ImGui::Spacing();
         float btnW = 80;
@@ -5200,6 +6233,7 @@ void App::renderNotificationPopup() {
 }
 
 void App::showNotification(const std::string& title, const std::string& message, bool isError) {
+    std::lock_guard<std::mutex> lk(m_notificationMutex);
     m_notificationTitle = title;
     m_notificationMessage = message;
     m_notificationIsError = isError;
@@ -9128,7 +10162,8 @@ void App::processBatchQueue() {
                 }
                 auto lastUpgradeCheck = std::chrono::steady_clock::now();
 
-                while (!m_shutdownTransfer && !batch->stopRequested.load()) {
+                while (!m_shutdownTransfer && !batch->stopRequested.load() &&
+                       batch->state.load() != BatchState::Failed) {
                     // Every 5s, check if we can restore the original transport for true dual-channel.
                     // This catches: USB dropped → both on WiFi → USB comes back → upgrade one channel.
                     // Also: WiFi dropped → both on USB → WiFi comes back → upgrade one channel.
@@ -9403,6 +10438,25 @@ void App::processBatchQueue() {
 
                     if (!ok && !batch->stopRequested.load()) {
                         std::string errMsg = dev.lastError();
+
+                        bool isLocalWriteError = batch->isPull &&
+                            (errMsg.find("Failed to create local file") != std::string::npos ||
+                             errMsg.find("Failed to open local file") != std::string::npos ||
+                             errMsg.find("Cannot open") != std::string::npos ||
+                             errMsg.find("Access is denied") != std::string::npos);
+
+                        if (isLocalWriteError) {
+                            LOG_WARN("Transfer", ch.channelName + " local destination failed: " +
+                                     item.displayName + " - " + errMsg);
+                            batch->state = BatchState::Failed;
+                            batch->errorMessage = errMsg +
+                                "\n\nThe destination may require administrator rights or be read-only.";
+                            {
+                                std::lock_guard<std::mutex> lk(workMutex);
+                                workQueue.clear();
+                            }
+                            break;
+                        }
 
                         // Check if this is a file-level error (server responded properly)
                         // vs an actual connection failure. File errors like "No such file or

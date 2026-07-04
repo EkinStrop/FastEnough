@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 #include <cwctype>
+#include <chrono>
+#include <iomanip>
 
 // System tray
 #define WM_TRAYICON (WM_APP + 1)
@@ -223,7 +225,39 @@ static std::string GetLaunchApkPath() {
     return apk;
 }
 
+static std::string GetExeSidePath(const char* fileName) {
+    char exePath[MAX_PATH] = {};
+    DWORD len = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return fileName;
+    std::string path(exePath, len);
+    size_t slash = path.find_last_of("\\/");
+    if (slash == std::string::npos) return fileName;
+    return path.substr(0, slash + 1) + fileName;
+}
+
+static std::string g_crashLogPath;
+
+static LONG WINAPI UnhandledCrashLogger(EXCEPTION_POINTERS* info) {
+    std::ofstream f(g_crashLogPath.empty() ? "Fast Enough - Android File Explorer.log" : g_crashLogPath, std::ios::app);
+    if (f) {
+        auto now = std::chrono::system_clock::now();
+        auto tt = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+        localtime_s(&tm, &tt);
+        DWORD code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
+        void* address = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionAddress : nullptr;
+        f << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << " [CRASH] Unhandled exception"
+          << " code=0x" << std::hex << code << " address=" << address << std::dec << "\n";
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    g_crashLogPath = GetExeSidePath("Fast Enough - Android File Explorer.log");
+    DebugLog::instance().setFilePath(g_crashLogPath);
+    SetUnhandledExceptionFilter(UnhandledCrashLogger);
+    LOG_INFO("Startup", "Application starting. Log file: " + g_crashLogPath);
+
     std::string launchApkPath = GetLaunchApkPath();
 
     // Single instance — if already running, bring existing window to front

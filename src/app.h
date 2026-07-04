@@ -15,6 +15,8 @@
 #include <filesystem>
 #include <chrono>
 #include <ctime>
+#include <fstream>
+#include <iomanip>
 
 // ---- Debug Log System ----
 enum class LogLevel { Debug, Info, Warn, Error };
@@ -33,12 +35,31 @@ public:
 
     void log(LogLevel level, const std::string& tag, const std::string& msg) {
         std::lock_guard<std::mutex> lk(m_mutex);
-        m_entries.push_back({ std::chrono::steady_clock::now(), std::chrono::system_clock::now(), level, tag, msg });
+        auto wallTime = std::chrono::system_clock::now();
+        m_entries.push_back({ std::chrono::steady_clock::now(), wallTime, level, tag, msg });
         if (m_entries.size() > 5000) m_entries.erase(m_entries.begin(), m_entries.begin() + 1000);
         m_scrollToBottom = true;
+        if (!m_filePath.empty()) {
+            std::ofstream f(m_filePath, std::ios::app);
+            if (f) {
+                auto tt = std::chrono::system_clock::to_time_t(wallTime);
+                std::tm tm{};
+                localtime_s(&tm, &tt);
+                const char* levelText = "INFO";
+                if (level == LogLevel::Debug) levelText = "DEBUG";
+                else if (level == LogLevel::Warn) levelText = "WARN";
+                else if (level == LogLevel::Error) levelText = "ERROR";
+                f << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << " [" << levelText << "] "
+                  << tag << ": " << msg << "\n";
+            }
+        }
     }
 
     void clear() { std::lock_guard<std::mutex> lk(m_mutex); m_entries.clear(); }
+    void setFilePath(const std::string& path) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_filePath = path;
+    }
 
     // Returns a snapshot for rendering (thread-safe)
     std::vector<LogEntry> snapshot() {
@@ -52,6 +73,7 @@ private:
     DebugLog() = default;
     std::mutex m_mutex;
     std::vector<LogEntry> m_entries;
+    std::string m_filePath;
 };
 
 // Convenience macros
@@ -319,6 +341,24 @@ struct FavoritePath {
     int deviceSlot = 0;
 };
 
+struct BackupManagerAppRow {
+    InstalledAppEntry app;
+    bool selected = false;
+};
+
+struct BackupManagerBackupRow {
+    AppBackupRecord record;
+    bool selected = false;
+    bool isJob = false;
+    int appCount = 0;
+    std::string contentsSummary;
+};
+
+struct BackupManagerJobAppRow {
+    AppBackupRecord record;
+    bool selected = false;
+};
+
 struct AppPreferences {
     bool restartAdbOnLaunch = false;  // default OFF
     bool enableCrcVerification = true;
@@ -383,6 +423,31 @@ public:
     bool m_showCloseConfirm = false;  // close confirmation dialog
 
 private:
+    struct UiMessage {
+        bool hasNotification = false;
+        std::string notificationTitle;
+        std::string notificationMessage;
+        bool notificationIsError = false;
+        bool hasStatus = false;
+        std::string status;
+        bool setBackupApps = false;
+        std::vector<BackupManagerAppRow> backupApps;
+        bool markBackupAppsFresh = false;
+        bool refreshBackupList = false;
+        bool refreshAppList = false;
+        bool hasBackupProgress = false;
+        bool backupProgressActive = false;
+        bool backupProgressIsRestore = false;
+        int backupProgressCurrent = 0;
+        int backupProgressTotal = 0;
+        int backupProgressStage = 0;
+        int backupProgressStageTotal = 1;
+        uint64_t backupProgressBytes = 0;
+        uint64_t backupProgressTotalBytes = 0;
+        std::string backupProgressPackage;
+        std::string backupProgressStageLabel;
+    };
+
     void setupStyle();
     void renderMenuBar();
     void renderPreferencesWindow();
@@ -399,7 +464,10 @@ private:
     void renderAboutPopup();
     void renderNotificationPopup();
     void showNotification(const std::string& title, const std::string& message, bool isError);
+    void postUiMessage(UiMessage message);
+    void drainUiMessages();
     void renderApkInstallDialog();
+    void renderBackupManagerWindow();
     void registerApkAssociation();
     void renderThemeWindow();
     void renderNicConfigWindow();
@@ -442,6 +510,17 @@ private:
     static std::string formatETA(double seconds);
     static std::string getFileIcon(const std::string& name, bool isDir);
     std::vector<std::string> getWindowsDrives();
+    std::string getBackupsRootPath() const;
+    void refreshBackupManagerApps();
+    void refreshBackupManagerBackups();
+    void startBackupManagerBackup();
+    void startBackupManagerRestore();
+    void startBackupManagerRestorePaths(std::vector<std::string> backups);
+    void openBackupManagerJob(const BackupManagerBackupRow& row);
+    void closeBackupManagerJob();
+    bool backupManagerAppVisible(const BackupManagerAppRow& row) const;
+    void setBackupManagerAppSelection(bool selected, bool visibleOnly);
+    void invertBackupManagerAppSelection(bool visibleOnly);
 
     // Draw a centered-text progress bar
     void drawProgressBar(float fraction, const char* overlayText, float height,
@@ -527,12 +606,50 @@ private:
     std::string m_notificationTitle;
     std::string m_notificationMessage;
     bool m_notificationIsError = false;
+    std::mutex m_notificationMutex;
 
     bool m_showApkInstallDialog = false;
     std::string m_pendingApkPath;
     int m_pendingApkDeviceIndex = 0;
     bool m_apkInstallGrantPermissions = false;
     bool m_apkInstallAllowDowngrade = false;
+
+    bool m_showBackupManager = false;
+    int m_backupManagerSlot = 0;
+    char m_backupManagerSearch[256] = {};
+    char m_backupManagerBackupSearch[256] = {};
+    bool m_backupIncludeApk = true;
+    bool m_backupIncludeData = true;
+    bool m_backupIncludeDeData = true;
+    bool m_backupIncludeExternalData = true;
+    bool m_backupIncludeObb = true;
+    bool m_backupIncludeMedia = true;
+    bool m_backupExcludeCache = true;
+    bool m_backupShowSystemApps = false;
+    bool m_backupRestorePermissions = true;
+    bool m_backupAllowDowngrade = false;
+    std::vector<BackupManagerAppRow> m_backupManagerApps;
+    std::vector<BackupManagerBackupRow> m_backupManagerBackups;
+    std::vector<BackupManagerJobAppRow> m_backupManagerJobApps;
+    bool m_backupManagerJobOpen = false;
+    std::string m_backupManagerOpenJobPath;
+    std::string m_backupManagerOpenJobTitle;
+    bool m_backupManagerNeedsAppRefresh = true;
+    bool m_backupManagerNeedsBackupRefresh = true;
+
+    bool m_backupProgressActive = false;
+    bool m_backupProgressIsRestore = false;
+    int m_backupProgressCurrent = 0;
+    int m_backupProgressTotal = 0;
+    int m_backupProgressStage = 0;
+    int m_backupProgressStageTotal = 1;
+    uint64_t m_backupProgressBytes = 0;
+    uint64_t m_backupProgressTotalBytes = 0;
+    std::string m_backupProgressPackage;
+    std::string m_backupProgressStageLabel;
+
+    std::mutex m_uiMessageMutex;
+    std::deque<UiMessage> m_uiMessages;
 
     // Connection mode UI
     bool m_showConnectionPopup = false;

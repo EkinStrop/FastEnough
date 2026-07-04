@@ -7,6 +7,45 @@
 #include <atomic>
 #include <cstdint>
 
+struct AppBackupOptions {
+    bool includeApk = true;
+    bool includeData = true;
+    bool includeDeviceProtectedData = true;
+    bool includeExternalData = true;
+    bool includeObb = true;
+    bool includeMedia = true;
+    bool excludeCache = true;
+    bool reinstall = true;
+    bool grantRuntimePermissions = true;
+    bool allowDowngrade = false;
+};
+
+struct AppBackupRecord {
+    std::string packageName;
+    std::string label;
+    std::string serial;
+    std::string backupPath;
+    std::string created;
+    std::string versionName;
+    int64_t versionCode = 0;
+    bool hasApk = false;
+    bool hasData = false;
+    bool hasDeviceProtectedData = false;
+    bool hasExternalData = false;
+    bool hasObb = false;
+    bool hasMedia = false;
+    uint64_t sizeBytes = 0;
+};
+
+struct AppBackupProgress {
+    std::string packageName;
+    std::string stageLabel;
+    int stageIndex = 0;
+    int stageCount = 1;
+    uint64_t bytesTransferred = 0;
+    uint64_t bytesTotal = 0;
+};
+
 struct DeviceFileEntry {
     std::string name;
     uint8_t type = 0;    // 0=file, 1=dir, 2=symlink
@@ -31,6 +70,7 @@ struct InstalledAppEntry {
 
 // Progress callback: (bytesTransferred, totalBytes) -> return false to cancel
 using ProgressCallback = std::function<bool(uint64_t transferred, uint64_t total)>;
+using BackupProgressCallback = std::function<bool(const AppBackupProgress& progress)>;
 
 class DeviceClient {
 public:
@@ -67,6 +107,15 @@ public:
                     bool reinstall = true, bool grantRuntimePermissions = false, bool allowDowngrade = false);
     bool uninstallPackage(const std::string& serial, const std::string& packageName, std::string& output,
                           bool keepData = false, bool userOnly = true, bool useRoot = false);
+    bool backupApp(const std::string& serial, const std::string& packageName, const std::string& backupRoot,
+                   const AppBackupOptions& options, AppBackupRecord& outRecord, std::string& output,
+                   BackupProgressCallback progress = nullptr);
+    bool restoreAppBackup(const std::string& serial, const std::string& backupPath, const AppBackupOptions& options,
+                          std::string& output, BackupProgressCallback progress = nullptr);
+    bool archiveRemoteDirectory(const std::string& remotePath, const std::string& localTarPath, bool excludeCache,
+                                uint64_t& outFileSize, ProgressCallback progress = nullptr);
+    bool extractRemoteArchive(const std::string& localTarPath, const std::string& remoteTarget,
+                              ProgressCallback progress = nullptr);
     void stopServer();
     bool isServerRunning() const { return m_connected; }
     const std::string& connectedSerial() const { return m_serial; }
@@ -186,6 +235,10 @@ private:
     bool tryDirectConnect(const std::string& ip);
 
     std::string runProcess(const std::string& command);
+    bool runProcessToFile(const std::string& command, const std::string& outputPath, std::string& output,
+                          uint32_t timeoutMs = 0, ProgressCallback progress = nullptr, uint64_t totalBytes = 0);
+    bool runProcessFromFile(const std::string& command, const std::string& inputPath, std::string& output,
+                            uint32_t timeoutMs = 0);
 
     // Low-level socket open. Returns INVALID_SOCKET on failure.
     static uintptr_t openServerSocket(const std::string& host, int port,

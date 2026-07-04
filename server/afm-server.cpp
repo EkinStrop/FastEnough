@@ -483,6 +483,142 @@ static void handle_pull(int fd, const char* path, uint32_t path_len) {
     if (!error) send_msg(fd, RSP_DONE, NULL, 0);
 }
 
+static void shell_quote(const char* in, char* out, size_t out_size) {
+    size_t j = 0;
+    if (j + 1 < out_size) out[j++] = '\'';
+    for (size_t i = 0; in[i] && j + 5 < out_size; i++) {
+        if (in[i] == '\'') {
+            out[j++] = '\'';
+            out[j++] = '\\';
+            out[j++] = '\'';
+            out[j++] = '\'';
+        } else {
+            out[j++] = in[i];
+        }
+    }
+    if (j + 1 < out_size) out[j++] = '\'';
+    out[j] = '\0';
+}
+
+static void stream_file_and_remove(int fd, const char* file_path) {
+    int file_fd = open(file_path, O_RDONLY);
+    if (file_fd < 0) {
+        send_error(fd, strerror(errno));
+        unlink(file_path);
+        return;
+    }
+    struct stat st;
+    if (fstat(file_fd, &st) != 0) {
+        close(file_fd);
+        unlink(file_path);
+        send_error(fd, strerror(errno));
+        return;
+    }
+    PullHeader ph = { (uint64_t)st.st_size };
+    if (send_ok(fd, &ph, sizeof(ph)) < 0) {
+        close(file_fd);
+        unlink(file_path);
+        return;
+    }
+    uint64_t remaining = st.st_size;
+    off_t offset = 0;
+    int error = 0;
+    while (remaining > 0) {
+        size_t chunk = remaining > BUF_SIZE ? BUF_SIZE : (size_t)remaining;
+        MsgHeader hdr{ RSP_DATA, (uint32_t)chunk };
+        if (send_all(fd, &hdr, sizeof(hdr)) < 0) { error = 1; break; }
+        size_t sent = 0;
+        while (sent < chunk) {
+            ssize_t n = sendfile(fd, file_fd, &offset, chunk - sent);
+            if (n <= 0) { error = 1; break; }
+            sent += n;
+        }
+        if (error) break;
+        remaining -= chunk;
+    }
+    close(file_fd);
+    unlink(file_path);
+    if (!error) send_msg(fd, RSP_DONE, NULL, 0);
+}
+
+static void handle_archive_path(int fd, const char* payload, uint32_t payload_len) {
+    if (payload_len < 5) { send_error(fd, "Invalid archive payload"); return; }
+    uint32_t exclude_cache = 0;
+    memcpy(&exclude_cache, payload, 4);
+    const char* path = payload + 4;
+    uint32_t path_len = payload_len - 4;
+    char pathbuf[PATH_MAX];
+    if (path_len >= PATH_MAX) { send_error(fd, "Path too long"); return; }
+    memcpy(pathbuf, path, path_len);
+    pathbuf[path_len] = '\0';
+
+    struct stat st;
+    if (lstat(pathbuf, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        send_error(fd, "Source directory not found");
+        return;
+    }
+
+    char tmpl[] = "/data/local/tmp/afm-backup-XXXXXX.tar";
+    int tmp_fd = mkstemps(tmpl, 4);
+    if (tmp_fd < 0) {
+        send_error(fd, strerror(errno));
+        return;
+    }
+    close(tmp_fd);
+
+    char quoted_path[PATH_MAX * 2];
+    char quoted_tmp[PATH_MAX * 2];
+    shell_quote(pathbuf, quoted_path, sizeof(quoted_path));
+    shell_quote(tmpl, quoted_tmp, sizeof(quoted_tmp));
+
+    char cmd[PATH_MAX * 5];
+    snprintf(cmd, sizeof(cmd), "cd %s && tar -cpf %s%s .", quoted_path, quoted_tmp,
+             exclude_cache ? " --exclude=cache --exclude=code_cache --exclude=no_backup" : "");
+    int rc = system(cmd);
+    if (rc != 0) {
+        unlink(tmpl);
+        send_error(fd, "tar archive failed");
+        return;
+    }
+    stream_file_and_remove(fd, tmpl);
+}
+
+static void handle_extract_archive(int fd, const void* payload, uint32_t payload_len) {
+    if (payload_len < 8) { send_error(fd, "Invalid extract payload"); return; }
+    uint32_t target_len = 0, archive_len = 0;
+    memcpy(&target_len, payload, 4);
+    memcpy(&archive_len, (const char*)payload + 4, 4);
+    if (target_len == 0 || archive_len == 0 || 8ULL + target_len + archive_len != payload_len) {
+        send_error(fd, "Invalid extract payload length");
+        return;
+    }
+    if (target_len >= PATH_MAX || archive_len >= PATH_MAX) {
+        send_error(fd, "Path too long");
+        return;
+    }
+    char target[PATH_MAX], archive[PATH_MAX];
+    memcpy(target, (const char*)payload + 8, target_len);
+    target[target_len] = '\0';
+    memcpy(archive, (const char*)payload + 8 + target_len, archive_len);
+    archive[archive_len] = '\0';
+
+    char quoted_target[PATH_MAX * 2];
+    char quoted_archive[PATH_MAX * 2];
+    shell_quote(target, quoted_target, sizeof(quoted_target));
+    shell_quote(archive, quoted_archive, sizeof(quoted_archive));
+
+    char cmd[PATH_MAX * 6];
+    snprintf(cmd, sizeof(cmd),
+             "mkdir -p %s && rm -rf %s/* && tar -xpf %s -C %s && rm -f %s && restorecon -RF %s 2>/dev/null",
+             quoted_target, quoted_target, quoted_archive, quoted_target, quoted_archive, quoted_target);
+    int rc = system(cmd);
+    if (rc != 0) {
+        send_error(fd, "archive extract failed");
+        return;
+    }
+    send_ok(fd, NULL, 0);
+}
+
 // Double-buffered push
 struct WriteJob {
     int       file_fd;
@@ -1663,6 +1799,8 @@ static void handle_client(int client_fd) {
             case CMD_DISK_SPACE:    handle_disk_space(client_fd); break;
             case CMD_WRITE_RANGE:   handle_write_range(client_fd, payload_buf, hdr.length); break;
             case CMD_CREATE_FILE:   handle_create_file(client_fd, payload_buf, hdr.length); break;
+            case CMD_ARCHIVE_PATH:  handle_archive_path(client_fd, payload_buf, hdr.length); break;
+            case CMD_EXTRACT_ARCHIVE: handle_extract_archive(client_fd, payload_buf, hdr.length); break;
             default:              send_error(client_fd, "Unknown command"); break;
         }
     }
