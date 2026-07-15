@@ -278,6 +278,13 @@ struct FilePanel {
         if (isApps) return 0;
         return isAndroid ? androidEntries[i].size : windowsEntries[i].size;
     }
+    uint64_t selectedFileSize() const {
+        uint64_t total = 0;
+        for (int i : selectedIndices) {
+            if (validIndex(i) && !entryIsDir(i)) total += entrySize(i);
+        }
+        return total;
+    }
     std::string entryDate(int i) const {
         if (!validIndex(i)) return "";
         if (isApps) return appEntries[i].isSystem ? "System" : "User";

@@ -7193,8 +7193,14 @@ void App::renderStatusBar() {
 
     int ls = (int)m_leftPanel.selectedIndices.size();
     int rs = (int)m_rightPanel.selectedIndices.size();
-    if (ls > 0) { ImGui::Text("| %d selected (PC)", ls); ImGui::SameLine(0, 20); }
-    if (rs > 0) { ImGui::Text("| %d selected (Android)", rs); ImGui::SameLine(0, 20); }
+    if (ls > 0) {
+        ImGui::Text("| %d selected, %s (PC)", ls, formatSize(m_leftPanel.selectedFileSize()).c_str());
+        ImGui::SameLine(0, 20);
+    }
+    if (rs > 0) {
+        ImGui::Text("| %d selected, %s (Android)", rs, formatSize(m_rightPanel.selectedFileSize()).c_str());
+        ImGui::SameLine(0, 20);
+    }
 
     ImGui::TextDisabled("| Android: %d items", m_rightPanel.entryCount());
     ImGui::SameLine(0, 20);

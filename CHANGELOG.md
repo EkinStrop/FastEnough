@@ -10,6 +10,7 @@ Backup Manager is available directly from the top bar.
 Backups are grouped into dated backup jobs.
 Backup jobs can be opened inside Backup Manager to view and restore individual apps.
 Backup and restore now show clear progress while running.
+Selecting multiple files now shows their total size for both Windows and Android.
 
 ### Fixed
 
