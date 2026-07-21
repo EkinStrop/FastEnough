@@ -9,3 +9,35 @@ IDR_AFM_SERVER RCDATA "..\\server\\afm-server"
 // Package label query used by app_process on Android
 #define IDR_APP_LABELS_DEX 201
 IDR_APP_LABELS_DEX RCDATA "..\\server\\afm-labels.dex"
+
+1 VERSIONINFO
+ FILEVERSION 1,0,18,0
+ PRODUCTVERSION 1,0,18,0
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "EkinStrop"
+            VALUE "FileDescription", "Fast Enough? - Android File Explorer"
+            VALUE "FileVersion", "1.0.18"
+            VALUE "InternalName", "Fast Enough - Android File Explorer"
+            VALUE "OriginalFilename", "Fast Enough - Android File Explorer.exe"
+            VALUE "ProductName", "Fast Enough"
+            VALUE "ProductVersion", "1.0.18"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
