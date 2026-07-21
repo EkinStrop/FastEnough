@@ -1,0 +1,14275 @@
+#include "app.h"
+#include "imgui_internal.h"
+#include "mcraw_local.h"
+#include "mcraw_projfs.h"
+#include "device_dokan.h"
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <Windows.h>
+#include <WinSock2.h>
+#include <WS2tcpip.h>
+#include <shellapi.h>
+#include <shobjidl.h>
+#include <shlobj.h>
+#include <wincrypt.h>
+#include <sstream>
+#include <algorithm>
+#include <ctime>
+#include <iomanip>
+#include <cctype>
+#include <cfloat>
+#include <cstdio>
+#include <cmath>
+#include <fstream>
+#include <set>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
+#include <deque>
+#include <ole2.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <nlohmann/json.hpp>
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "gdi32.lib")
+
+// Safe UTF-8 path-to-string helper (avoids ANSI code page issues with .string())
+static std::string pathToUtf8(const std::filesystem::path& p) {
+    auto ws = p.wstring();
+    if (ws.empty()) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
+    std::string utf8(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), utf8.data(), len, nullptr, nullptr);
+    return utf8;
+}
+
+// UTF-8 to wide string helper for Unicode-safe Win32 API calls
+static std::wstring toWide(const std::string& utf8) {
+    if (utf8.empty()) return {};
+    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), nullptr, 0);
+    std::wstring wide(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), wide.data(), len);
+    return wide;
+}
+
+// UTF-8 string to std::filesystem::path (via wide string to avoid ANSI codepage issues)
+static std::filesystem::path toFsPath(const std::string& utf8) {
+    return std::filesystem::path(toWide(utf8));
+}
+
+static void appendPathSeparator(std::string& path, char sep) {
+    if (path.empty()) {
+        path.push_back(sep);
+    } else if (path.back() != sep) {
+        path.push_back(sep);
+    }
+}
+
+static char lastCharOr(const std::string& value, char fallback = '\0') {
+    return value.empty() ? fallback : value.back();
+}
+
+static void alignTextToCompactFrame() {
+    ImGui::GetCurrentWindow()->DC.CurrLineTextBaseOffset =
+        ImGui::GetStyle().FramePadding.y * 0.62f;
+}
+
+static std::string sanitizeDeviceDisplayValue(std::string value) {
+    auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
+    while (!value.empty() && isSpace((unsigned char)value.front())) value.erase(value.begin());
+    while (!value.empty() && isSpace((unsigned char)value.back())) value.pop_back();
+    if (value.empty() || value.size() > 200 || value.find('|') != std::string::npos)
+        return "";
+
+    for (unsigned char c : value)
+        if (c < 0x20) return "";
+
+    std::string lower = value;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+        [](unsigned char c) { return (char)std::tolower(c); });
+    const char* adbDiagnostics[] = {
+        "adb.exe:",
+        "adb:",
+        "error:",
+        "device '",
+        "device \"",
+        "not found",
+        "offline",
+        "unauthorized",
+        "no devices/emulators",
+        "more than one device/emulator",
+        "failed to",
+        "cannot connect",
+        "* daemon",
+    };
+    for (const char* diagnostic : adbDiagnostics)
+        if (lower.find(diagnostic) != std::string::npos) return "";
+
+    return value;
+}
+
+static std::string normalizeCompareName(std::string name) {
+    std::transform(name.begin(), name.end(), name.begin(),
+        [](unsigned char c) { return (char)std::tolower(c); });
+    return name;
+}
+
+static std::string bytesToHex(const BYTE* data, DWORD len) {
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    out.reserve((size_t)len * 2);
+    for (DWORD i = 0; i < len; i++) {
+        BYTE b = data[i];
+        out.push_back(hex[b >> 4]);
+        out.push_back(hex[b & 0x0f]);
+    }
+    return out;
+}
+
+static bool computeCompareLocalSha256(const std::string& path, std::string& outSha256, std::string& detail) {
+    HANDLE hFile = CreateFileW(toWide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        detail = "Could not read local file";
+        return false;
+    }
+
+    FILE_IO_PRIORITY_HINT_INFO ph = { (PRIORITY_HINT)1 };
+    SetFileInformationByHandle(hFile, FileIoPriorityHintInfo, &ph, sizeof(ph));
+
+    HCRYPTPROV prov = 0;
+    HCRYPTHASH hash = 0;
+    if (!CryptAcquireContextW(&prov, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) ||
+        !CryptCreateHash(prov, CALG_SHA_256, 0, 0, &hash)) {
+        if (hash) CryptDestroyHash(hash);
+        if (prov) CryptReleaseContext(prov, 0);
+        CloseHandle(hFile);
+        detail = "Could not start SHA-256";
+        return false;
+    }
+
+    const DWORD bufSize = 4 * 1024 * 1024;
+    std::vector<char> buf(bufSize);
+    DWORD bytesRead = 0;
+    BOOL readOk = TRUE;
+    while ((readOk = ReadFile(hFile, buf.data(), bufSize, &bytesRead, nullptr)) && bytesRead > 0) {
+        if (!CryptHashData(hash, (const BYTE*)buf.data(), bytesRead, 0)) {
+            CryptDestroyHash(hash);
+            CryptReleaseContext(prov, 0);
+            CloseHandle(hFile);
+            detail = "Could not update SHA-256";
+            return false;
+        }
+    }
+    CloseHandle(hFile);
+    if (!readOk) {
+        CryptDestroyHash(hash);
+        CryptReleaseContext(prov, 0);
+        detail = "Could not finish local hash";
+        return false;
+    }
+
+    BYTE digest[32];
+    DWORD digestLen = sizeof(digest);
+    if (!CryptGetHashParam(hash, HP_HASHVAL, digest, &digestLen, 0) || digestLen != 32) {
+        CryptDestroyHash(hash);
+        CryptReleaseContext(prov, 0);
+        detail = "Could not finalize SHA-256";
+        return false;
+    }
+
+    outSha256 = bytesToHex(digest, digestLen);
+    CryptDestroyHash(hash);
+    CryptReleaseContext(prov, 0);
+    return true;
+}
+
+static uint64_t directorySizeBytes(const std::filesystem::path& dir) {
+    uint64_t total = 0;
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(dir, std::filesystem::directory_options::skip_permission_denied, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (it->is_regular_file(ec)) total += it->file_size(ec);
+    }
+    return total;
+}
+
+static std::string backupJobStamp() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    std::ostringstream ss;
+    ss << std::put_time(&tm, "%Y%m%d-%H%M%S");
+    return ss.str();
+}
+
+static std::vector<DetectedNic> enumerateNics() {
+    std::vector<DetectedNic> result;
+    ULONG bufLen = 16384;
+    std::vector<BYTE> buf(bufLen);
+    ULONG flags = GAA_FLAG_INCLUDE_PREFIX;
+    DWORD ret = GetAdaptersAddresses(AF_INET, flags, nullptr,
+                                      (PIP_ADAPTER_ADDRESSES)buf.data(), &bufLen);
+    if (ret == ERROR_BUFFER_OVERFLOW) {
+        buf.resize(bufLen);
+        ret = GetAdaptersAddresses(AF_INET, flags, nullptr,
+                                    (PIP_ADAPTER_ADDRESSES)buf.data(), &bufLen);
+    }
+    if (ret != NO_ERROR) return result;
+
+    for (auto* adapter = (PIP_ADAPTER_ADDRESSES)buf.data(); adapter; adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp) continue;
+        if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        if (adapter->IfType != IF_TYPE_ETHERNET_CSMACD &&
+            adapter->IfType != IF_TYPE_IEEE80211) continue;
+
+        for (auto* ua = adapter->FirstUnicastAddress; ua; ua = ua->Next) {
+            if (ua->Address.lpSockaddr->sa_family != AF_INET) continue;
+            sockaddr_in* sa = (sockaddr_in*)ua->Address.lpSockaddr;
+            char ipStr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &sa->sin_addr, ipStr, sizeof(ipStr));
+            std::string ip(ipStr);
+            if (ip == "127.0.0.1") continue;
+
+            DetectedNic nic;
+            int wlen = (int)wcslen(adapter->FriendlyName);
+            int mbLen = WideCharToMultiByte(CP_UTF8, 0, adapter->FriendlyName, wlen, nullptr, 0, nullptr, nullptr);
+            nic.adapterName.resize(mbLen);
+            WideCharToMultiByte(CP_UTF8, 0, adapter->FriendlyName, wlen, nic.adapterName.data(), mbLen, nullptr, nullptr);
+            nic.ipAddress = ip;
+            nic.speed = adapter->TransmitLinkSpeed;
+            wlen = (int)wcslen(adapter->Description);
+            mbLen = WideCharToMultiByte(CP_UTF8, 0, adapter->Description, wlen, nullptr, 0, nullptr, nullptr);
+            nic.description.resize(mbLen);
+            WideCharToMultiByte(CP_UTF8, 0, adapter->Description, wlen, nic.description.data(), mbLen, nullptr, nullptr);
+            result.push_back(std::move(nic));
+        }
+    }
+    return result;
+}
+
+class SimpleDropSource : public IDropSource {
+    LONG m_ref = 1;
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IDropSource) { *ppv = this; AddRef(); return S_OK; }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&m_ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&m_ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL fEscapePressed, DWORD grfKeyState) override {
+        if (fEscapePressed) return DRAGDROP_S_CANCEL;
+        if (!(grfKeyState & MK_LBUTTON)) return DRAGDROP_S_DROP;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
+};
+
+class SimpleDataObject : public IDataObject {
+    LONG m_ref = 1;
+    struct Entry { FORMATETC fmt; STGMEDIUM stg; };
+    std::vector<Entry> m_entries;
+
+    static HGLOBAL dupGlobal(HGLOBAL src) {
+        if (!src) return nullptr;
+        SIZE_T sz = GlobalSize(src);
+        HGLOBAL dst = GlobalAlloc(GHND, sz);
+        if (!dst) return nullptr;
+        void* s = GlobalLock(src); void* d = GlobalLock(dst);
+        memcpy(d, s, sz);
+        GlobalUnlock(dst); GlobalUnlock(src);
+        return dst;
+    }
+    static bool fmtMatch(const FORMATETC& a, const FORMATETC& b) {
+        return a.cfFormat == b.cfFormat && a.dwAspect == b.dwAspect && a.lindex == b.lindex;
+    }
+public:
+    ~SimpleDataObject() {
+        for (auto& e : m_entries) ReleaseStgMedium(&e.stg);
+    }
+
+    void setHDrop(const std::vector<std::wstring>& files) {
+        size_t totalChars = 0;
+        for (auto& f : files) totalChars += f.size() + 1;
+        totalChars += 1;
+        size_t bufSize = sizeof(DROPFILES) + totalChars * sizeof(wchar_t);
+
+        HGLOBAL hGlobal = GlobalAlloc(GHND, bufSize);
+        if (!hGlobal) return;
+        auto* df = (DROPFILES*)GlobalLock(hGlobal);
+        df->pFiles = sizeof(DROPFILES);
+        df->fWide = TRUE;
+        wchar_t* dst = (wchar_t*)((char*)df + sizeof(DROPFILES));
+        for (auto& f : files) {
+            memcpy(dst, f.c_str(), (f.size() + 1) * sizeof(wchar_t));
+            dst += f.size() + 1;
+        }
+        *dst = L'\0';
+        GlobalUnlock(hGlobal);
+
+        Entry e{};
+        e.fmt.cfFormat = CF_HDROP;
+        e.fmt.dwAspect = DVASPECT_CONTENT;
+        e.fmt.lindex = -1;
+        e.fmt.tymed = TYMED_HGLOBAL;
+        e.stg.tymed = TYMED_HGLOBAL;
+        e.stg.hGlobal = hGlobal;
+        m_entries.push_back(e);
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IDataObject) { *ppv = this; AddRef(); return S_OK; }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&m_ref); }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG r = InterlockedDecrement(&m_ref); if (!r) delete this; return r; }
+    HRESULT STDMETHODCALLTYPE GetData(FORMATETC* fmt, STGMEDIUM* stg) override {
+        for (auto& e : m_entries) {
+            if (fmtMatch(e.fmt, *fmt) && (e.fmt.tymed & fmt->tymed)) {
+                stg->tymed = e.stg.tymed;
+                stg->pUnkForRelease = nullptr;
+                if (e.stg.tymed == TYMED_HGLOBAL) {
+                    stg->hGlobal = dupGlobal(e.stg.hGlobal);
+                    if (!stg->hGlobal) return E_OUTOFMEMORY;
+                    return S_OK;
+                } else if (e.stg.tymed == TYMED_ISTREAM) {
+                    stg->pstm = e.stg.pstm;
+                    if (stg->pstm) stg->pstm->AddRef();
+                    return S_OK;
+                } else if (e.stg.tymed == TYMED_GDI) {
+                    stg->hBitmap = e.stg.hBitmap;
+                    return S_OK;
+                }
+                return DV_E_TYMED;
+            }
+        }
+        return DV_E_FORMATETC;
+    }
+    HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* fmt) override {
+        for (auto& e : m_entries) {
+            if (fmtMatch(e.fmt, *fmt) && (e.fmt.tymed & fmt->tymed)) return S_OK;
+        }
+        return DV_E_FORMATETC;
+    }
+    HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*, FORMATETC* out) override {
+        out->ptd = nullptr; return DATA_S_SAMEFORMATETC;
+    }
+    HRESULT STDMETHODCALLTYPE SetData(FORMATETC* fmt, STGMEDIUM* stg, BOOL fRelease) override {
+        if (!fmt || !stg) return E_INVALIDARG;
+        // Replace existing entry of same format
+        for (auto it = m_entries.begin(); it != m_entries.end(); ++it) {
+            if (fmtMatch(it->fmt, *fmt)) {
+                ReleaseStgMedium(&it->stg);
+                m_entries.erase(it);
+                break;
+            }
+        }
+        Entry e{};
+        e.fmt = *fmt;
+        if (fRelease) {
+            e.stg = *stg;
+        } else {
+            // Copy the medium
+            e.stg.tymed = stg->tymed;
+            e.stg.pUnkForRelease = nullptr;
+            if (stg->tymed == TYMED_HGLOBAL) {
+                e.stg.hGlobal = dupGlobal(stg->hGlobal);
+                if (!e.stg.hGlobal) return E_OUTOFMEMORY;
+            } else if (stg->tymed == TYMED_ISTREAM) {
+                e.stg.pstm = stg->pstm;
+                if (e.stg.pstm) e.stg.pstm->AddRef();
+            } else {
+                e.stg = *stg;
+            }
+        }
+        m_entries.push_back(e);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD dir, IEnumFORMATETC** ppEnum) override {
+        if (dir != DATADIR_GET) { *ppEnum = nullptr; return E_NOTIMPL; }
+        std::vector<FORMATETC> fmts;
+        for (auto& e : m_entries) fmts.push_back(e.fmt);
+        return SHCreateStdEnumFmtEtc((UINT)fmts.size(), fmts.empty() ? nullptr : fmts.data(), ppEnum);
+    }
+    HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override { return OLE_E_ADVISENOTSUPPORTED; }
+    HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override { return OLE_E_ADVISENOTSUPPORTED; }
+    HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA**) override { return OLE_E_ADVISENOTSUPPORTED; }
+};
+
+// Shared state for AdbPullStream — held via shared_ptr so the producer thread
+// can outlive the IStream object on cancel without us blocking IStream::Release.
+struct AdbStreamState {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::deque<std::vector<char>> queue;
+    size_t queueBytes = 0;
+    size_t frontConsumed = 0;
+    uint64_t pos = 0;
+    bool eof = false;
+    bool aborted = false;
+};
+
+// IStream that streams a remote file via a producer thread running
+// DeviceClient::readRangeStreaming. State is shared with the producer so
+// destruction is non-blocking — abort flag is set, the producer is detached,
+// and it cleans up when the device finishes draining.
+class AdbPullStream : public IStream {
+    LONG m_ref = 1;
+    std::string m_remotePath;
+    DeviceClient* m_dev = nullptr;
+    uint64_t m_size = 0;
+    std::wstring m_name;
+    std::shared_ptr<AdbStreamState> m_state;
+    bool m_producerStarted = false;
+    std::atomic<int>* m_inflightCounter = nullptr;
+
+    static constexpr size_t kMaxQueue = 128 * 1024 * 1024; // 128 MiB read-ahead cap
+
+    // Caller holds m_state->mtx. Aborts any prior producer (detached) and starts
+    // a new one at startOffset. The new producer captures a fresh shared_ptr to
+    // its own state — restarting effectively replaces m_state.
+    void restartProducerLocked(std::unique_lock<std::mutex>& lk, uint64_t startOffset) {
+        // Signal the current producer to abort and detach it; it will finish
+        // draining on its own and then drop its shared_ptr<State>.
+        m_state->aborted = true;
+        m_state->cv.notify_all();
+        lk.unlock();
+
+        // New, independent state for the new producer / consumer pair.
+        auto fresh = std::make_shared<AdbStreamState>();
+        fresh->pos = startOffset;
+        m_state = fresh;
+        lk = std::unique_lock<std::mutex>(m_state->mtx);
+        m_producerStarted = true;
+        if (startOffset >= m_size) { m_state->eof = true; return; }
+
+        std::shared_ptr<AdbStreamState> stateRef = m_state;
+        DeviceClient* dev = m_dev;
+        std::string remote = m_remotePath;
+        uint64_t length = m_size - startOffset;
+        std::atomic<int>* inflight = m_inflightCounter;
+        std::thread([stateRef, dev, remote, startOffset, length, inflight]() {
+            if (inflight) inflight->fetch_add(1);
+            dev->readRangeStreaming(remote, startOffset, length,
+                [stateRef](const void* data, uint32_t len, uint64_t /*offset*/) -> bool {
+                    // Apply backpressure first (mutex briefly held).
+                    {
+                        std::unique_lock<std::mutex> lk(stateRef->mtx);
+                        stateRef->cv.wait(lk, [&] {
+                            return stateRef->aborted || stateRef->queueBytes < kMaxQueue;
+                        });
+                        if (stateRef->aborted) return false;
+                    }
+                    // Copy out of the device's reusable buffer outside the lock so
+                    // the consumer is not blocked during the per-chunk memcpy.
+                    std::vector<char> chunk((const char*)data, (const char*)data + len);
+                    {
+                        std::lock_guard<std::mutex> lk(stateRef->mtx);
+                        if (stateRef->aborted) return false;
+                        stateRef->queue.push_back(std::move(chunk));
+                        stateRef->queueBytes += len;
+                        stateRef->cv.notify_all();
+                    }
+                    return true;
+                });
+            {
+                std::lock_guard<std::mutex> lk(stateRef->mtx);
+                stateRef->eof = true;
+                stateRef->cv.notify_all();
+            }
+            if (inflight) inflight->fetch_sub(1);
+        }).detach();
+    }
+
+public:
+    AdbPullStream(std::string remotePath, DeviceClient* dev, uint64_t size, std::wstring name,
+                  std::atomic<int>* inflight)
+        : m_remotePath(std::move(remotePath)), m_dev(dev), m_size(size), m_name(std::move(name)),
+          m_state(std::make_shared<AdbStreamState>()), m_inflightCounter(inflight) {}
+    ~AdbPullStream() {
+        // Tell the (possibly running) producer to abort; do NOT join — we want
+        // IStream::Release to return immediately so Explorer's cancel is fast.
+        std::lock_guard<std::mutex> lk(m_state->mtx);
+        m_state->aborted = true;
+        m_state->cv.notify_all();
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_ISequentialStream || riid == IID_IStream) {
+            *ppv = this; AddRef(); return S_OK;
+        }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&m_ref); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = InterlockedDecrement(&m_ref);
+        if (!r) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE Read(void* pv, ULONG cb, ULONG* pcbRead) override {
+        if (pcbRead) *pcbRead = 0;
+        std::unique_lock<std::mutex> lk(m_state->mtx);
+        if (!m_producerStarted) restartProducerLocked(lk, m_state->pos);
+        auto* st = m_state.get();
+        if (st->pos >= m_size) return S_FALSE;
+        ULONG written = 0;
+        while (written < cb && st->pos < m_size) {
+            if (st->queue.empty()) {
+                if (st->eof) break;
+                st->cv.wait(lk, [&] { return !st->queue.empty() || st->eof || st->aborted; });
+                if (st->aborted) return E_FAIL;
+                continue;
+            }
+            auto& front = st->queue.front();
+            size_t avail = front.size() - st->frontConsumed;
+            size_t want = cb - written;
+            size_t take = (avail < want) ? avail : want;
+            memcpy((char*)pv + written, front.data() + st->frontConsumed, take);
+            written += (ULONG)take;
+            st->frontConsumed += take;
+            st->pos += take;
+            st->queueBytes -= take;
+            if (st->frontConsumed == front.size()) {
+                st->queue.pop_front();
+                st->frontConsumed = 0;
+            }
+            st->cv.notify_all();
+        }
+        if (pcbRead) *pcbRead = written;
+        if (written == 0) return S_FALSE;
+        return (written < cb) ? S_FALSE : S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Write(const void*, ULONG, ULONG*) override { return STG_E_ACCESSDENIED; }
+    HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER off, DWORD origin, ULARGE_INTEGER* newPos) override {
+        std::unique_lock<std::mutex> lk(m_state->mtx);
+        auto* st = m_state.get();
+        int64_t base = 0;
+        if (origin == STREAM_SEEK_SET) base = 0;
+        else if (origin == STREAM_SEEK_CUR) base = (int64_t)st->pos;
+        else if (origin == STREAM_SEEK_END) base = (int64_t)m_size;
+        else return STG_E_INVALIDFUNCTION;
+        int64_t np = base + off.QuadPart;
+        if (np < 0) return STG_E_INVALIDFUNCTION;
+        uint64_t want = (uint64_t)np;
+        if (want == st->pos) {
+            if (newPos) newPos->QuadPart = st->pos;
+            return S_OK;
+        }
+        if (want > st->pos && (want - st->pos) <= st->queueBytes) {
+            uint64_t skip = want - st->pos;
+            while (skip > 0 && !st->queue.empty()) {
+                auto& front = st->queue.front();
+                size_t avail = front.size() - st->frontConsumed;
+                size_t take = (size_t)((skip < avail) ? skip : avail);
+                st->frontConsumed += take;
+                st->queueBytes -= take;
+                skip -= take;
+                st->pos += take;
+                if (st->frontConsumed == front.size()) {
+                    st->queue.pop_front();
+                    st->frontConsumed = 0;
+                }
+            }
+            st->cv.notify_all();
+            if (newPos) newPos->QuadPart = st->pos;
+            return S_OK;
+        }
+        // Restart producer at new offset (replaces m_state).
+        restartProducerLocked(lk, want);
+        if (newPos) newPos->QuadPart = m_state->pos;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER) override { return STG_E_ACCESSDENIED; }
+    HRESULT STDMETHODCALLTYPE CopyTo(IStream* dst, ULARGE_INTEGER cb,
+                                     ULARGE_INTEGER* read, ULARGE_INTEGER* written) override {
+        ULARGE_INTEGER tot{}; ULARGE_INTEGER w{};
+        std::vector<char> buf(1 << 20); // 1 MiB
+        while (cb.QuadPart > 0) {
+            ULONG to = (ULONG)((cb.QuadPart < buf.size()) ? cb.QuadPart : buf.size());
+            ULONG got = 0;
+            HRESULT hr = Read(buf.data(), to, &got);
+            if (FAILED(hr)) return hr;
+            if (got == 0) break;
+            tot.QuadPart += got;
+            ULONG ww = 0;
+            if (dst) dst->Write(buf.data(), got, &ww);
+            w.QuadPart += ww;
+            cb.QuadPart -= got;
+            if (got < to) break;
+        }
+        if (read) *read = tot;
+        if (written) *written = w;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Commit(DWORD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Revert() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
+    HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
+    HRESULT STDMETHODCALLTYPE Stat(STATSTG* p, DWORD flags) override {
+        if (!p) return E_POINTER;
+        memset(p, 0, sizeof(*p));
+        if (!(flags & STATFLAG_NONAME)) {
+            size_t nb = (m_name.size() + 1) * sizeof(wchar_t);
+            p->pwcsName = (LPOLESTR)CoTaskMemAlloc(nb);
+            if (p->pwcsName) memcpy(p->pwcsName, m_name.c_str(), nb);
+        }
+        p->type = STGTY_STREAM;
+        p->cbSize.QuadPart = m_size;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Clone(IStream**) override { return E_NOTIMPL; }
+};
+
+// Register virtual files (FILEGROUPDESCRIPTORW + per-index FILECONTENTS streams)
+// on the data object. Streams ownership is transferred (refcount stays at the
+// caller's, we AddRef when we store).
+static void setVirtualFilesOnDataObject(SimpleDataObject* obj,
+                                        const std::vector<std::wstring>& names,
+                                        const std::vector<uint64_t>& sizes,
+                                        const std::vector<IStream*>& streams) {
+    UINT cfDesc = RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW);
+    UINT cfCont = RegisterClipboardFormatW(CFSTR_FILECONTENTS);
+
+    // Build FILEGROUPDESCRIPTORW
+    size_t n = names.size();
+    size_t bufSize = sizeof(FILEGROUPDESCRIPTORW) + (n - 1) * sizeof(FILEDESCRIPTORW);
+    HGLOBAL hg = GlobalAlloc(GHND, bufSize);
+    if (hg) {
+        auto* fgd = (FILEGROUPDESCRIPTORW*)GlobalLock(hg);
+        fgd->cItems = (UINT)n;
+        for (size_t i = 0; i < n; i++) {
+            FILEDESCRIPTORW& fd = fgd->fgd[i];
+            fd.dwFlags = FD_FILESIZE | FD_PROGRESSUI;
+            fd.nFileSizeLow = (DWORD)(sizes[i] & 0xFFFFFFFF);
+            fd.nFileSizeHigh = (DWORD)(sizes[i] >> 32);
+            const std::wstring& nm = names[i];
+            size_t copy = nm.size() < (MAX_PATH - 1) ? nm.size() : (MAX_PATH - 1);
+            memcpy(fd.cFileName, nm.c_str(), copy * sizeof(wchar_t));
+            fd.cFileName[copy] = L'\0';
+        }
+        GlobalUnlock(hg);
+
+        FORMATETC fmt{};
+        fmt.cfFormat = (CLIPFORMAT)cfDesc;
+        fmt.dwAspect = DVASPECT_CONTENT;
+        fmt.lindex = -1;
+        fmt.tymed = TYMED_HGLOBAL;
+        STGMEDIUM stg{};
+        stg.tymed = TYMED_HGLOBAL;
+        stg.hGlobal = hg;
+        obj->SetData(&fmt, &stg, TRUE);
+    }
+
+    // Per-index FILECONTENTS
+    for (size_t i = 0; i < n; i++) {
+        FORMATETC fmt{};
+        fmt.cfFormat = (CLIPFORMAT)cfCont;
+        fmt.dwAspect = DVASPECT_CONTENT;
+        fmt.lindex = (LONG)i;
+        fmt.tymed = TYMED_ISTREAM;
+        STGMEDIUM stg{};
+        stg.tymed = TYMED_ISTREAM;
+        stg.pstm = streams[i];
+        if (stg.pstm) stg.pstm->AddRef();
+        obj->SetData(&fmt, &stg, TRUE);
+    }
+}
+
+// Build a small RGB bitmap with drag label text. Caller owns the returned HBITMAP.
+static HBITMAP createDragLabelBitmap(const std::wstring& label, COLORREF& outColorKey) {
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    LOGFONTW lf{};
+    GetObjectW(font, sizeof(lf), &lf);
+    lf.lfHeight = -16;
+    HFONT bigFont = CreateFontIndirectW(&lf);
+
+    HFONT oldFont = (HFONT)SelectObject(mem, bigFont);
+    RECT measure{0,0,0,0};
+    DrawTextW(mem, label.c_str(), -1, &measure, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    int w = measure.right + 16;
+    int h = measure.bottom + 8;
+    if (w < 64) w = 64;
+    if (h < 24) h = 24;
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+
+    // Magenta color key background
+    outColorKey = RGB(255, 0, 255);
+    HBRUSH bgBrush = CreateSolidBrush(outColorKey);
+    RECT full{0,0,w,h};
+    FillRect(mem, &full, bgBrush);
+    DeleteObject(bgBrush);
+
+    // Rounded panel
+    HBRUSH panelBrush = CreateSolidBrush(RGB(30, 50, 80));
+    HPEN panelPen = CreatePen(PS_SOLID, 1, RGB(80, 130, 200));
+    HBRUSH oldBrush = (HBRUSH)SelectObject(mem, panelBrush);
+    HPEN oldPen = (HPEN)SelectObject(mem, panelPen);
+    RoundRect(mem, 0, 0, w, h, 8, 8);
+    SelectObject(mem, oldBrush);
+    SelectObject(mem, oldPen);
+    DeleteObject(panelBrush);
+    DeleteObject(panelPen);
+
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, RGB(220, 235, 255));
+    RECT textRect{8, 4, w - 8, h - 4};
+    DrawTextW(mem, label.c_str(), -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+
+    SelectObject(mem, oldFont);
+    SelectObject(mem, oldBmp);
+    DeleteObject(bigFont);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    return bmp;
+}
+
+// Attach a label drag image to the data object via IDragSourceHelper2.
+static void attachDragImage(IDataObject* dataObj, const std::wstring& label) {
+    IDragSourceHelper2* dsh2 = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_DragDropHelper, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dsh2)))) return;
+    SHDRAGIMAGE img{};
+    COLORREF key = 0;
+    img.hbmpDragImage = createDragLabelBitmap(label, key);
+    if (img.hbmpDragImage) {
+        BITMAP bm{};
+        GetObject(img.hbmpDragImage, sizeof(bm), &bm);
+        img.sizeDragImage.cx = bm.bmWidth;
+        img.sizeDragImage.cy = bm.bmHeight;
+        img.ptOffset.x = bm.bmWidth / 2;
+        img.ptOffset.y = bm.bmHeight / 2;
+        img.crColorKey = key;
+        if (FAILED(dsh2->InitializeFromBitmap(&img, dataObj))) {
+            DeleteObject(img.hbmpDragImage);
+        }
+    }
+    dsh2->Release();
+}
+
+static std::wstring buildDragLabel(const std::vector<std::wstring>& items) {
+    if (items.size() == 1) {
+        const std::wstring& p = items[0];
+        size_t slash = p.find_last_of(L"\\/");
+        return (slash == std::wstring::npos) ? p : p.substr(slash + 1);
+    }
+    return std::to_wstring(items.size()) + L" files";
+}
+
+void App::performOleDragDrop(const std::vector<std::string>& filePaths) {
+    std::vector<std::wstring> wPaths;
+    for (auto& p : filePaths) {
+        int len = MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, nullptr, 0);
+        std::wstring wp(len - 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, wp.data(), len);
+        wPaths.push_back(std::move(wp));
+    }
+    auto* dataObj = new SimpleDataObject();
+    dataObj->setHDrop(wPaths);
+    auto* dropSrc = new SimpleDropSource();
+
+    attachDragImage(dataObj, buildDragLabel(wPaths));
+
+    DWORD effect = 0;
+    DoDragDrop(dataObj, dropSrc, DROPEFFECT_COPY | DROPEFFECT_MOVE, &effect);
+
+    // If Explorer performed a move, delete the source files
+    if (effect == DROPEFFECT_MOVE) {
+        for (auto& p : filePaths) {
+            try { std::filesystem::remove(toFsPath(p)); } catch (...) {}
+        }
+    }
+
+    // Clear selection on the source panel so it doesn't look stuck after the drop.
+    if (m_dragSourcePanel) {
+        m_dragSourcePanel->selectedIndices.clear();
+        m_dragSourcePanel->focusedIndex = -1;
+    }
+    m_dragSourcePanel = nullptr;
+
+    // Refresh panels after any drag-out (file may have been moved/copied)
+    m_leftPanel.needsRefresh = true;
+    m_rightPanel.needsRefresh = true;
+
+    dropSrc->Release();
+    dataObj->Release();
+}
+
+void App::performAndroidDragOut(FilePanel* src) {
+    if (!src || !src->isAndroid) return;
+    DeviceClient* dev = &deviceFor(*src);
+    if (!dev->isServerRunning()) return;
+
+    std::vector<std::string> remotePaths;
+    std::vector<std::wstring> wNames;
+    std::vector<uint64_t> sizes;
+    for (int idx : src->selectedIndices) {
+        if (!src->validIndex(idx)) continue;
+        if (src->entryIsDir(idx)) continue;
+        std::string name = src->entryName(idx);
+        std::string remotePath = src->currentPath;
+        appendPathSeparator(remotePath, '/');
+        remotePath += name;
+        remotePaths.push_back(remotePath);
+        wNames.push_back(toWide(name));
+        sizes.push_back(src->entrySize(idx));
+    }
+    if (remotePaths.empty()) return;
+
+    std::string serial = dev->connectedSerial();
+    FilePanel* srcPanel = src;
+    DWORD uiThreadId = GetCurrentThreadId();
+
+    // Run DoDragDrop on a dedicated STA thread so Explorer's IStream::Read calls
+    // (which may pull large files via ADB) don't block the UI thread.
+    std::thread worker([this, dev, serial, remotePaths, wNames, sizes, srcPanel, uiThreadId]() {
+        OleInitialize(nullptr);
+        // Share input state with the UI thread so DoDragDrop sees the live mouse
+        // button state and can render the drag image as the user moves the cursor.
+        AttachThreadInput(GetCurrentThreadId(), uiThreadId, TRUE);
+
+        auto* dataObj = new SimpleDataObject();
+        auto* dropSrc = new SimpleDropSource();
+
+        std::vector<IStream*> streams;
+        streams.reserve(remotePaths.size());
+        for (size_t i = 0; i < remotePaths.size(); i++) {
+            streams.push_back(new AdbPullStream(remotePaths[i], dev, sizes[i], wNames[i],
+                                                &m_androidDragInflight));
+        }
+        setVirtualFilesOnDataObject(dataObj, wNames, sizes, streams);
+        for (auto* s : streams) s->Release();
+
+        attachDragImage(dataObj, buildDragLabel(wNames));
+
+        DWORD effect = 0;
+        DoDragDrop(dataObj, dropSrc, DROPEFFECT_COPY | DROPEFFECT_MOVE, &effect);
+
+        dropSrc->Release();
+        dataObj->Release();
+
+        if (srcPanel) {
+            srcPanel->selectedIndices.clear();
+            srcPanel->focusedIndex = -1;
+        }
+        m_leftPanel.needsRefresh = true;
+        m_rightPanel.needsRefresh = true;
+        m_dragSourcePanel = nullptr;
+
+        AttachThreadInput(GetCurrentThreadId(), uiThreadId, FALSE);
+        OleUninitialize();
+    });
+    worker.detach();
+}
+
+// Check if a serial is a WiFi ADB connection (IP:port format like "192.168.x.x:5555")
+static bool isWifiSerial(const std::string& serial) {
+    auto colon = serial.rfind(':');
+    if (colon == std::string::npos || colon == 0) return false;
+    return serial.substr(0, colon).find('.') != std::string::npos;
+}
+
+static bool endsWithCI(const std::string& s, const std::string& suffix) {
+    if (s.size() < suffix.size()) return false;
+    return _stricmp(s.c_str() + s.size() - suffix.size(), suffix.c_str()) == 0;
+}
+
+static std::string getPrefsPath() {
+    char path[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, path))) {
+        std::string dir = std::string(path) + "\\FastEnough";
+        CreateDirectoryA(dir.c_str(), nullptr);
+        return dir + "\\preferences.ini";
+    }
+    return "";
+}
+
+void AppPreferences::save() {
+    std::string path = getPrefsPath();
+    if (path.empty()) return;
+    std::ofstream f(path);
+    if (!f) return;
+    f << "[Preferences]\n";
+    f << "restartAdbOnLaunch=" << (restartAdbOnLaunch ? 1 : 0) << "\n";
+    f << "enableCrcVerification=" << (enableCrcVerification ? 1 : 0) << "\n";
+    f << "autoDismissTransfer=" << (autoDismissTransfer ? 1 : 0) << "\n";
+    f << "wifiAutoConnect=" << (wifiAutoConnect ? 1 : 0) << "\n";
+    f << "confirmOnClose=" << (confirmOnClose ? 1 : 0) << "\n";
+    f << "killAdbOnClose=" << (killAdbOnClose ? 1 : 0) << "\n";
+    for (auto& w : savedWifiDevices) {
+        f << "wifiDevice=" << w.serial << "|" << w.wifiIp << "|" << w.port << "|" << (w.autoConnect ? 1 : 0) << "|" << w.model << "\n";
+    }
+    f << "enableMultiNic=" << (enableMultiNic ? 1 : 0) << "\n";
+    f << "pipeSettingsV2=1\n";
+    f << "usbPipeCount=" << usbPipeCount << "\n";
+    f << "wifiPipeCount=" << wifiPipeCount << "\n";
+    for (const auto& pipes : devicePipePreferences) {
+        if (!pipes.serial.empty())
+            f << "devicePipes=" << pipes.serial << "|" << pipes.usbPipeCount << "|" << pipes.wifiPipeCount << "\n";
+    }
+    for (auto& r : rootDevices) {
+        if (!r.serial.empty())
+            f << "rootDevice=" << r.serial << "|" << (r.enabled ? 1 : 0) << "\n";
+    }
+    for (auto& fav : favoritePaths) {
+        f << "favoritePath=" << (fav.isAndroid ? 1 : 0) << "|" << fav.deviceSlot << "|"
+          << fav.label << "|" << fav.path << "\n";
+    }
+    for (auto& nb : multiNicBindings) {
+        f << "nicBinding=" << nb.adapterName << "|" << nb.localIp << "|" << (nb.enabled ? 1 : 0) << "\n";
+    }
+}
+
+bool AppPreferences::rootEnabledForSerial(const std::string& serial) const {
+    if (serial.empty()) return false;
+    for (const auto& r : rootDevices)
+        if (r.serial == serial) return r.enabled;
+    return false;
+}
+
+void AppPreferences::setRootEnabledForSerial(const std::string& serial, bool enabled) {
+    if (serial.empty()) return;
+    for (auto& r : rootDevices) {
+        if (r.serial == serial) {
+            r.enabled = enabled;
+            return;
+        }
+    }
+    rootDevices.push_back({serial, enabled});
+}
+
+DevicePipePreference& AppPreferences::pipePreferencesFor(const std::string& serial) {
+    std::string key = serial;
+    for (const auto& saved : savedWifiDevices) {
+        std::string wifiSerial = saved.wifiIp.empty() ? "" : saved.wifiIp + ":" + std::to_string(saved.port);
+        if (!saved.serial.empty() && (saved.serial == serial || wifiSerial == serial)) {
+            key = saved.serial;
+            break;
+        }
+    }
+    auto it = std::find_if(devicePipePreferences.begin(), devicePipePreferences.end(),
+        [&](const DevicePipePreference& pipes) { return pipes.serial == key; });
+    if (it != devicePipePreferences.end()) return *it;
+    devicePipePreferences.push_back({key, usbPipeCount, wifiPipeCount});
+    return devicePipePreferences.back();
+}
+
+DevicePipePreference AppPreferences::pipePreferencesFor(const std::string& serial) const {
+    std::string key = serial;
+    for (const auto& saved : savedWifiDevices) {
+        std::string wifiSerial = saved.wifiIp.empty() ? "" : saved.wifiIp + ":" + std::to_string(saved.port);
+        if (!saved.serial.empty() && (saved.serial == serial || wifiSerial == serial)) {
+            key = saved.serial;
+            break;
+        }
+    }
+    auto it = std::find_if(devicePipePreferences.begin(), devicePipePreferences.end(),
+        [&](const DevicePipePreference& pipes) { return pipes.serial == key; });
+    return it != devicePipePreferences.end() ? *it : DevicePipePreference{key, usbPipeCount, wifiPipeCount};
+}
+
+void AppPreferences::load() {
+    std::string path = getPrefsPath();
+    if (path.empty()) return;
+    std::ifstream f(path);
+    if (!f) return;
+    std::string line;
+    bool pipeSettingsV2 = false;
+    bool repairedSavedWifiName = false;
+    while (std::getline(f, line)) {
+        if (line.find("restartAdbOnLaunch=") == 0)
+            restartAdbOnLaunch = (lastCharOr(line) == '1');
+        else if (line.find("enableCrcVerification=") == 0)
+            enableCrcVerification = (lastCharOr(line) == '1');
+        else if (line.find("autoDismissTransfer=") == 0)
+            autoDismissTransfer = (lastCharOr(line) == '1');
+        else if (line.find("wifiAutoConnect=") == 0)
+            wifiAutoConnect = (lastCharOr(line) == '1');
+        else if (line.find("confirmOnClose=") == 0)
+            confirmOnClose = (lastCharOr(line) == '1');
+        else if (line.find("killAdbOnClose=") == 0)
+            killAdbOnClose = (lastCharOr(line) == '1');
+        else if (line.find("wifiDevice=") == 0) {
+            std::string val = line.substr(11);
+            SavedWifiDevice w;
+            auto p1 = val.find('|'); if (p1 == std::string::npos) continue;
+            auto p2 = val.find('|', p1+1); if (p2 == std::string::npos) continue;
+            auto p3 = val.find('|', p2+1); if (p3 == std::string::npos) continue;
+            w.serial = val.substr(0, p1);
+            w.wifiIp = val.substr(p1+1, p2-p1-1);
+            w.port = std::stoi(val.substr(p2+1, p3-p2-1));
+            auto p4 = val.find('|', p3+1);
+            if (p4 != std::string::npos) {
+                w.autoConnect = (val[p3+1] == '1');
+                w.model = val.substr(p4+1);
+                std::string sanitizedModel = sanitizeDeviceDisplayValue(w.model);
+                if (sanitizedModel != w.model) {
+                    w.model = std::move(sanitizedModel);
+                    repairedSavedWifiName = true;
+                }
+            } else {
+                w.autoConnect = (lastCharOr(val) == '1');
+            }
+            savedWifiDevices.push_back(std::move(w));
+        }
+        else if (line.find("enableMultiNic=") == 0)
+            enableMultiNic = (lastCharOr(line) == '1');
+        else if (line.find("pipeSettingsV2=") == 0)
+            pipeSettingsV2 = (lastCharOr(line) == '1');
+        else if (line.find("usbPipeCount=") == 0)
+            usbPipeCount = std::clamp(std::stoi(line.substr(13)), 1, 4);
+        else if (line.find("wifiPipeCount=") == 0)
+            wifiPipeCount = std::clamp(std::stoi(line.substr(14)), 1, 4);
+        else if (line.find("devicePipes=") == 0) {
+            std::string value = line.substr(12);
+            size_t first = value.find('|'), second = first == std::string::npos ? std::string::npos : value.find('|', first + 1);
+            if (first != std::string::npos && second != std::string::npos) {
+                try {
+                    devicePipePreferences.push_back({value.substr(0, first),
+                        std::clamp(std::stoi(value.substr(first + 1, second - first - 1)), 1, 4),
+                        std::clamp(std::stoi(value.substr(second + 1)), 1, 4)});
+                } catch (...) {}
+            }
+        }
+        else if (line.find("useRoot=") == 0) {
+            // Legacy global root setting intentionally ignored. Root is now per device.
+        }
+        else if (line.find("rootDevice=") == 0) {
+            std::string val = line.substr(11);
+            auto p1 = val.find('|'); if (p1 == std::string::npos) continue;
+            RootDevicePreference r;
+            r.serial = val.substr(0, p1);
+            r.enabled = (val.substr(p1 + 1) == "1");
+            if (!r.serial.empty()) rootDevices.push_back(std::move(r));
+        }
+        else if (line.find("favoritePath=") == 0) {
+            std::string val = line.substr(13);
+            FavoritePath fav;
+            auto p1 = val.find('|'); if (p1 == std::string::npos) continue;
+            auto p2 = val.find('|', p1 + 1); if (p2 == std::string::npos) continue;
+            auto p3 = val.find('|', p2 + 1); if (p3 == std::string::npos) continue;
+            fav.isAndroid = (val.substr(0, p1) == "1");
+            try { fav.deviceSlot = std::clamp(std::stoi(val.substr(p1 + 1, p2 - p1 - 1)), 0, 1); }
+            catch (...) { fav.deviceSlot = 0; }
+            fav.label = val.substr(p2 + 1, p3 - p2 - 1);
+            fav.path = val.substr(p3 + 1);
+            if (!fav.path.empty()) favoritePaths.push_back(std::move(fav));
+        }
+        else if (line.find("nicBinding=") == 0) {
+            std::string val = line.substr(11);
+            NicBinding nb;
+            auto p1 = val.find('|'); if (p1 == std::string::npos) continue;
+            auto p2 = val.find('|', p1+1); if (p2 == std::string::npos) continue;
+            nb.adapterName = val.substr(0, p1);
+            nb.localIp = val.substr(p1+1, p2-p1-1);
+            nb.enabled = (val[p2+1] == '1');
+            multiNicBindings.push_back(std::move(nb));
+        }
+    }
+
+    // Older builds only allowed up to 2 pipes. Treat the old maximum as
+    // "high speed" and migrate it to the new maximum once.
+    if (!pipeSettingsV2) {
+        if (usbPipeCount == 2) usbPipeCount = 4;
+        if (wifiPipeCount == 2) wifiPipeCount = 4;
+    }
+    if (repairedSavedWifiName) {
+        f.close();
+        save();
+    }
+}
+
+std::string AppTheme::getThemePath() {
+    char path[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, path))) {
+        std::string dir = std::string(path) + "\\FastEnough";
+        CreateDirectoryA(dir.c_str(), nullptr);
+        return dir + "\\theme.ini";
+    }
+    return "";
+}
+
+void AppTheme::save() {
+    std::string path = getThemePath();
+    if (path.empty()) return;
+    std::ofstream f(path);
+    if (!f) return;
+    f << "[Theme]\n";
+    f << "userScale=" << userScale << "\n";
+    f << "mode=" << mode << "\n";
+    f << "gradientPrimary=" << gradientPrimary.x << "," << gradientPrimary.y << ","
+      << gradientPrimary.z << "," << gradientPrimary.w << "\n";
+    f << "gradientSecondary=" << gradientSecondary.x << "," << gradientSecondary.y << ","
+      << gradientSecondary.z << "," << gradientSecondary.w << "\n";
+    f << "gradientStrength=" << gradientStrength << "\n";
+    f << "customColors=" << (customColors ? 1 : 0) << "\n";
+    if (customColors) {
+        for (int i = 0; i < ImGuiCol_COUNT; i++) {
+            f << "color" << i << "="
+              << colors[i].x << "," << colors[i].y << ","
+              << colors[i].z << "," << colors[i].w << "\n";
+        }
+    }
+}
+
+void AppTheme::load() {
+    std::string path = getThemePath();
+    if (path.empty()) return;
+    std::ifstream f(path);
+    if (!f) return;
+    std::string line;
+    bool hasAdaptiveThemeSettings = false;
+    while (std::getline(f, line)) {
+        if (line.find("userScale=") == 0) {
+            userScale = std::stof(line.substr(10));
+            if (userScale < 0.5f) userScale = 0.5f;
+            if (userScale > 3.0f) userScale = 3.0f;
+        } else if (line.find("mode=") == 0) {
+            mode = std::clamp(std::stoi(line.substr(5)), 0, 2);
+            hasAdaptiveThemeSettings = true;
+        } else if (line.find("gradientPrimary=") == 0) {
+            sscanf(line.c_str() + 16, "%f,%f,%f,%f", &gradientPrimary.x, &gradientPrimary.y,
+                &gradientPrimary.z, &gradientPrimary.w);
+            hasAdaptiveThemeSettings = true;
+        } else if (line.find("gradientSecondary=") == 0) {
+            sscanf(line.c_str() + 18, "%f,%f,%f,%f", &gradientSecondary.x, &gradientSecondary.y,
+                &gradientSecondary.z, &gradientSecondary.w);
+        } else if (line.find("gradientStrength=") == 0) {
+            gradientStrength = std::clamp(std::stof(line.substr(17)), 0.0f, 1.0f);
+        } else if (line.find("customColors=") == 0) {
+            customColors = (lastCharOr(line) == '1');
+        } else if (line.find("color") == 0) {
+            // Parse "colorN=r,g,b,a"
+            auto eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            int idx = std::stoi(line.substr(5, eq - 5));
+            if (idx < 0 || idx >= ImGuiCol_COUNT) continue;
+            std::string vals = line.substr(eq + 1);
+            float r, g, b, a;
+            if (sscanf(vals.c_str(), "%f,%f,%f,%f", &r, &g, &b, &a) == 4) {
+                colors[idx] = ImVec4(r, g, b, a);
+            }
+        }
+    }
+    if (!hasAdaptiveThemeSettings)
+        customColors = false;
+}
+
+// Defined in main.cpp — for real quit (bypassing minimize-to-tray)
+extern bool g_reallyQuit;
+extern HWND g_mainHwnd;
+
+// IFileOperation-based delete: recycle bin or permanent
+static bool deleteWindowsFiles(const std::vector<std::string>& paths, bool permanent, std::string& error) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    bool needUninit = SUCCEEDED(hr);
+
+    IFileOperation* pfo = nullptr;
+    hr = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&pfo));
+    if (FAILED(hr)) {
+        error = "Failed to create IFileOperation";
+        if (needUninit) CoUninitialize();
+        return false;
+    }
+
+    DWORD flags = FOF_NOCONFIRMATION | FOF_SILENT;
+    if (!permanent) flags |= FOFX_RECYCLEONDELETE;
+    // FOF_ALLOWUNDO also enables recycle for older behavior
+    if (!permanent) flags |= FOF_ALLOWUNDO;
+
+    pfo->SetOperationFlags(flags);
+
+    for (const auto& path : paths) {
+        // Convert to wide string
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        std::wstring wpath(wlen, 0);
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+
+        IShellItem* pItem = nullptr;
+        hr = SHCreateItemFromParsingName(wpath.c_str(), nullptr, IID_PPV_ARGS(&pItem));
+        if (SUCCEEDED(hr)) {
+            pfo->DeleteItem(pItem, nullptr);
+            pItem->Release();
+        }
+    }
+
+    hr = pfo->PerformOperations();
+    pfo->Release();
+    if (needUninit) CoUninitialize();
+
+    if (FAILED(hr)) {
+        error = "Delete operation failed (HRESULT: " + std::to_string(hr) + ")";
+        return false;
+    }
+    return true;
+}
+
+App::App() {
+    m_prefs.load();
+    m_theme.load();
+
+    // Second device uses a different local port for ADB forward
+    m_deviceSlots[1].setLocalPort(AFM_PORT + 1);
+    // Secondary channel (dual-channel WiFi) uses a different port to avoid ADB forward collision
+    m_secondaryChannel.setLocalPort(AFM_PORT + 2);
+
+    m_leftPanel.isAndroid = false;
+    m_leftPanel.currentPath = "C:\\";
+    strcpy_s(m_leftPanel.pathInput, m_leftPanel.currentPath.c_str());
+
+    m_rightPanel.isAndroid = true;
+    m_rightPanel.currentPath = "/";  // will be updated once device is detected
+    strcpy_s(m_rightPanel.pathInput, m_rightPanel.currentPath.c_str());
+
+    m_shutdownTransfer = false;
+    m_batchThread = std::thread([this]() { processBatchQueue(); });
+
+    m_shutdownPoll = false;
+    m_pollThread = std::thread([this]() { devicePollLoop(); });
+
+    m_asyncThread = std::thread([this]() { asyncWorkerLoop(); });
+
+    // setupStyle sets base sizes + colors, then we scale for DPI + user preference
+    // m_systemDpiScale is set by main.cpp AFTER construction, so initial scaling
+    // is handled by applyScale() called from the first render frame.
+    // For now, set base style — main.cpp will set m_systemDpiScale and the first
+    // render handles the rest.
+    setupStyle();
+}
+
+App::~App() {
+    m_shutdownTransfer = true;
+    m_shutdownPoll = true;
+    m_batchCV.notify_all();
+    m_asyncCV.notify_all();
+    if (m_batchThread.joinable()) m_batchThread.join();
+    if (m_pollThread.joinable()) m_pollThread.join();
+    if (m_asyncThread.joinable()) m_asyncThread.join();
+
+    // Release wakelock process if still running
+    if (m_wakeLockProcess) {
+        TerminateProcess(m_wakeLockProcess, 0);
+        CloseHandle(m_wakeLockProcess);
+        m_wakeLockProcess = nullptr;
+    }
+
+    // Stop the device server first (cleans up ADB forwarding, kills afm-server on device).
+    // This must happen before kill-server, because any adb command auto-starts the daemon.
+    m_device.stopServer();
+
+    // Unmount all mounts
+    DeviceMountManager::instance(0).unmount();
+    DeviceMountManager::instance(1).unmount();
+    McrawMountManager::instance().unmountAll();
+
+    // Kill ADB server last — after all ADB commands are done.
+    // DeviceClient::~DeviceClient() calls stopServer() again but it's a no-op (serial is cleared).
+    if (m_prefs.killAdbOnClose) {
+        m_device.runAdbCommand("kill-server");
+    }
+}
+
+void App::asyncWorkerLoop() {
+    while (!m_shutdownPoll) {
+        std::function<void()> action;
+        {
+            std::unique_lock<std::mutex> lk(m_asyncMutex);
+            m_asyncCV.wait(lk, [&]() { return m_shutdownPoll || !m_asyncQueue.empty(); });
+            if (m_shutdownPoll) return;
+            action = std::move(m_asyncQueue.front());
+            m_asyncQueue.pop_front();
+        }
+        m_asyncBusy = true;
+        try {
+            action();
+        } catch (const std::exception& e) {
+            LOG_ERROR("Async", std::string("Background task failed: ") + e.what());
+            UiMessage message;
+            message.hasNotification = true;
+            message.notificationTitle = "Operation Failed";
+            message.notificationMessage = e.what();
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        } catch (...) {
+            LOG_ERROR("Async", "Background task failed with an unknown exception");
+            UiMessage message;
+            message.hasNotification = true;
+            message.notificationTitle = "Operation Failed";
+            message.notificationMessage = "Unexpected background task failure.";
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        }
+        m_asyncBusy = false;
+        m_asyncStatus.clear();
+    }
+}
+
+void App::postAsync(const std::string& statusMsg, std::function<void()> action) {
+    {
+        std::lock_guard<std::mutex> lk(m_asyncMutex);
+        m_asyncStatus = statusMsg;
+        m_asyncQueue.push_back(std::move(action));
+    }
+    m_asyncCV.notify_one();
+}
+
+void App::postUiMessage(UiMessage message) {
+    std::lock_guard<std::mutex> lk(m_uiMessageMutex);
+    m_uiMessages.push_back(std::move(message));
+}
+
+void App::drainUiMessages() {
+    std::deque<UiMessage> messages;
+    {
+        std::lock_guard<std::mutex> lk(m_uiMessageMutex);
+        messages.swap(m_uiMessages);
+    }
+
+    for (auto& message : messages) {
+        if (message.setBackupApps) {
+            m_backupManagerApps = std::move(message.backupApps);
+            m_backupManagerAppSelectionAnchor = -1;
+        }
+        if (message.markBackupAppsFresh) {
+            m_backupManagerNeedsAppRefresh = false;
+        }
+        if (message.refreshBackupList) {
+            m_backupManagerNeedsBackupRefresh = true;
+        }
+        if (message.refreshAppList) {
+            m_backupManagerNeedsAppRefresh = true;
+        }
+        if (message.backupRootProbeComplete && message.backupRootSlot == (m_backupManagerSlot & 1) &&
+            message.backupRootSerial == m_slotSerial[m_backupManagerSlot & 1]) {
+            m_backupRootAccessSerial = message.backupRootSerial;
+            m_backupRootAccess = message.backupRootAvailable ? BackupRootAccess::Available : BackupRootAccess::Unavailable;
+            if (message.backupRootAvailable) {
+                m_backupIncludeData = true;
+                m_backupIncludeDeData = true;
+            } else {
+                m_showBackupRootChoice = true;
+            }
+        }
+        if (message.hasBackupProgress) {
+            m_backupProgressActive = message.backupProgressActive;
+            m_backupProgressIsRestore = message.backupProgressIsRestore;
+            if (message.backupProgressActive && !message.backupProgressIsRestore)
+                m_backupProgressCurrent = std::max(m_backupProgressCurrent, message.backupProgressCurrent);
+            else
+                m_backupProgressCurrent = message.backupProgressCurrent;
+            m_backupProgressTotal = message.backupProgressTotal;
+            m_backupProgressStage = message.backupProgressStage;
+            m_backupProgressStageTotal = message.backupProgressStageTotal;
+            m_backupProgressBytes = message.backupProgressBytes;
+            m_backupProgressTotalBytes = message.backupProgressTotalBytes;
+            m_backupProgressPackage = std::move(message.backupProgressPackage);
+            m_backupProgressStageLabel = std::move(message.backupProgressStageLabel);
+            if (message.backupProgressAppIndex >= 0 &&
+                message.backupProgressAppIndex < (int)m_backupAppProgress.size()) {
+                int index = message.backupProgressAppIndex;
+                m_backupProgressActiveAppIndex = index;
+                m_backupAppProgress[index] = std::max(m_backupAppProgress[index],
+                    std::clamp(message.backupProgressAppFraction, 0.0f, 1.0f));
+                m_backupAppActive[index] = true;
+            }
+        }
+        if (message.hasStatus) {
+            m_statusMessage = std::move(message.status);
+            m_statusTime = std::chrono::steady_clock::now();
+        }
+        if (message.hasNotification) {
+            showNotification(message.notificationTitle, message.notificationMessage, message.notificationIsError);
+        }
+    }
+}
+
+bool App::selectDeviceBySerial(const std::string& serial, const std::vector<DeviceInfo>* refreshedDevices) {
+    if (serial.empty()) return false;
+    std::lock_guard<std::mutex> lk(m_deviceMutex);
+    if (refreshedDevices) m_devices = *refreshedDevices;
+    for (int i = 0; i < (int)m_devices.size(); i++) {
+        if (m_devices[i].serial == serial && m_devices[i].state == "device") {
+            m_selectedDevice = i;
+            m_lastDeviceSerial.clear();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool App::refreshDeviceListAndSelect(const std::string& serial, int attempts, int delayMs) {
+    for (int attempt = 0; attempt < attempts && !m_shutdownPoll; attempt++) {
+        auto devices = m_device.getDevices();
+        if (selectDeviceBySerial(serial, &devices)) return true;
+        if (attempt + 1 < attempts)
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+    }
+    return false;
+}
+
+void App::connectDeviceBySerialNow(const std::string& serial) {
+    if (serial.empty()) return;
+    if (!refreshDeviceListAndSelect(serial) && !selectDeviceBySerial(serial)) {
+        m_statusMessage = "Device not available: " + serial;
+        m_statusTime = std::chrono::steady_clock::now();
+        return;
+    }
+    onDeviceChanged();
+}
+
+void App::addKnownPrimarySerials(std::set<std::string>& serials, const std::string& serial) const {
+    if (serial.empty()) return;
+    serials.insert(serial);
+    for (const auto& w : m_prefs.savedWifiDevices) {
+        if (w.wifiIp.empty()) continue;
+        std::string wifiSerial = w.wifiIp + ":" + std::to_string(w.port);
+        if (w.serial == serial || wifiSerial == serial) {
+            if (!w.serial.empty()) serials.insert(w.serial);
+            serials.insert(wifiSerial);
+        }
+    }
+}
+
+static bool windowsUsesLightAppTheme() {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    LSTATUS status = RegGetValueA(HKEY_CURRENT_USER,
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        "AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size);
+    return status == ERROR_SUCCESS && value != 0;
+}
+
+void App::setupStyle() {
+    m_resolvedLightTheme = m_theme.mode == 2 || (m_theme.mode == 0 && windowsUsesLightAppTheme());
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 12.0f;
+    style.ChildRounding = 10.0f;
+    style.FrameRounding = 8.0f;
+    style.PopupRounding = 10.0f;
+    style.GrabRounding = 8.0f;
+    style.TabRounding = 8.0f;
+    style.ScrollbarRounding = 10.0f;
+    style.WindowBorderSize = 1.0f;
+    style.ChildBorderSize = 1.0f;
+    style.FrameBorderSize = 1.0f;
+    style.PopupBorderSize = 1.0f;
+    style.WindowPadding = ImVec2(12, 12);
+    style.FramePadding = ImVec2(11, 6);
+    style.ItemSpacing = ImVec2(9, 8);
+    style.ItemInnerSpacing = ImVec2(7, 5);
+    style.CellPadding = ImVec2(11, 8);
+    style.TouchExtraPadding = ImVec2(1, 1);
+    style.IndentSpacing = 20.0f;
+    style.ScrollbarSize = 12.0f;
+    style.GrabMinSize = 12.0f;
+    style.DisabledAlpha = 0.46f;
+    style.Alpha = 1.0f;
+    style.AntiAliasedLines = true;
+    style.AntiAliasedFill = true;
+
+    // Layered graphite surfaces with a cool blue accent.
+    ImVec4* c = style.Colors;
+    c[ImGuiCol_Text]                 = ImVec4(0.86f, 0.91f, 0.98f, 1.00f);
+    c[ImGuiCol_TextDisabled]         = ImVec4(0.46f, 0.52f, 0.64f, 1.00f);
+    c[ImGuiCol_WindowBg]             = ImVec4(0.018f, 0.022f, 0.032f, 1.00f);
+    c[ImGuiCol_ChildBg]              = ImVec4(0.027f, 0.033f, 0.047f, 1.00f);
+    c[ImGuiCol_PopupBg]              = ImVec4(0.035f, 0.043f, 0.061f, 0.99f);
+    c[ImGuiCol_Border]               = ImVec4(0.13f, 0.18f, 0.27f, 0.90f);
+    c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.32f);
+    c[ImGuiCol_FrameBg]              = ImVec4(0.050f, 0.061f, 0.086f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]       = ImVec4(0.075f, 0.102f, 0.150f, 1.00f);
+    c[ImGuiCol_FrameBgActive]        = ImVec4(0.090f, 0.137f, 0.220f, 1.00f);
+    c[ImGuiCol_TitleBg]              = ImVec4(0.022f, 0.028f, 0.041f, 1.00f);
+    c[ImGuiCol_TitleBgActive]        = ImVec4(0.035f, 0.052f, 0.080f, 1.00f);
+    c[ImGuiCol_TitleBgCollapsed]     = c[ImGuiCol_TitleBg];
+    c[ImGuiCol_MenuBarBg]            = ImVec4(0.026f, 0.033f, 0.047f, 1.00f);
+    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.020f, 0.025f, 0.036f, 0.75f);
+    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.14f, 0.19f, 0.28f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.22f, 0.32f, 0.48f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.31f, 0.52f, 0.82f, 1.00f);
+    c[ImGuiCol_CheckMark]            = ImVec4(0.34f, 0.72f, 1.00f, 1.00f);
+    c[ImGuiCol_SliderGrab]           = ImVec4(0.28f, 0.57f, 0.88f, 1.00f);
+    c[ImGuiCol_SliderGrabActive]     = ImVec4(0.38f, 0.76f, 1.00f, 1.00f);
+    c[ImGuiCol_Button]               = ImVec4(0.075f, 0.098f, 0.145f, 1.00f);
+    c[ImGuiCol_ButtonHovered]        = ImVec4(0.105f, 0.190f, 0.315f, 1.00f);
+    c[ImGuiCol_ButtonActive]         = ImVec4(0.115f, 0.330f, 0.570f, 1.00f);
+    c[ImGuiCol_Header]               = ImVec4(0.075f, 0.110f, 0.165f, 0.88f);
+    c[ImGuiCol_HeaderHovered]        = ImVec4(0.105f, 0.205f, 0.345f, 0.92f);
+    c[ImGuiCol_HeaderActive]         = ImVec4(0.125f, 0.355f, 0.610f, 0.95f);
+    c[ImGuiCol_Separator]            = ImVec4(0.11f, 0.15f, 0.23f, 0.85f);
+    c[ImGuiCol_SeparatorHovered]     = ImVec4(0.24f, 0.47f, 0.76f, 1.00f);
+    c[ImGuiCol_SeparatorActive]      = ImVec4(0.34f, 0.68f, 1.00f, 1.00f);
+    c[ImGuiCol_ResizeGrip]           = ImVec4(0.18f, 0.28f, 0.44f, 0.45f);
+    c[ImGuiCol_ResizeGripHovered]    = ImVec4(0.27f, 0.50f, 0.78f, 0.75f);
+    c[ImGuiCol_ResizeGripActive]     = ImVec4(0.34f, 0.68f, 1.00f, 0.95f);
+    c[ImGuiCol_Tab]                  = ImVec4(0.045f, 0.060f, 0.088f, 1.00f);
+    c[ImGuiCol_TabHovered]           = ImVec4(0.11f, 0.23f, 0.39f, 1.00f);
+    c[ImGuiCol_TabSelected]          = ImVec4(0.09f, 0.18f, 0.31f, 1.00f);
+    c[ImGuiCol_TableHeaderBg]        = ImVec4(0.045f, 0.057f, 0.080f, 1.00f);
+    c[ImGuiCol_TableBorderStrong]    = ImVec4(0.12f, 0.16f, 0.24f, 0.90f);
+    c[ImGuiCol_TableBorderLight]     = ImVec4(0.075f, 0.095f, 0.14f, 0.80f);
+    c[ImGuiCol_TableRowBg]           = ImVec4(0.025f, 0.031f, 0.044f, 0.55f);
+    c[ImGuiCol_TableRowBgAlt]        = ImVec4(0.045f, 0.056f, 0.080f, 0.62f);
+    c[ImGuiCol_TextSelectedBg]       = ImVec4(0.18f, 0.46f, 0.76f, 0.48f);
+    c[ImGuiCol_DragDropTarget]       = ImVec4(0.36f, 0.78f, 1.00f, 0.95f);
+    c[ImGuiCol_NavHighlight]         = ImVec4(0.32f, 0.68f, 1.00f, 0.90f);
+    c[ImGuiCol_NavWindowingHighlight]= ImVec4(0.50f, 0.76f, 1.00f, 0.70f);
+    c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0.00f, 0.01f, 0.02f, 0.76f);
+
+    auto mix = [](const ImVec4& a, const ImVec4& b, float amount) {
+        return ImVec4(a.x + (b.x - a.x) * amount, a.y + (b.y - a.y) * amount,
+            a.z + (b.z - a.z) * amount, a.w + (b.w - a.w) * amount);
+    };
+    ImVec4 primary = m_theme.gradientPrimary;
+    ImVec4 secondary = m_theme.gradientSecondary;
+    float strength = m_theme.gradientStrength;
+    if (m_resolvedLightTheme) {
+        ImVec4 canvas(0.935f, 0.950f, 0.975f, 1.0f);
+        ImVec4 surface(0.975f, 0.982f, 0.995f, 1.0f);
+        ImVec4 raised(1.0f, 1.0f, 1.0f, 1.0f);
+        ImVec4 ink(0.075f, 0.105f, 0.160f, 1.0f);
+        c[ImGuiCol_Text] = ink;
+        c[ImGuiCol_TextDisabled] = ImVec4(0.36f, 0.42f, 0.52f, 1.0f);
+        c[ImGuiCol_WindowBg] = canvas;
+        c[ImGuiCol_ChildBg] = surface;
+        c[ImGuiCol_PopupBg] = raised;
+        c[ImGuiCol_MenuBarBg] = ImVec4(0.955f, 0.968f, 0.990f, 1.0f);
+        c[ImGuiCol_TitleBg] = c[ImGuiCol_MenuBarBg];
+        c[ImGuiCol_TitleBgActive] = raised;
+        c[ImGuiCol_Border] = mix(ImVec4(0.72f, 0.77f, 0.85f, 1.0f), primary, 0.10f * strength);
+        c[ImGuiCol_BorderShadow] = ImVec4(0.15f, 0.22f, 0.34f, 0.12f);
+        c[ImGuiCol_FrameBg] = ImVec4(0.915f, 0.935f, 0.970f, 1.0f);
+        c[ImGuiCol_FrameBgHovered] = mix(c[ImGuiCol_FrameBg], primary, 0.13f * strength);
+        c[ImGuiCol_FrameBgActive] = mix(c[ImGuiCol_FrameBg], primary, 0.22f * strength);
+        c[ImGuiCol_Button] = ImVec4(0.885f, 0.915f, 0.960f, 1.0f);
+        c[ImGuiCol_Header] = ImVec4(0.875f, 0.910f, 0.960f, 0.92f);
+        c[ImGuiCol_TableHeaderBg] = ImVec4(0.865f, 0.895f, 0.945f, 1.0f);
+        c[ImGuiCol_TableRowBg] = ImVec4(0.985f, 0.990f, 1.0f, 0.82f);
+        c[ImGuiCol_TableRowBgAlt] = ImVec4(0.925f, 0.945f, 0.980f, 0.72f);
+        c[ImGuiCol_TableBorderStrong] = ImVec4(0.72f, 0.77f, 0.85f, 0.85f);
+        c[ImGuiCol_TableBorderLight] = ImVec4(0.80f, 0.84f, 0.90f, 0.75f);
+        c[ImGuiCol_Separator] = ImVec4(0.72f, 0.77f, 0.85f, 0.75f);
+        c[ImGuiCol_ScrollbarBg] = ImVec4(0.88f, 0.91f, 0.95f, 0.70f);
+        c[ImGuiCol_ScrollbarGrab] = ImVec4(0.62f, 0.69f, 0.79f, 0.85f);
+        c[ImGuiCol_Tab] = ImVec4(0.89f, 0.92f, 0.96f, 1.0f);
+        c[ImGuiCol_ModalWindowDimBg] = ImVec4(0.12f, 0.17f, 0.25f, 0.38f);
+    }
+
+    ImVec4 interactiveBase = c[ImGuiCol_Button];
+    c[ImGuiCol_ButtonHovered] = mix(interactiveBase, primary, 0.30f + 0.18f * strength);
+    c[ImGuiCol_ButtonActive] = mix(interactiveBase, primary, 0.52f + 0.22f * strength);
+    c[ImGuiCol_HeaderHovered] = mix(c[ImGuiCol_Header], primary, 0.34f + 0.14f * strength);
+    c[ImGuiCol_HeaderActive] = mix(c[ImGuiCol_Header], secondary, 0.40f + 0.18f * strength);
+    c[ImGuiCol_CheckMark] = primary;
+    c[ImGuiCol_SliderGrab] = mix(primary, secondary, 0.18f);
+    c[ImGuiCol_SliderGrabActive] = mix(primary, secondary, 0.42f);
+    c[ImGuiCol_SeparatorHovered] = mix(primary, secondary, 0.24f);
+    c[ImGuiCol_SeparatorActive] = primary;
+    c[ImGuiCol_TextSelectedBg] = ImVec4(primary.x, primary.y, primary.z, 0.38f);
+    c[ImGuiCol_DragDropTarget] = mix(primary, secondary, 0.25f);
+    c[ImGuiCol_NavHighlight] = primary;
+}
+
+bool App::modernButton(const char* label, const ImVec2& requestedSize) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImVec2 textSize = ImGui::CalcTextSize(label, nullptr, true);
+    ImVec2 size = requestedSize;
+    if (size.x == 0.0f) size.x = textSize.x + style.FramePadding.x * 2.0f;
+    else if (size.x < 0.0f) size.x = std::max(4.0f, ImGui::GetContentRegionAvail().x + size.x);
+    if (size.y == 0.0f) size.y = textSize.y + style.FramePadding.y * 2.0f;
+
+    ImGuiID id = ImGui::GetID(label);
+    bool pressed = ImGui::InvisibleButton(label, size);
+    bool hovered = ImGui::IsItemHovered();
+    bool held = ImGui::IsItemActive();
+    float target = hovered ? 1.0f : 0.0f;
+    float& animation = m_buttonHoverAnimation[id];
+    float response = 1.0f - expf(-ImGui::GetIO().DeltaTime * 14.0f);
+    animation += (target - animation) * response;
+
+    ImVec4 base = style.Colors[ImGuiCol_Button];
+    ImVec4 hover = style.Colors[ImGuiCol_ButtonHovered];
+    ImVec4 active = style.Colors[ImGuiCol_ButtonActive];
+    auto blend = [](const ImVec4& a, const ImVec4& b, float t) {
+        return ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
+            a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t);
+    };
+    ImVec4 fill = held ? active : blend(base, hover, animation);
+    fill.w *= style.Alpha;
+    ImVec2 min = ImGui::GetItemRectMin();
+    ImVec2 max = ImGui::GetItemRectMax();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    float rounding = style.FrameRounding;
+    draw->AddRectFilled(ImVec2(min.x, min.y + 2.0f), ImVec2(max.x, max.y + 2.0f),
+        IM_COL32(0, 0, 0, (int)(55 * style.Alpha)), rounding);
+    draw->AddRectFilled(min, max, ImGui::ColorConvertFloat4ToU32(fill), rounding);
+    ImVec4 border = blend(style.Colors[ImGuiCol_Border], m_theme.gradientPrimary, animation * 0.72f);
+    border.w *= style.Alpha;
+    draw->AddRect(min, max, ImGui::ColorConvertFloat4ToU32(border), rounding, 0, 1.0f);
+
+    const char* marker = strstr(label, "##");
+    std::string visibleLabel = marker ? std::string(label, marker) : std::string(label);
+    ImVec2 visibleSize = ImGui::CalcTextSize(visibleLabel.c_str());
+    ImVec2 textPos(min.x + (size.x - visibleSize.x) * 0.5f,
+        min.y + (size.y - visibleSize.y) * 0.5f);
+    ImVec4 textColor = style.Colors[ImGuiCol_Text];
+    textColor.w *= style.Alpha;
+    draw->AddText(textPos, ImGui::ColorConvertFloat4ToU32(textColor), visibleLabel.c_str());
+    return pressed;
+}
+
+bool App::modernSmallButton(const char* label) {
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+        ImVec2(ImGui::GetStyle().FramePadding.x * 0.78f, ImGui::GetStyle().FramePadding.y * 0.62f));
+    bool pressed = modernButton(label);
+    ImGui::PopStyleVar();
+    return pressed;
+}
+
+void App::render() {
+    ImGuiIO& io = ImGui::GetIO();
+    drainUiMessages();
+
+    if (m_theme.mode == 0) {
+        auto themeNow = std::chrono::steady_clock::now();
+        if (m_lastSystemThemeCheck.time_since_epoch().count() == 0 ||
+            themeNow - m_lastSystemThemeCheck >= std::chrono::seconds(2)) {
+            m_lastSystemThemeCheck = themeNow;
+            bool light = windowsUsesLightAppTheme();
+            if (light != m_resolvedLightTheme && m_pendingScale < 0.0f)
+                m_pendingScale = m_theme.userScale;
+        }
+    }
+
+    // Reset drag state when mouse button released
+    if (m_isDragging && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        m_isDragging = false;
+
+    // Global keyboard shortcuts
+    bool anyModalOpen = ImGui::IsPopupOpen("Rename") || ImGui::IsPopupOpen("New Folder") || ImGui::IsPopupOpen("Confirm Delete");
+
+    if (ImGui::IsKeyPressed(ImGuiKey_F12)) m_showDebugWindow = !m_showDebugWindow;
+    if (ImGui::IsKeyPressed(ImGuiKey_F5) && !anyModalOpen) {
+        m_leftPanel.needsRefresh = true;
+        m_rightPanel.needsRefresh = true;
+        m_lastNavTimeLeft = std::chrono::steady_clock::now();
+        m_lastNavTimeRight = std::chrono::steady_clock::now();
+    }
+    // F6 — copy selected files to Android (push)
+    if (ImGui::IsKeyPressed(ImGuiKey_F6) && !anyModalOpen) startTransfer(false);
+    // F7 — copy selected files to Windows (pull)
+    if (ImGui::IsKeyPressed(ImGuiKey_F7) && !anyModalOpen) startTransfer(true);
+
+    // Del / Shift+Del — delete selected files in the focused panel
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !anyModalOpen) {
+        FilePanel* focused = m_lastFocusedPanel;
+        if (focused && !focused->isApps && !focused->isConnections && !focused->selectedIndices.empty()) {
+            m_contextPanel = focused;
+            m_contextIndex = *focused->selectedIndices.begin();
+            m_deletePermanent = ImGui::GetIO().KeyShift;
+            m_showDeleteConfirm = true;
+        }
+    }
+
+    // Backspace — navigate up
+    if (ImGui::IsKeyPressed(ImGuiKey_Backspace) && !anyModalOpen) {
+        if (m_lastFocusedPanel && !m_lastFocusedPanel->isApps && !m_lastFocusedPanel->isConnections)
+            navigateUp(*m_lastFocusedPanel);
+    }
+
+    // Enter — open/navigate the focused item (same as double-click)
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter) && !anyModalOpen) {
+        FilePanel* focused = m_lastFocusedPanel;
+        if (focused && !focused->isApps && !focused->isConnections &&
+            focused->focusedIndex >= 0 && focused->validIndex(focused->focusedIndex)) {
+            std::string name = focused->entryName(focused->focusedIndex);
+            bool isDir = focused->entryIsDir(focused->focusedIndex);
+            if (isDir) {
+                std::string sep = focused->isAndroid ? "/" : "\\";
+                std::string np = focused->currentPath;
+                appendPathSeparator(np, sep[0]);
+                np += name;
+                navigateToDirectory(*focused, np);
+            } else if (endsWithCI(name, ".mcraw") && !focused->isAndroid) {
+                std::string mcrawFullPath = focused->currentPath;
+                appendPathSeparator(mcrawFullPath, '\\');
+                mcrawFullPath += name;
+                postAsync("Mounting MCRAW...", [this, mcrawFullPath, focused]() {
+                    std::string mountPath = McrawMountManager::instance().mountMcraw(mcrawFullPath);
+                    if (!mountPath.empty()) {
+                        focused->insideMcraw = true;
+                        focused->mcrawFilePath = mcrawFullPath;
+                        navigateToDirectory(*focused, mountPath);
+                    }
+                });
+            } else if (endsWithCI(name, ".mcraw") && focused->isAndroid) {
+                std::string np = focused->currentPath;
+                appendPathSeparator(np, '/');
+                np += name;
+                navigateToDirectory(*focused, np);
+            }
+        }
+    }
+
+    // Space — pause/resume active transfer
+    if (ImGui::IsKeyPressed(ImGuiKey_Space) && !anyModalOpen) {
+        std::lock_guard<std::mutex> lk(m_batchMutex);
+        for (auto& b : m_batchQueue) {
+            auto s = b->state.load();
+            if (s == BatchState::Running) { b->pauseRequested = true; break; }
+            if (s == BatchState::Paused)  { b->pauseRequested = false; m_batchCV.notify_all(); break; }
+        }
+    }
+
+    // Ctrl+C — copy selected files to clipboard
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C) && !anyModalOpen) {
+        FilePanel* focused = m_lastFocusedPanel;
+        if (focused && !focused->isApps && !focused->isConnections && !focused->selectedIndices.empty()) {
+            m_clipboardPaths.clear();
+            std::string sep = focused->isAndroid ? "/" : "\\";
+            for (int idx : focused->selectedIndices) {
+                if (!focused->validIndex(idx)) continue;
+                std::string p = focused->currentPath;
+                appendPathSeparator(p, sep[0]);
+                p += focused->entryName(idx);
+                m_clipboardPaths.push_back(p);
+            }
+            m_clipboardIsAndroid = focused->isAndroid;
+            m_clipboardDeviceSlot = focused->deviceSlot;
+            m_clipboardCut = false;
+        }
+    }
+
+    // Ctrl+X — cut selected files to clipboard
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X) && !anyModalOpen) {
+        FilePanel* focused = m_lastFocusedPanel;
+        if (focused && !focused->isApps && !focused->isConnections && !focused->selectedIndices.empty()) {
+            m_clipboardPaths.clear();
+            std::string sep = focused->isAndroid ? "/" : "\\";
+            for (int idx : focused->selectedIndices) {
+                if (!focused->validIndex(idx)) continue;
+                std::string p = focused->currentPath;
+                appendPathSeparator(p, sep[0]);
+                p += focused->entryName(idx);
+                m_clipboardPaths.push_back(p);
+            }
+            m_clipboardIsAndroid = focused->isAndroid;
+            m_clipboardDeviceSlot = focused->deviceSlot;
+            m_clipboardCut = true;
+        }
+    }
+
+    // Ctrl+V — paste clipboard files into focused panel
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V) && !anyModalOpen) {
+        FilePanel* focused = m_lastFocusedPanel;
+        if (focused && !focused->isApps && !focused->isConnections && !m_clipboardPaths.empty()) {
+            performClipboardPaste(*focused);
+        }
+    }
+
+    if (m_showBackupManager && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A) && !anyModalOpen && !ImGui::IsAnyItemActive()) {
+        setBackupManagerAppSelection(true, true);
+    }
+
+    // Escape — cancel confirm dialogs
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        if (m_confirmStopTransfer) m_confirmStopTransfer = false;
+        else if (m_showDeleteConfirm) m_showDeleteConfirm = false;
+        else if (m_showNewFolderPopup) m_showNewFolderPopup = false;
+        else if (m_showRenamePopup) m_showRenamePopup = false;
+    }
+
+    // Device polling happens in background thread - nothing blocking here
+
+    // Refresh panels — each can be Windows or Android independently
+    bool panelsRefreshed = false;
+    auto refreshPanel = [&](FilePanel& panel) {
+        if (!panel.needsRefresh) return;
+        if (panel.isConnections) {
+            panel.needsRefresh = false;
+            return;
+        }
+        if (panel.isApps) {
+            if (panel.refreshInProgress) return;
+            panel.refreshInProgress = true;
+            panel.needsRefresh = false;
+            FilePanel* targetPanel = &panel;
+            int slot = panel.deviceSlot;
+            std::string expectedSerial = (slot >= 0 && slot < 2) ? m_slotSerial[slot] : "";
+            postAsync("Loading installed apps...", [this, targetPanel, slot, expectedSerial]() {
+                std::vector<InstalledAppEntry> apps;
+                DeviceClient& dev = deviceForSlot(slot);
+                if (dev.isServerRunning()) {
+                    std::string serial = m_slotSerial[slot];
+                    apps = dev.listInstalledApps(serial, true);
+                    int col = targetPanel->sortColumn;
+                    bool desc = targetPanel->sortDescending;
+                    std::sort(apps.begin(), apps.end(),
+                        [col, desc](const InstalledAppEntry& a, const InstalledAppEntry& b) {
+                            int cmp = 0;
+                            if (col == 1) cmp = _stricmp(a.packageName.c_str(), b.packageName.c_str());
+                            else if (col == 2) cmp = (int)a.isSystem - (int)b.isSystem;
+                            else if (col == 3) cmp = _stricmp(a.apkPath.c_str(), b.apkPath.c_str());
+                            else {
+                                const std::string& aName = a.appName.empty() ? a.packageName : a.appName;
+                                const std::string& bName = b.appName.empty() ? b.packageName : b.appName;
+                                cmp = _stricmp(aName.c_str(), bName.c_str());
+                            }
+                            return desc ? cmp > 0 : cmp < 0;
+                        });
+                }
+                if (targetPanel->isApps && targetPanel->deviceSlot == slot && m_slotSerial[slot] == expectedSerial) {
+                    targetPanel->appEntries = std::move(apps);
+                    targetPanel->selectedIndices.clear();
+                    strcpy_s(targetPanel->pathInput, "Installed apps");
+                }
+                targetPanel->refreshInProgress = false;
+                m_compareDirty = true;
+            });
+        } else if (panel.isAndroid) {
+            if (m_selectedDevice < 0) return;
+            if (panel.refreshInProgress) return;
+            panel.refreshInProgress = true;
+            panel.needsRefresh = false;
+            FilePanel* targetPanel = &panel;
+            int slot = panel.deviceSlot;
+            std::string path = panel.currentPath;
+            bool insideMcraw = panel.insideMcraw;
+            std::string mcrawPath = panel.mcrawFilePath;
+            postAsync("Loading folder...", [this, targetPanel, slot, path, insideMcraw, mcrawPath]() {
+                std::vector<DeviceFileEntry> entries;
+                DeviceClient& dev = deviceForSlot(slot);
+                if (dev.isServerRunning()) {
+                    if (insideMcraw)
+                        entries = dev.listMcraw(mcrawPath);
+                    else
+                        entries = dev.listDirectory(path);
+                    int col = targetPanel->sortColumn;
+                    bool desc = targetPanel->sortDescending;
+                    std::sort(entries.begin(), entries.end(),
+                        [col, desc](const DeviceFileEntry& a, const DeviceFileEntry& b) {
+                            if (a.isDirectory() != b.isDirectory()) return a.isDirectory();
+                            int cmp;
+                            if (col == 1) cmp = (a.size < b.size) ? -1 : (a.size > b.size) ? 1 : 0;
+                            else if (col == 2) cmp = (a.mtime < b.mtime) ? -1 : (a.mtime > b.mtime) ? 1 : 0;
+                            else cmp = _stricmp(a.name.c_str(), b.name.c_str());
+                            return desc ? cmp > 0 : cmp < 0;
+                        });
+                }
+                if (targetPanel->isAndroid && targetPanel->deviceSlot == slot && targetPanel->currentPath == path) {
+                    targetPanel->androidEntries = std::move(entries);
+                    targetPanel->selectedIndices.clear();
+                    strcpy_s(targetPanel->pathInput, targetPanel->currentPath.c_str());
+                    m_compareDirty = true;
+                }
+                targetPanel->refreshInProgress = false;
+            });
+        } else {
+            refreshWindowsPanel(panel);
+            panel.needsRefresh = false;
+            panel.refreshInProgress = false;
+            panelsRefreshed = true;
+        }
+    };
+    refreshPanel(m_leftPanel);
+    refreshPanel(m_rightPanel);
+    if (m_compareEnabled && (m_compareDirty || panelsRefreshed)) {
+        updateCompareHighlights();
+        m_compareDirty = false;
+    }
+
+    // --- Main full-screen window ---
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    float entranceResponse = 1.0f - expf(-io.DeltaTime * 4.5f);
+    m_shellEntranceAnimation += (1.0f - m_shellEntranceAnimation) * entranceResponse;
+    ImDrawList* background = ImGui::GetBackgroundDrawList();
+    ImVec4 baseA = m_resolvedLightTheme ? ImVec4(0.945f, 0.960f, 0.985f, 1.0f)
+        : ImVec4(0.014f, 0.018f, 0.028f, 1.0f);
+    ImVec4 baseB = m_resolvedLightTheme ? ImVec4(0.900f, 0.930f, 0.975f, 1.0f)
+        : ImVec4(0.025f, 0.032f, 0.052f, 1.0f);
+    auto tint = [](const ImVec4& base, const ImVec4& accent, float amount) {
+        return ImVec4(base.x + (accent.x - base.x) * amount,
+            base.y + (accent.y - base.y) * amount,
+            base.z + (accent.z - base.z) * amount, 1.0f);
+    };
+    float gradientAmount = (m_resolvedLightTheme ? 0.055f : 0.10f) *
+        m_theme.gradientStrength * m_shellEntranceAnimation;
+    ImVec4 topLeft = tint(baseA, m_theme.gradientPrimary, gradientAmount);
+    ImVec4 topRight = tint(baseA, m_theme.gradientSecondary, gradientAmount * 0.85f);
+    ImVec4 bottomLeft = tint(baseB, m_theme.gradientSecondary, gradientAmount * 0.42f);
+    ImVec4 bottomRight = tint(baseB, m_theme.gradientPrimary, gradientAmount * 0.35f);
+    background->AddRectFilledMultiColor(vp->WorkPos,
+        ImVec2(vp->WorkPos.x + vp->WorkSize.x, vp->WorkPos.y + vp->WorkSize.y),
+        ImGui::ColorConvertFloat4ToU32(topLeft), ImGui::ColorConvertFloat4ToU32(topRight),
+        ImGui::ColorConvertFloat4ToU32(bottomRight), ImGui::ColorConvertFloat4ToU32(bottomLeft));
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGuiWindowFlags mainFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_MenuBar;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::Begin("##MainWindow", nullptr, mainFlags);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(3);
+
+    renderMenuBar();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 12));
+
+    renderDeviceBar();
+    renderWifiBanner();
+
+    if (m_showBackupManager) {
+        ImGui::SetCursorPosX(8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
+        ImGui::BeginChild("##BackupManagerOuter", ImVec2(-16.0f, -8.0f), ImGuiChildFlags_Borders);
+        renderBackupManagerWindow();
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+    } else {
+        ImGui::SetCursorPosX(8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
+        ImGui::BeginChild("##FileManagerOuter", ImVec2(-16.0f, -8.0f), ImGuiChildFlags_Borders);
+        renderCompareToolbar();
+
+        float availW = ImGui::GetContentRegionAvail().x;
+        float availH = ImGui::GetContentRegionAvail().y;
+        float statusBarH = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2.0f;
+        float panelHeight = availH - statusBarH - ImGui::GetStyle().ItemSpacing.y;
+        float panelGap = 12.0f;
+        float panelWidth = (availW - panelGap) * 0.5f;
+
+        // Left panel
+        ImGui::BeginChild("##LeftPanel", ImVec2(panelWidth, panelHeight), ImGuiChildFlags_Borders);
+        m_leftPanelMin = ImGui::GetWindowPos();
+        m_leftPanelMax = ImVec2(m_leftPanelMin.x + ImGui::GetWindowSize().x, m_leftPanelMin.y + ImGui::GetWindowSize().y);
+        renderPanel(m_leftPanel, PanelSide::Left);
+        // Drop target — accept drops from the other panel
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_DRAG")) {
+                startTransferFromDrag(m_rightPanel, m_leftPanel);
+            }
+            ImGui::EndDragDropTarget();
+        }
+        ImGui::EndChild();
+
+        ImGui::SameLine(0, panelGap);
+
+        // Right panel
+        ImGui::BeginChild("##RightPanel", ImVec2(panelWidth, panelHeight), ImGuiChildFlags_Borders);
+        m_rightPanelMin = ImGui::GetWindowPos();
+        m_rightPanelMax = ImVec2(m_rightPanelMin.x + ImGui::GetWindowSize().x, m_rightPanelMin.y + ImGui::GetWindowSize().y);
+        renderPanel(m_rightPanel, PanelSide::Right);
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_DRAG")) {
+                startTransferFromDrag(m_leftPanel, m_rightPanel);
+            }
+            ImGui::EndDragDropTarget();
+        }
+        ImGui::EndChild();
+
+        renderStatusBar();
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+    }
+
+    ImGui::PopStyleVar();
+    ImGui::End();
+
+    renderConnectionActivity();
+
+    // --- Transfer overlay (separate window) ---
+    renderTransferOverlay();
+
+    renderNewFolderPopup();
+    renderRenamePopup();
+    renderDeleteConfirmPopup();
+    renderCopyMoveDialog();
+    renderCrossDeviceDialog();
+    renderWifiWizard();
+    renderWifiPairingDialog();
+    renderAboutPopup();
+    renderNotificationPopup();
+    renderApkInstallDialog();
+    renderCloseConfirmDialog();
+    if (m_showPreferences) renderPreferencesWindow();
+    if (m_showNicConfig) renderNicConfigWindow();
+    if (m_showThemeWindow) renderThemeWindow();
+
+    if (m_showDebugWindow) renderDebugWindow();
+
+    // Connection mode popup
+    if (m_showConnectionPopup) {
+        ImGui::OpenPopup("Connection Mode");
+        m_showConnectionPopup = false;
+        m_connectionPopupScanned = false;
+        m_detectedIps.clear();
+        // Scan IPs asynchronously when popup opens
+        std::string scanSerial;
+        {
+            std::lock_guard<std::mutex> lk(m_deviceMutex);
+            if (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size())
+                scanSerial = m_devices[m_selectedDevice].serial;
+        }
+        if (!scanSerial.empty()) {
+            postAsync("Scanning device IPs...", [this, scanSerial]() {
+                const char* ifaces[] = {"rndis0", "usb0", "ncm0"};
+                const char* labels[] = {"USB Tethering (rndis0)", "USB (usb0)", "USB NCM (ncm0)"};
+                std::vector<DetectedIp> found;
+                for (int i = 0; i < 3; i++) {
+                    std::string cmd = "-s " + scanSerial + " shell \"ip -4 addr show " + std::string(ifaces[i]) + " 2>/dev/null | grep inet\"";
+                    std::string out = m_device.runAdbCommand(cmd);
+                    auto pos = out.find("inet ");
+                    if (pos == std::string::npos) continue;
+                    pos += 5;
+                    auto slash = out.find('/', pos);
+                    auto space = out.find(' ', pos);
+                    auto endp = std::min(slash, space);
+                    if (endp == std::string::npos || endp <= pos) continue;
+                    std::string ip = out.substr(pos, endp - pos);
+                    if (ip == "127.0.0.1") continue;
+                    found.push_back({ ifaces[i], labels[i], ip });
+                }
+                m_detectedIps = std::move(found);
+                m_connectionPopupScanned = true;
+            });
+        } else {
+            m_connectionPopupScanned = true;
+        }
+    }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Connection Mode", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Current mode:");
+        if (m_device.isDirectConnection()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.3f, 1, 0.5f, 1), "Direct TCP: %s", m_device.deviceIp().c_str());
+        } else {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1), "ADB Forward");
+        }
+
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Show detected IPs (scanned asynchronously)
+        ImGui::Text("Detected device IPs:");
+        ImGui::Spacing();
+
+        std::string popupSerial;
+        {
+            std::lock_guard<std::mutex> lk(m_deviceMutex);
+            if (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size())
+                popupSerial = m_devices[m_selectedDevice].serial;
+        }
+        if (!m_connectionPopupScanned) {
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Scanning...");
+        } else if (!popupSerial.empty()) {
+            bool foundAny = !m_detectedIps.empty();
+            for (auto& det : m_detectedIps) {
+                ImGui::BulletText("%s: %s", det.label.c_str(), det.ip.c_str());
+                ImGui::SameLine();
+
+                bool isCurrent = m_device.isDirectConnection() && m_device.deviceIp() == det.ip;
+                if (isCurrent) {
+                    ImGui::TextColored(ImVec4(0.3f, 1, 0.5f, 1), "(active)");
+                } else {
+                    std::string btnId = "Connect##" + det.iface;
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.20f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.50f, 0.28f, 1));
+                    if (modernSmallButton(btnId.c_str())) {
+                        std::string connectIp = det.ip;
+                        std::string ser = popupSerial;
+                        ImGui::CloseCurrentPopup();
+                        postAsync("Connecting to " + connectIp + "...", [this, connectIp, ser]() {
+                            if (m_device.connectDirect(connectIp)) {
+                                m_statusMessage = "Direct TCP: " + connectIp;
+                            } else {
+                                m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
+                                m_statusMessage = "Failed to connect to " + connectIp;
+                            }
+                            m_statusTime = std::chrono::steady_clock::now();
+                        });
+                    }
+                    ImGui::PopStyleColor(2);
+                }
+            }
+
+            if (!foundAny) {
+                ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "No network interfaces found.");
+                ImGui::Spacing();
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.20f, 1));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.50f, 0.28f, 1));
+                if (modernButton("Enable USB Tethering", ImVec2(-1, 28))) {
+                    std::string ser = popupSerial;
+                    ImGui::CloseCurrentPopup();
+                    postAsync("Enabling USB tethering...", [this, ser]() {
+                        if (m_device.tryEnableUsbTethering(ser)) {
+                            m_statusMessage = "USB Tethering enabled!";
+                        } else {
+                            m_statusMessage = "Could not enable tethering - enable manually in device Settings";
+                        }
+                        m_statusTime = std::chrono::steady_clock::now();
+                    });
+                }
+                ImGui::PopStyleColor(2);
+                ImGui::TextDisabled("Or enable manually: Settings > Network > Hotspot > USB Tethering");
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Manual IP input
+        ImGui::Text("Manual IP:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(150);
+        bool enterIp = ImGui::InputText("##ManualIP", m_manualIp, sizeof(m_manualIp), ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if ((modernButton("Connect##manual") || enterIp) && strlen(m_manualIp) > 0) {
+            std::string connectIp(m_manualIp);
+            std::string ser = popupSerial;
+            ImGui::CloseCurrentPopup();
+            postAsync("Connecting to " + connectIp + "...", [this, connectIp, ser]() {
+                if (m_device.connectDirect(connectIp)) {
+                    m_statusMessage = "Direct TCP: " + connectIp;
+                } else {
+                    if (!ser.empty()) m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
+                    m_statusMessage = "Failed to connect to " + connectIp;
+                }
+                m_statusTime = std::chrono::steady_clock::now();
+            });
+        }
+
+        ImGui::Spacing();
+
+        // Switch back to ADB forward
+        if (m_device.isDirectConnection()) {
+            if (modernButton("Switch to ADB Forward", ImVec2(-1, 0))) {
+                std::string ser = popupSerial;
+                ImGui::CloseCurrentPopup();
+                postAsync("Switching to ADB Forward...", [this, ser]() {
+                    m_device.disconnectTcp();
+                    // Set up ADB forward and connect directly — don't use startServer which would pick Direct TCP again
+                    m_device.runAdbCommand("-s " + ser + " forward tcp:" + std::to_string(AFM_PORT) + " tcp:" + std::to_string(AFM_PORT));
+                    if (m_device.connectTcp("127.0.0.1", AFM_PORT) && m_device.verifyConnection()) {
+                        m_statusMessage = "Switched to ADB Forward";
+                    } else {
+                        m_device.disconnectTcp();
+                        m_statusMessage = "ADB Forward failed — reconnecting...";
+                        m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
+                    }
+                    m_statusTime = std::chrono::steady_clock::now();
+                });
+            }
+        }
+
+        ImGui::Spacing();
+        if (modernButton("Close", ImVec2(-1, 28))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    // Update Windows taskbar progress
+    {
+        bool anyActive = false;
+        float bestProg = 0;
+        BatchState bestState = BatchState::Queued;
+        {
+            std::lock_guard<std::mutex> lk(m_batchMutex);
+            for (auto& b : m_batchQueue) {
+                auto s = b->state.load();
+                if (s == BatchState::Running || s == BatchState::Paused || s == BatchState::Verifying || s == BatchState::WaitingConflict) {
+                    anyActive = true;
+                    bestProg = b->totalProgress.load();
+                    bestState = s;
+                    break;
+                }
+            }
+        }
+        if (anyActive) {
+            if (bestState == BatchState::Paused || bestState == BatchState::WaitingConflict)
+                setTaskbarPaused();
+            else
+                updateTaskbarProgress(bestProg, true);
+        } else {
+            // Check if last batch failed
+            bool lastFailed = false;
+            {
+                std::lock_guard<std::mutex> lk(m_batchMutex);
+                if (!m_batchQueue.empty()) {
+                    auto s = m_batchQueue.back()->state.load();
+                    if (s == BatchState::Failed) lastFailed = true;
+                }
+            }
+            if (lastFailed)
+                setTaskbarError();
+            else
+                updateTaskbarProgress(0, false);
+        }
+    }
+
+    m_firstFrame = false;
+}
+
+bool App::wantsHighFps() {
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.MouseDown[0] || io.MouseDown[1] || io.MouseDown[2] || io.MouseWheel != 0.0f || io.MouseWheelH != 0.0f)
+        return true;
+    if (ImGui::IsAnyItemActive() || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+        return true;
+
+    if (m_isDragging || m_pendingOleDrag || m_pendingScale > 0.0f || m_themeNeedsReposition || m_showCloseConfirm)
+        return true;
+
+    if (m_shellEntranceAnimation < 0.999f || m_deviceSlots[0].isConnecting() || m_deviceSlots[1].isConnecting())
+        return true;
+    for (const auto& [id, value] : m_buttonHoverAnimation) {
+        if (value > 0.001f && value < 0.999f) return true;
+    }
+
+    if (m_asyncBusy.load() || m_pollBusy.load() || m_tetheringInProgress.load())
+        return true;
+
+    if (m_compareDirty)
+        return true;
+    {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        if (m_compareContentBusy)
+            return true;
+    }
+
+    if ((m_overlayVisible || m_overlayFade > 0.01f) && m_overlayFade < 0.99f)
+        return true;
+
+    {
+        std::lock_guard<std::mutex> lk(m_batchMutex);
+        for (const auto& batch : m_batchQueue) {
+            BatchState state = batch->state.load();
+            if (state == BatchState::Queued || state == BatchState::Running ||
+                state == BatchState::Verifying || state == BatchState::WaitingConflict) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+void App::renderMenuBar() {
+    if (ImGui::BeginMenuBar()) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(m_theme.gradientPrimary, "FAST ENOUGH");
+        ImGui::SameLine(0.0f, 10.0f);
+        ImGui::TextDisabled("|");
+        ImGui::SameLine(0.0f, 10.0f);
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Refresh All", "F5")) {
+                m_leftPanel.needsRefresh = true;
+                m_rightPanel.needsRefresh = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Exit", "Alt+F4")) {
+                if (m_prefs.confirmOnClose) {
+                    m_showCloseConfirm = true;
+                } else {
+                    g_reallyQuit = true;
+                    PostMessage(g_mainHwnd, WM_CLOSE, 0, 0);
+                }
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Edit")) {
+            if (ImGui::MenuItem("Preferences...")) {
+                m_showPreferences = true;
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("View")) {
+            ImGui::MenuItem("Show Hidden (Windows)", nullptr, &m_leftPanel.showHidden);
+            ImGui::MenuItem("Show Hidden (Android)", nullptr, &m_rightPanel.showHidden);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Show Transfer Window", nullptr, m_overlayVisible)) {
+                m_overlayVisible = !m_overlayVisible;
+            }
+            if (ImGui::MenuItem("Appearance...")) {
+                m_showThemeWindow = true;
+            }
+            ImGui::MenuItem("Debug Log", "F12", &m_showDebugWindow);
+            ImGui::EndMenu();
+        }
+        if (ImGui::MenuItem("Backup Manager")) {
+            m_showBackupManager = true;
+            m_backupManagerNeedsAppRefresh = true;
+            m_backupManagerNeedsBackupRefresh = true;
+            m_backupRootAccess = BackupRootAccess::Unknown;
+            m_backupRootAccessSerial.clear();
+        }
+        if (ImGui::BeginMenu("Transfer")) {
+            if (ImGui::MenuItem("Copy to Android  >>", "F6")) startTransfer(false);
+            if (ImGui::MenuItem("<< Copy to Windows", "F7")) startTransfer(true);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Register APK Double-Click Installer")) {
+                registerApkAssociation();
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Connection")) {
+            bool hasDevice = false;
+            std::string curSerial;
+            {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+                if (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size() && m_devices[m_selectedDevice].state == "device") {
+                    hasDevice = true;
+                    curSerial = m_devices[m_selectedDevice].serial;
+                }
+            }
+
+            if (m_device.isServerRunning()) {
+                if (m_device.isDirectConnection())
+                    ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "Direct TCP: %s", m_device.deviceIp().c_str());
+                else
+                    ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "ADB Forward");
+                ImGui::Separator();
+            }
+
+            if (m_asyncBusy) {
+                ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Working: %s", m_asyncStatus.c_str());
+            } else if (hasDevice) {
+                bool isDirect = m_device.isDirectConnection();
+                bool isConnected = m_device.isServerRunning();
+
+#if 0 // Hidden: superseded by USB 2x / WiFi 2x multi-pipe options
+                if (ImGui::MenuItem("Connection Mode...")) {
+                    m_showConnectionPopup = true;
+                }
+#endif
+                if (ImGui::MenuItem("Multi-NIC Configuration...")) {
+                    m_showNicConfig = true;
+                    if (m_detectedNics.empty())
+                        m_detectedNics = enumerateNics();
+                    m_nicTestResults.assign(m_detectedNics.size(), false);
+                    m_nicTestDone.assign(m_detectedNics.size(), false);
+                    m_nicTestReason.assign(m_detectedNics.size(), "");
+                }
+#if 0 // Hidden: superseded by USB 2x / WiFi 2x multi-pipe options. Logic preserved.
+                ImGui::Separator();
+
+                // Switch between connection types
+                if (isDirect) {
+                    if (ImGui::MenuItem("Switch to ADB Forward")) {
+                        m_preferAdbForward = true;
+                        std::string ser = curSerial;
+                        postAsync("Switching to ADB Forward...", [this, ser]() {
+                            m_device.disconnectTcp();
+                            m_device.runAdbCommand("-s " + ser + " forward tcp:" + std::to_string(AFM_PORT) + " tcp:" + std::to_string(AFM_PORT));
+                            if (m_device.connectTcp("127.0.0.1", AFM_PORT) && m_device.verifyConnection()) {
+                                m_statusMessage = "Switched to ADB Forward";
+                            } else {
+                                m_device.disconnectTcp();
+                                m_statusMessage = "ADB Forward failed";
+                                m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
+                            }
+                            m_statusTime = std::chrono::steady_clock::now();
+                        });
+                    }
+                } else {
+                    if (ImGui::MenuItem("Switch to Direct TCP")) {
+                        m_preferAdbForward = false;
+                        std::string ser = curSerial;
+                        postAsync("Switching to Direct TCP...", [this, ser]() {
+                            LOG_INFO("UI", "Manual switch to Direct TCP");
+                            std::string ip = m_device.detectDeviceIp(ser);
+                            // No tethering IP? Enable it first
+                            if (ip.empty()) {
+                                LOG_INFO("UI", "No tethering IP — enabling tethering");
+                                m_tetheringInProgress = true;
+                                m_device.tryEnableUsbTethering(ser);
+                                m_tetheringInProgress = false;
+                                ip = m_device.detectDeviceIp(ser);
+                            }
+                            if (!ip.empty()) {
+                                if (m_device.connectDirect(ip)) {
+                                    m_statusMessage = "Direct TCP: " + ip;
+                                } else {
+                                    m_statusMessage = "Direct TCP failed: " + m_device.lastError();
+                                }
+                            } else {
+                                m_statusMessage = "No USB tethering IP found — tethering may not be supported";
+                            }
+                            m_statusTime = std::chrono::steady_clock::now();
+                        });
+                    }
+                }
+
+                ImGui::Separator();
+
+                if (ImGui::MenuItem("Enable USB Tethering")) {
+                    std::string ser = curSerial;
+                    postAsync("Enabling USB tethering...", [this, ser]() {
+                        LOG_INFO("UI", "Manual tethering enable");
+                        if (m_device.tryEnableUsbTethering(ser)) {
+                            m_statusMessage = "USB tethering enabled";
+                            std::string ip = m_device.detectDeviceIp(ser);
+                            if (!ip.empty() && m_device.connectDirect(ip))
+                                m_statusMessage = "Tethering + Direct TCP: " + ip;
+                        } else {
+                            m_statusMessage = "Tethering unavailable";
+                        }
+                        m_statusTime = std::chrono::steady_clock::now();
+                    });
+                }
+#endif
+
+                ImGui::Separator();
+
+                // Dokan virtual drive mount (per device slot)
+                for (int slot = 0; slot < 2; slot++) {
+                    if (!m_slotConnected[slot]) continue;
+                    auto& mgr = DeviceMountManager::instance(slot);
+                    std::string driveLetter = (slot == 0) ? "P:\\" : "Q:\\";
+                    std::string slotLabel = m_slotSerial[slot];
+                    if (slotLabel.size() > 12) slotLabel = slotLabel.substr(0, 12) + "..";
+
+                    if (mgr.isMounted()) {
+                        std::string mp = mgr.mountPoint();
+                        ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "Mounted: %s (%s)", mp.c_str(), slotLabel.c_str());
+                        std::string unmountId = "Unmount " + mp + "##" + std::to_string(slot);
+                        if (ImGui::MenuItem(unmountId.c_str())) {
+                            postAsync("Unmounting...", [slot]() {
+                                DeviceMountManager::instance(slot).unmount();
+                            });
+                        }
+                        std::string openId = "Open " + mp + " in Explorer##" + std::to_string(slot);
+                        if (ImGui::MenuItem(openId.c_str())) {
+                            ShellExecuteA(nullptr, "explore", mp.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                        }
+                    } else {
+                        std::string mountId = "Mount " + slotLabel + " as " + driveLetter + "##" + std::to_string(slot);
+                        if (ImGui::MenuItem(mountId.c_str())) {
+                            std::string sr = m_slotStorageRoot[slot];
+                            postAsync("Mounting virtual drive...", [this, slot, sr, driveLetter]() {
+                                if (DeviceMountManager::instance(slot).mount(&m_deviceSlots[slot], sr, driveLetter)) {
+                                    m_statusMessage = "Mounted: " + driveLetter;
+                                    ShellExecuteA(nullptr, "explore", driveLetter.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                                } else {
+                                    m_statusMessage = "Mount failed — is Dokan driver installed?";
+                                }
+                                m_statusTime = std::chrono::steady_clock::now();
+                            });
+                        }
+                    }
+                }
+
+                ImGui::Separator();
+
+                // WiFi ADB options
+                if (ImGui::BeginMenu("WiFi ADB")) {
+                    if (ImGui::MenuItem("Setup Wizard...", nullptr, false, hasDevice)) {
+                        m_showWifiWizard = true;
+                        m_wizardStep = 0;
+                    }
+                    if (ImGui::MenuItem("Pair (Android 11+)...")) {
+                        m_showWifiPairing = true;
+                        m_pairingIp[0] = '\0';
+                        m_pairingCode[0] = '\0';
+                    }
+                    ImGui::Separator();
+                    if (!m_prefs.savedWifiDevices.empty()) {
+                        ImGui::TextDisabled("Saved devices:");
+                        for (int i = 0; i < (int)m_prefs.savedWifiDevices.size(); i++) {
+                            auto& w = m_prefs.savedWifiDevices[i];
+                            std::string label = w.wifiIp + ":" + std::to_string(w.port);
+                            if (!w.serial.empty()) label += " (" + w.serial.substr(0, 8) + ")";
+                            ImGui::PushID(i);
+                            if (ImGui::MenuItem(label.c_str())) {
+                                // Manual connect to saved device
+                                std::string ip = w.wifiIp;
+                                int port = w.port;
+                                postAsync("Connecting WiFi...", [this, ip, port]() {
+                                    std::string connectAddr = ip + ":" + std::to_string(port);
+                                    std::string result = m_device.runAdbCommand("connect " + connectAddr);
+                                    if (result.find("connected") != std::string::npos &&
+                                        result.find("failed") == std::string::npos) {
+                                        connectDeviceBySerialNow(connectAddr);
+                                    } else {
+                                        m_statusMessage = result;
+                                    }
+                                    m_statusTime = std::chrono::steady_clock::now();
+                                });
+                            }
+                            ImGui::SameLine();
+                            if (modernSmallButton("X")) {
+                                m_prefs.savedWifiDevices.erase(m_prefs.savedWifiDevices.begin() + i);
+                                m_prefs.save();
+                            }
+                            ImGui::PopID();
+                        }
+                    }
+                    ImGui::EndMenu();
+                }
+
+                ImGui::Separator();
+
+                if (ImGui::MenuItem("Reconnect Server")) {
+                    std::string ser = curSerial;
+                    bool preferForward = m_preferAdbForward;
+                    postAsync("Reconnecting server...", [this, ser, preferForward]() {
+                        LOG_INFO("UI", std::string("Manual reconnect (prefer ") + (preferForward ? "ADB Forward" : "Direct TCP") + ")");
+                        m_device.stopServer();
+                        bool useRoot = m_prefs.rootEnabledForSerial(ser);
+                        m_device.startServer(ser, preferForward, useRoot);
+                        m_statusMessage = m_device.isServerRunning()
+                            ? ("Reconnected via " + std::string(m_device.isDirectConnection() ? "Direct TCP" : "ADB Forward"))
+                            : ("Reconnect failed: " + m_device.lastError());
+                        m_statusTime = std::chrono::steady_clock::now();
+                    });
+                }
+
+                if (ImGui::MenuItem("Restart ADB Daemon")) {
+                    postAsync("Restarting ADB daemon...", [this]() {
+                        LOG_INFO("UI", "Manual ADB daemon restart");
+                        m_device.runAdbCommand("kill-server");
+                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        m_device.runAdbCommand("start-server");
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                        m_statusMessage = "ADB daemon restarted";
+                        m_statusTime = std::chrono::steady_clock::now();
+                    });
+                }
+            } else {
+                ImGui::TextDisabled("No device connected");
+
+                if (ImGui::MenuItem("Restart ADB Daemon")) {
+                    postAsync("Restarting ADB daemon...", [this]() {
+                        LOG_INFO("UI", "Manual ADB daemon restart");
+                        m_device.runAdbCommand("kill-server");
+                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        m_device.runAdbCommand("start-server");
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                        m_statusMessage = "ADB daemon restarted";
+                        m_statusTime = std::chrono::steady_clock::now();
+                    });
+                }
+            }
+
+            ImGui::EndMenu();
+        }
+
+        if (ImGui::BeginMenu("Help")) {
+            if (ImGui::MenuItem("About")) {
+                m_showAboutPopup = true;
+            }
+            ImGui::EndMenu();
+        }
+
+        float tw = ImGui::CalcTextSize("Fast Enough? - Android File Explorer").x;
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - tw) * 0.5f);
+        ImGui::TextColored(ImVec4(0.5f,0.7f,1,1), "Fast Enough? - Android File Explorer");
+        ImGui::EndMenuBar();
+    }
+}
+
+void App::renderCompareToolbar() {
+    ImGui::Separator();
+
+    bool compareWasEnabled = m_compareEnabled;
+    if (compareWasEnabled) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.33f, 0.08f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.43f, 0.12f, 1));
+    }
+    if (modernButton(m_compareEnabled ? "Compare: On" : "Compare")) {
+        m_compareEnabled = !m_compareEnabled;
+        m_compareDirty = true;
+    }
+    if (compareWasEnabled) ImGui::PopStyleColor(2);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Highlight items in the current folder that are missing from the other pane");
+
+    ImGui::SameLine(0, 8);
+    ImGui::BeginDisabled(!m_compareEnabled);
+
+    const char* currentMode = "Both sides";
+    if (m_compareMode == CompareHighlightMode::LeftOnly) currentMode = "Left side";
+    else if (m_compareMode == CompareHighlightMode::RightOnly) currentMode = "Right side";
+
+    ImGui::SetNextItemWidth(130.0f);
+    if (ImGui::BeginCombo("##CompareMode", currentMode)) {
+        if (ImGui::Selectable("Both sides", m_compareMode == CompareHighlightMode::Both)) {
+            m_compareMode = CompareHighlightMode::Both;
+        }
+        if (ImGui::Selectable("Left side", m_compareMode == CompareHighlightMode::LeftOnly)) {
+            m_compareMode = CompareHighlightMode::LeftOnly;
+        }
+        if (ImGui::Selectable("Right side", m_compareMode == CompareHighlightMode::RightOnly)) {
+            m_compareMode = CompareHighlightMode::RightOnly;
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Choose which pane shows items that do not exist on the opposite pane");
+
+    ImGui::SameLine(0, 8);
+    if (ImGui::Checkbox("Size/hash##CompareContent", &m_compareContentEnabled)) {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        m_compareContentSignature.clear();
+        m_compareContent.clear();
+        m_compareSizeMismatchCount = 0;
+        m_compareHashMatchCount = 0;
+        m_compareHashMismatchCount = 0;
+        m_compareHashErrorCount = 0;
+        m_compareContentGeneration++;
+        m_compareDirty = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("For names that exist on both sides, compare file size and SHA-256 hash");
+
+    ImGui::SameLine(0, 8);
+    if (modernSmallButton("Recheck")) {
+        m_leftPanel.needsRefresh = true;
+        m_rightPanel.needsRefresh = true;
+        {
+            std::lock_guard<std::mutex> lk(m_compareMutex);
+            m_compareContentSignature.clear();
+            m_compareContentGeneration++;
+        }
+        m_compareDirty = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Refresh both folders and compare again");
+
+    ImGui::EndDisabled();
+
+    ImGui::SameLine(0, 12);
+    ImGui::AlignTextToFramePadding();
+    if (m_compareEnabled) {
+        if (m_compareContentEnabled) {
+            ImGui::TextDisabled("Missing L %d, R %d. Size %d. Hash ok %d, diff %d, errors %d%s",
+                m_compareMissingLeftCount, m_compareMissingRightCount,
+                m_compareSizeMismatchCount, m_compareHashMatchCount,
+                m_compareHashMismatchCount, m_compareHashErrorCount,
+                m_compareContentBusy ? ". Hashing..." : "");
+        } else {
+            ImGui::TextDisabled("Missing, left %d, right %d", m_compareMissingLeftCount, m_compareMissingRightCount);
+        }
+    } else {
+        ImGui::TextDisabled("Compare current folders");
+    }
+    ImGui::Separator();
+}
+
+void App::updateCompareHighlights() {
+    m_compareMissingLeft.clear();
+    m_compareMissingRight.clear();
+    m_compareMissingLeftCount = 0;
+    m_compareMissingRightCount = 0;
+
+    if (!m_compareEnabled) return;
+
+    std::unordered_set<std::string> leftNames;
+    std::unordered_set<std::string> rightNames;
+
+    for (int i = 0; i < m_leftPanel.entryCount(); i++) {
+        std::string name = m_leftPanel.entryName(i);
+        if (!name.empty()) leftNames.insert(normalizeCompareName(name));
+    }
+    for (int i = 0; i < m_rightPanel.entryCount(); i++) {
+        std::string name = m_rightPanel.entryName(i);
+        if (!name.empty()) rightNames.insert(normalizeCompareName(name));
+    }
+
+    for (const auto& name : leftNames) {
+        if (rightNames.find(name) == rightNames.end()) m_compareMissingLeft.insert(name);
+    }
+    for (const auto& name : rightNames) {
+        if (leftNames.find(name) == leftNames.end()) m_compareMissingRight.insert(name);
+    }
+
+    m_compareMissingLeftCount = (int)m_compareMissingLeft.size();
+    m_compareMissingRightCount = (int)m_compareMissingRight.size();
+
+    std::unordered_map<std::string, int> leftIndexByName;
+    std::unordered_map<std::string, int> rightIndexByName;
+    for (int i = 0; i < m_leftPanel.entryCount(); i++) {
+        std::string key = normalizeCompareName(m_leftPanel.entryName(i));
+        leftIndexByName[key] = i;
+    }
+    for (int i = 0; i < m_rightPanel.entryCount(); i++) {
+        std::string key = normalizeCompareName(m_rightPanel.entryName(i));
+        rightIndexByName[key] = i;
+    }
+
+    bool shouldStartHash = false;
+    std::string signature = std::to_string(m_compareContentGeneration + 1);
+    if (m_compareContentEnabled) {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        m_compareContentSignature = signature;
+        m_compareContent.clear();
+        m_compareSizeMismatchCount = 0;
+        m_compareHashMatchCount = 0;
+        m_compareHashMismatchCount = 0;
+        m_compareHashErrorCount = 0;
+        m_compareContentGeneration++;
+
+        for (const auto& [name, leftIndex] : leftIndexByName) {
+            auto rightIt = rightIndexByName.find(name);
+            if (rightIt == rightIndexByName.end()) continue;
+            int rightIndex = rightIt->second;
+            if (m_leftPanel.entryIsDir(leftIndex) || m_rightPanel.entryIsDir(rightIndex)) continue;
+
+            CompareContentInfo info;
+            info.leftSize = m_leftPanel.entrySize(leftIndex);
+            info.rightSize = m_rightPanel.entrySize(rightIndex);
+            if (info.leftSize != info.rightSize) {
+                info.state = CompareContentState::SizeMismatch;
+                info.detail = "File sizes are different";
+                m_compareSizeMismatchCount++;
+            } else {
+                info.state = CompareContentState::HashPending;
+                shouldStartHash = true;
+            }
+            m_compareContent[name] = std::move(info);
+        }
+
+        if (shouldStartHash) m_compareContentBusy = true;
+        else m_compareContentBusy = false;
+    } else {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        m_compareContentSignature.clear();
+        m_compareContent.clear();
+        m_compareContentBusy = false;
+        m_compareSizeMismatchCount = 0;
+        m_compareHashMatchCount = 0;
+        m_compareHashMismatchCount = 0;
+        m_compareHashErrorCount = 0;
+    }
+
+    if (shouldStartHash) startCompareHashCheck(signature);
+}
+
+bool App::isCompareHighlighted(const FilePanel& panel, PanelSide side, int index) const {
+    if (!m_compareEnabled || !panel.validIndex(index)) return false;
+
+    if (side == PanelSide::Left && m_compareMode == CompareHighlightMode::RightOnly) return false;
+    if (side == PanelSide::Right && m_compareMode == CompareHighlightMode::LeftOnly) return false;
+
+    std::string name = normalizeCompareName(panel.entryName(index));
+    if (side == PanelSide::Left) {
+        return m_compareMissingLeft.find(name) != m_compareMissingLeft.end();
+    }
+    return m_compareMissingRight.find(name) != m_compareMissingRight.end();
+}
+
+std::string App::favoriteLabelForPath(const std::string& path, bool isAndroid) {
+    if (path.empty()) return isAndroid ? "/" : "PC";
+    std::string trimmed = path;
+    while (trimmed.size() > 1 && (lastCharOr(trimmed) == '/' || lastCharOr(trimmed) == '\\')) trimmed.pop_back();
+    if (!isAndroid && trimmed.size() == 2 && trimmed[1] == ':') return trimmed + "\\";
+    size_t pos = trimmed.find_last_of(isAndroid ? "/" : "\\");
+    if (pos == std::string::npos) return trimmed;
+    std::string label = trimmed.substr(pos + 1);
+    if (label.empty()) return isAndroid ? "/" : trimmed;
+    return label;
+}
+
+bool App::isFavoritePath(const FilePanel& panel) const {
+    if (panel.isApps) return false;
+    for (const auto& fav : m_prefs.favoritePaths) {
+        if (fav.isAndroid == panel.isAndroid &&
+            fav.deviceSlot == panel.deviceSlot &&
+            fav.path == panel.currentPath) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void App::addFavoritePath(const FilePanel& panel) {
+    if (panel.isApps || panel.currentPath.empty() || isFavoritePath(panel)) return;
+
+    FavoritePath fav;
+    fav.path = panel.currentPath;
+    fav.isAndroid = panel.isAndroid;
+    fav.deviceSlot = panel.deviceSlot;
+    fav.label = favoriteLabelForPath(panel.currentPath, panel.isAndroid);
+    m_prefs.favoritePaths.push_back(std::move(fav));
+    m_prefs.save();
+
+    m_statusMessage = "Favorite added";
+    m_statusTime = std::chrono::steady_clock::now();
+}
+
+void App::removeFavoritePath(int index) {
+    if (index < 0 || index >= (int)m_prefs.favoritePaths.size()) return;
+    m_prefs.favoritePaths.erase(m_prefs.favoritePaths.begin() + index);
+    m_prefs.save();
+    m_statusMessage = "Favorite removed";
+    m_statusTime = std::chrono::steady_clock::now();
+}
+
+void App::renderFavoritesBar(FilePanel& panel, PanelSide side) {
+    if (panel.isApps) return;
+    bool alreadyFavorite = isFavoritePath(panel);
+    if (alreadyFavorite) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.33f, 0.08f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.43f, 0.12f, 1));
+    }
+
+    std::string starId = std::string(alreadyFavorite ? "*##Fav" : "+ Fav##Fav") +
+        (side == PanelSide::Left ? "L" : "R");
+    if (modernSmallButton(starId.c_str())) {
+        if (alreadyFavorite) {
+            for (int i = 0; i < (int)m_prefs.favoritePaths.size(); i++) {
+                const auto& fav = m_prefs.favoritePaths[i];
+                if (fav.isAndroid == panel.isAndroid &&
+                    fav.deviceSlot == panel.deviceSlot &&
+                    fav.path == panel.currentPath) {
+                    removeFavoritePath(i);
+                    break;
+                }
+            }
+        } else {
+            addFavoritePath(panel);
+        }
+    }
+    if (alreadyFavorite) ImGui::PopStyleColor(2);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(alreadyFavorite ? "Remove this folder from favorites" : "Add this folder to favorites");
+
+    for (int i = 0; i < (int)m_prefs.favoritePaths.size(); i++) {
+        const auto& fav = m_prefs.favoritePaths[i];
+        if (fav.isAndroid != panel.isAndroid) continue;
+        if (fav.isAndroid && fav.deviceSlot != panel.deviceSlot) continue;
+
+        ImGui::SameLine();
+        std::string label = fav.label.empty() ? favoriteLabelForPath(fav.path, fav.isAndroid) : fav.label;
+        std::string id = label + "##FavPath" + std::to_string(i) + (side == PanelSide::Left ? "L" : "R");
+        if (modernSmallButton(id.c_str())) {
+            navigateToDirectory(panel, fav.path);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Open %s\nRight-click to remove", fav.path.c_str());
+        }
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            removeFavoritePath(i);
+            break;
+        }
+    }
+}
+
+std::string App::compareEntryPath(const FilePanel& panel, int index) const {
+    if (panel.isApps) return panel.entryName(index);
+    std::string path = panel.currentPath;
+    char sep = panel.isAndroid ? '/' : '\\';
+    appendPathSeparator(path, sep);
+    path += panel.entryName(index);
+    return path;
+}
+
+void App::startCompareHashCheck(const std::string& signature) {
+    struct HashTask {
+        std::string name;
+        bool leftAndroid = false;
+        bool rightAndroid = false;
+        int leftSlot = 0;
+        int rightSlot = 0;
+        std::string leftPath;
+        std::string rightPath;
+        uint64_t size = 0;
+    };
+
+    std::vector<HashTask> tasks;
+    {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        for (const auto& [name, info] : m_compareContent) {
+            if (info.state != CompareContentState::HashPending) continue;
+
+            int leftIndex = -1;
+            int rightIndex = -1;
+            for (int i = 0; i < m_leftPanel.entryCount(); i++) {
+                if (normalizeCompareName(m_leftPanel.entryName(i)) == name) { leftIndex = i; break; }
+            }
+            for (int i = 0; i < m_rightPanel.entryCount(); i++) {
+                if (normalizeCompareName(m_rightPanel.entryName(i)) == name) { rightIndex = i; break; }
+            }
+            if (leftIndex < 0 || rightIndex < 0) continue;
+
+            HashTask task;
+            task.name = name;
+            task.leftAndroid = m_leftPanel.isAndroid;
+            task.rightAndroid = m_rightPanel.isAndroid;
+            task.leftSlot = m_leftPanel.deviceSlot;
+            task.rightSlot = m_rightPanel.deviceSlot;
+            task.leftPath = compareEntryPath(m_leftPanel, leftIndex);
+            task.rightPath = compareEntryPath(m_rightPanel, rightIndex);
+            task.size = info.leftSize;
+            tasks.push_back(std::move(task));
+        }
+    }
+
+    if (tasks.empty()) {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        if (m_compareContentSignature == signature) m_compareContentBusy = false;
+        return;
+    }
+
+    int generation;
+    {
+        std::lock_guard<std::mutex> lk(m_compareMutex);
+        generation = m_compareContentGeneration;
+    }
+
+    postAsync("Hashing matching files...", [this, tasks = std::move(tasks), signature, generation]() {
+        {
+            std::lock_guard<std::mutex> lk(m_compareMutex);
+            if (generation != m_compareContentGeneration || signature != m_compareContentSignature) {
+                return;
+            }
+        }
+
+        auto hashFor = [this](bool android, int slot, const std::string& path, uint64_t size,
+                              std::string& hash, std::string& detail) -> bool {
+            if (android) {
+                DeviceClient& dev = deviceForSlot(slot);
+                if (!dev.isServerRunning()) {
+                    detail = "Android side is not connected";
+                    return false;
+                }
+                if (dev.getRemoteSha256(path, hash, detail, size)) return true;
+                if (detail.find("Unknown command") != std::string::npos) {
+                    std::string serial = dev.connectedSerial();
+                    bool preferAdbForward = !dev.isDirectConnection();
+                    bool useRoot = dev.useRoot();
+                    if (!serial.empty()) {
+                        LOG_INFO("SHA256", "Restarting Android server for SHA-256 support");
+                        dev.stopServer();
+                        if (dev.startServer(serial, preferAdbForward, useRoot)) {
+                            return dev.getRemoteSha256(path, hash, detail, size);
+                        }
+                        detail = "Restart failed: " + dev.lastError();
+                    }
+                }
+                return false;
+            }
+            return computeCompareLocalSha256(path, hash, detail);
+        };
+
+        std::unordered_map<std::string, CompareContentInfo> results;
+        int hashMatch = 0;
+        int hashMismatch = 0;
+        int hashError = 0;
+
+        for (const auto& task : tasks) {
+            CompareContentInfo info;
+            info.leftSize = task.size;
+            info.rightSize = task.size;
+
+            std::string leftDetail;
+            std::string rightDetail;
+            bool leftOk = hashFor(task.leftAndroid, task.leftSlot, task.leftPath, task.size, info.leftHash, leftDetail);
+            bool rightOk = hashFor(task.rightAndroid, task.rightSlot, task.rightPath, task.size, info.rightHash, rightDetail);
+
+            if (!leftOk || !rightOk) {
+                info.state = CompareContentState::HashError;
+                info.detail = !leftOk ? leftDetail : rightDetail;
+                hashError++;
+            } else if (info.leftHash == info.rightHash) {
+                info.state = CompareContentState::HashMatch;
+                info.detail = "Size and hash match";
+                hashMatch++;
+            } else {
+                info.state = CompareContentState::HashMismatch;
+                info.detail = "Same size, different hash";
+                hashMismatch++;
+            }
+            results[task.name] = std::move(info);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(m_compareMutex);
+            if (generation == m_compareContentGeneration && signature == m_compareContentSignature) {
+                for (auto& [name, info] : results) m_compareContent[name] = std::move(info);
+                m_compareHashMatchCount = hashMatch;
+                m_compareHashMismatchCount = hashMismatch;
+                m_compareHashErrorCount = hashError;
+                m_compareContentBusy = false;
+            }
+        }
+    });
+}
+
+void App::renderDeviceBar() {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_ChildBg));
+    float devBarH = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2 + 12;
+    ImGui::SetCursorPosX(8.0f);
+    ImGui::BeginChild("##DeviceBar", ImVec2(-16.0f, devBarH), ImGuiChildFlags_Borders);
+    ImGui::SetCursorPos(ImVec2(12, 9));
+
+    if (m_device.getAdbPath().empty()) {
+        ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "ADB not found!");
+        ImGui::SameLine(); ImGui::TextDisabled("Extract the full ZIP or add Android SDK Platform Tools to PATH");
+    } else {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(m_theme.gradientPrimary, "DEVICE");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(300);
+
+        // Snapshot under lock to avoid race with poll thread
+        std::vector<DeviceInfo> devSnap;
+        int selSnap;
+        {
+            std::lock_guard<std::mutex> lk(m_deviceMutex);
+            devSnap = m_devices;
+            selSnap = m_selectedDevice;
+        }
+
+        if (devSnap.empty()) {
+            ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "No device connected");
+        } else {
+            auto physicalIdentity = [&](const std::string& serial) {
+                for (const auto& saved : m_prefs.savedWifiDevices) {
+                    if (saved.wifiIp.empty()) continue;
+                    std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
+                    if ((saved.serial == serial || wifiSerial == serial) &&
+                        !saved.serial.empty() && saved.serial != wifiSerial)
+                        return saved.serial;
+                }
+                return serial;
+            };
+            std::vector<int> physicalDeviceIndices;
+            std::map<std::string, int> physicalIndex;
+            for (int i = 0; i < (int)devSnap.size(); ++i) {
+                std::string identity = physicalIdentity(devSnap[i].serial);
+                auto existing = physicalIndex.find(identity);
+                if (existing == physicalIndex.end()) {
+                    physicalIndex.emplace(identity, i);
+                    physicalDeviceIndices.push_back(i);
+                } else if (isWifiSerial(devSnap[existing->second].serial) && !isWifiSerial(devSnap[i].serial)) {
+                    int previousIndex = existing->second;
+                    existing->second = i;
+                    auto indexIt = std::find(physicalDeviceIndices.begin(), physicalDeviceIndices.end(), previousIndex);
+                    if (indexIt != physicalDeviceIndices.end()) *indexIt = i;
+                }
+            }
+            // Use marketing name if available, otherwise fall back to adb model
+            auto getDevName = [&](int idx) -> std::string {
+                auto it = m_deviceDisplayNames.find(devSnap[idx].serial);
+                const std::string& name = (it != m_deviceDisplayNames.end()) ? it->second : devSnap[idx].model;
+                return name + " (" + devSnap[idx].serial + ")";
+            };
+            int previewIndex = selSnap;
+            if (selSnap >= 0 && selSnap < (int)devSnap.size()) {
+                auto current = physicalIndex.find(physicalIdentity(devSnap[selSnap].serial));
+                if (current != physicalIndex.end()) previewIndex = current->second;
+            }
+            std::string preview = (previewIndex >= 0 && previewIndex < (int)devSnap.size())
+                ? getDevName(previewIndex) : "Select...";
+            if (ImGui::BeginCombo("##DeviceCombo", preview.c_str())) {
+                for (int i : physicalDeviceIndices) {
+                    std::string label = getDevName(i);
+                    if (devSnap[i].state != "device") {
+                        label += " [" + devSnap[i].state + "]";
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,0.5f,0.5f,1));
+                    }
+                    if (ImGui::Selectable(label.c_str(), i == selSnap)) {
+                        std::string selectedSerial = devSnap[i].serial;
+                        bool alreadySelected = i == selSnap;
+                        bool alreadyConnected = (m_slotConnected[0] &&
+                            physicalIdentity(m_slotSerial[0]) == physicalIdentity(selectedSerial) &&
+                            m_device.isServerRunning()) ||
+                            (m_slotConnected[1] && physicalIdentity(m_slotSerial[1]) == physicalIdentity(selectedSerial) &&
+                             m_deviceSlots[1].isServerRunning());
+                        if (alreadyConnected && !alreadySelected) {
+                            m_statusMessage = "Device is already connected. Select it from an Android pane.";
+                            m_statusTime = std::chrono::steady_clock::now();
+                        } else {
+                            std::lock_guard<std::mutex> lk(m_deviceMutex);
+                            m_selectedDevice = i;
+                            if (!alreadySelected)
+                                m_lastDeviceSerial.clear();
+                        }
+                        if (devSnap[i].state == "device" && !alreadySelected && !alreadyConnected) {
+                            postAsync("Connecting to " + selectedSerial + "...", [this, selectedSerial]() {
+                                connectDeviceBySerialNow(selectedSerial);
+                            });
+                        }
+                    }
+                    if (devSnap[i].state != "device") ImGui::PopStyleColor();
+                }
+                ImGui::EndCombo();
+            }
+            if (selSnap >= 0 && devSnap[selSnap].state == "device") {
+                ImGui::SameLine();
+
+                // Show connection mode - detect actual transport
+                ImGui::AlignTextToFramePadding();
+                if (m_device.isServerRunning()) {
+                    bool serialIsWifi = isWifiSerial(devSnap[selSnap].serial);
+                    if (m_dualChannelAvailable) {
+                        if (m_activeChannelCount >= 4)
+                            ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "%d channels", m_activeChannelCount);
+                        else if (serialIsWifi)
+                            ImGui::TextColored(ImVec4(0.3f,0.8f,1,1), "WiFi (dual)");
+                        else if (m_secondaryChannelType == "USB")
+                            ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "USB (dual)");
+                        else
+                            ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "USB + %s", m_secondaryChannelType.c_str());
+                    } else if (serialIsWifi) {
+                        ImGui::TextColored(ImVec4(0.3f,0.8f,1,1), "WiFi");
+                    } else if (m_device.isDirectConnection()) {
+                        ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "USB (Direct)");
+                    } else {
+                        ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "USB");
+                    }
+                } else {
+                    ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "Connecting...");
+                }
+
+                auto drawPipeSelector = [&](const char* label, const char* id, int& value) -> bool {
+                    bool changed = false;
+                    // Keep this group on the same frame height as the device selector and
+                    // checkbox controls. Only its horizontal padding is compact.
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(label);
+                    for (int pipes = 1; pipes <= 4; pipes++) {
+                        ImGui::SameLine(0, 3);
+                        bool selected = (value == pipes);
+                        if (selected) {
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.45f, 0.25f, 1));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.55f, 0.30f, 1));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.25f, 0.65f, 0.35f, 1));
+                        }
+                        std::string btn = "x" + std::to_string(pipes) + "##" + id + std::to_string(pipes);
+                        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(ImGui::GetStyle().FramePadding.x * 0.78f,
+                                ImGui::GetStyle().FramePadding.y));
+                        bool pressed = modernButton(btn.c_str());
+                        ImGui::PopStyleVar();
+                        if (pressed && value != pipes) {
+                            value = pipes;
+                            changed = true;
+                        }
+                        if (selected) ImGui::PopStyleColor(3);
+                    }
+                    return changed;
+                };
+
+                // Pipe controls, directly visible for quick tuning
+                auto& devicePipes = m_prefs.pipePreferencesFor(devSnap[selSnap].serial);
+                ImGui::SameLine(0, 16);
+                {
+                    if (drawPipeSelector("USB", "usbdevbar", devicePipes.usbPipeCount)) {
+                        m_prefs.save();
+                        m_statusMessage = "USB pipes: x" + std::to_string(devicePipes.usbPipeCount);
+                        m_statusTime = std::chrono::steady_clock::now();
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Parallel ADB connections over USB. Higher values can improve throughput on fast devices.\nApplies on next device reconnect or transfer channel setup.");
+                }
+                ImGui::SameLine(0, 8);
+                {
+                    if (drawPipeSelector("WiFi", "wifidevbar", devicePipes.wifiPipeCount)) {
+                        m_prefs.save();
+                        m_statusMessage = "WiFi pipes: x" + std::to_string(devicePipes.wifiPipeCount);
+                        m_statusTime = std::chrono::steady_clock::now();
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Parallel direct TCP connections over WiFi. Higher values can help WiFi 6/7 devices.\nApplies on next device reconnect or transfer channel setup.");
+                }
+
+                // Root mode toggle — relaunches the on-device server via `su -c`
+                ImGui::SameLine(0, 16);
+                {
+                    std::string ser = devSnap[selSnap].serial;
+                    bool rootOn = m_prefs.rootEnabledForSerial(ser);
+                    if (ImGui::Checkbox("Root##devbar", &rootOn)) {
+                        if (rootOn) {
+                            // Probe root availability before committing.
+                            postAsync("Checking root access...", [this, ser]() {
+                                bool hasRoot = m_device.isRootAvailable(ser);
+                                if (!hasRoot) {
+                                    std::string msg = "Root is not available for this device, or the root request was denied.\n\n"
+                                        "Check that the device is rooted and that ADB has been granted root access in Magisk, KernelSU, or your root manager. Then enable Root again for this device.";
+                                    showNotification("Root Access Unavailable", msg, true);
+                                    m_statusMessage = "Root not available or not granted";
+                                    m_statusTime = std::chrono::steady_clock::now();
+                                    return;
+                                }
+                                m_prefs.setRootEnabledForSerial(ser, true);
+                                m_prefs.save();
+                                m_device.disconnectTcp();
+                                if (m_device.startServer(ser, m_preferAdbForward, true)) {
+                                    m_statusMessage = "Root access enabled";
+                                    m_leftPanel.needsRefresh = true;
+                                    m_rightPanel.needsRefresh = true;
+                                } else {
+                                    std::string msg = "Root access was requested, but the device helper could not start as root.\n\n"
+                                        "Check that root access is granted to ADB for this device, then enable Root again.\n\n"
+                                        "Details: " + m_device.lastError();
+                                    showNotification("Root Startup Failed", msg, true);
+                                    m_statusMessage = "Root server start failed: " + m_device.lastError();
+                                    m_prefs.setRootEnabledForSerial(ser, false);
+                                    m_prefs.save();
+                                }
+                                m_statusTime = std::chrono::steady_clock::now();
+                            });
+                        } else {
+                            m_prefs.setRootEnabledForSerial(ser, false);
+                            m_prefs.save();
+                            postAsync("Disabling root...", [this, ser]() {
+                                m_device.disconnectTcp();
+                                if (m_device.startServer(ser, m_preferAdbForward, false)) {
+                                    m_statusMessage = "Root access disabled";
+                                    m_leftPanel.needsRefresh = true;
+                                    m_rightPanel.needsRefresh = true;
+                                } else {
+                                    m_statusMessage = "Restart failed: " + m_device.lastError();
+                                }
+                                m_statusTime = std::chrono::steady_clock::now();
+                            });
+                        }
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Run this device's helper as root via `su -c`.\nRequires a rooted device and granted ADB root permission.\nSaved separately for each device.");
+                }
+
+                // WiFi auto-connect toggle
+                ImGui::SameLine(0, 16);
+                bool wifiAuto = m_prefs.wifiAutoConnect;
+                if (ImGui::Checkbox("WiFi Auto##devbar", &wifiAuto)) {
+                    m_prefs.wifiAutoConnect = wifiAuto;
+                    m_prefs.save();
+                    if (!wifiAuto) {
+                        // Disconnect secondary channel and disable dual-channel
+                        m_secondaryChannel.disconnectTcp();
+                        m_dualChannelAvailable = false;
+                        m_secondaryChannelType.clear();
+                        m_wifiAutoSetupDone = false;
+                        m_statusMessage = "WiFi auto-connect disabled";
+                        m_statusTime = std::chrono::steady_clock::now();
+                    }
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Automatically set up WiFi for dual-channel transfers\nwhen this device connects via USB");
+
+                // Keep awake toggle (uses a wakelock held by a background adb shell process)
+                ImGui::SameLine(0, 16);
+                bool keepAwake = m_keepAwake;
+                if (ImGui::Checkbox("Keep Awake##devbar", &keepAwake)) {
+                    std::string serial = devSnap[selSnap].serial;
+                    std::string adbPath = m_device.getAdbPath();
+                    if (keepAwake && !m_keepAwake) {
+                        // Spawn a background adb shell that holds a wakelock
+                        // When the process dies (disconnect, app close), the lock auto-releases
+                        std::string cmd = "\"" + adbPath + "\" -s " + serial +
+                            " shell \"echo afm_keepawake > /sys/power/wake_lock && cat > /dev/null\"";
+                        STARTUPINFOA si{}; si.cb = sizeof(si);
+                        si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+                        PROCESS_INFORMATION pi{};
+                        if (CreateProcessA(nullptr, (LPSTR)cmd.c_str(), nullptr, nullptr, FALSE,
+                                           CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                            CloseHandle(pi.hThread);
+                            m_wakeLockProcess = pi.hProcess;
+                            m_keepAwake = true;
+                            m_statusMessage = "Keep awake enabled (wakelock)";
+                            m_statusTime = std::chrono::steady_clock::now();
+                        } else {
+                            // Fallback for non-root: use svc power stayon
+                            m_device.runAdbCommand("-s " + serial + " shell svc power stayon usb");
+                            cmd = "\"" + adbPath + "\" -s " + serial +
+                                " shell \"trap 'svc power stayon false' EXIT; cat > /dev/null\"";
+                            si = {}; si.cb = sizeof(si);
+                            si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+                            pi = {};
+                            if (CreateProcessA(nullptr, (LPSTR)cmd.c_str(), nullptr, nullptr, FALSE,
+                                               CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                                CloseHandle(pi.hThread);
+                                m_wakeLockProcess = pi.hProcess;
+                            }
+                            m_keepAwake = true;
+                            m_statusMessage = "Keep awake enabled";
+                            m_statusTime = std::chrono::steady_clock::now();
+                        }
+                    } else if (!keepAwake && m_keepAwake) {
+                        // Kill the background process, which releases the wakelock
+                        if (m_wakeLockProcess) {
+                            TerminateProcess(m_wakeLockProcess, 0);
+                            CloseHandle(m_wakeLockProcess);
+                            m_wakeLockProcess = nullptr;
+                        }
+                        m_keepAwake = false;
+                        // Clean up wakelock entry async to avoid UI hang
+                        postAsync("Disabling keep awake...", [this, serial]() {
+                            m_device.runAdbCommand("-s " + serial + " shell \"echo afm_keepawake > /sys/power/wake_unlock 2>/dev/null; svc power stayon false 2>/dev/null\"");
+                            m_statusMessage = "Keep awake disabled";
+                            m_statusTime = std::chrono::steady_clock::now();
+                        });
+                    }
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Prevent the device from sleeping while connected.\nUses a wakelock that auto-releases if the connection drops.");
+
+                // (Dual channel button removed — replaced by USB x2 / WiFi x2 toggles above)
+
+                // Disconnect button for WiFi devices
+                if (isWifiSerial(devSnap[selSnap].serial)) {
+                    ImGui::SameLine(0, 16);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.15f, 0.15f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.2f, 0.2f, 1));
+                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(ImGui::GetStyle().FramePadding.x * 0.78f,
+                            ImGui::GetStyle().FramePadding.y));
+                    bool disconnectPressed = modernButton("Disconnect##wifi");
+                    ImGui::PopStyleVar();
+                    if (disconnectPressed) {
+                        std::string serial = devSnap[selSnap].serial;
+                        // Kill wakelock process if active (will auto-release on device)
+                        if (m_keepAwake && m_wakeLockProcess) {
+                            TerminateProcess(m_wakeLockProcess, 0);
+                            CloseHandle(m_wakeLockProcess);
+                            m_wakeLockProcess = nullptr;
+                            m_keepAwake = false;
+                        }
+                        postAsync("Disconnecting...", [this, serial]() {
+                            m_device.stopServer();
+                            m_device.runAdbCommand("disconnect " + serial);
+                            m_statusMessage = "Disconnected: " + serial;
+                            m_statusTime = std::chrono::steady_clock::now();
+                        });
+                    }
+                    ImGui::PopStyleColor(2);
+                }
+            }
+        }
+
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+void App::renderConnectionActivity() {
+    struct ConnectionCard {
+        int slot = 0;
+        std::string serial;
+        std::string name;
+        std::string stage;
+        bool connected = false;
+        bool connecting = false;
+        bool retrying = false;
+        bool dualTransport = false;
+    };
+
+    std::vector<ConnectionCard> cards;
+    cards.reserve(2);
+    std::set<std::string> onlineSerials;
+    {
+        std::lock_guard<std::mutex> lock(m_deviceMutex);
+        for (const auto& device : m_devices) {
+            if (device.state == "device") onlineSerials.insert(device.serial);
+        }
+    }
+    auto now = std::chrono::steady_clock::now();
+    for (int slot = 0; slot < 2; ++slot) {
+        DeviceClient& client = m_deviceSlots[slot];
+        ConnectionCard card;
+        card.slot = slot;
+        card.connected = m_slotConnected[slot] && client.isServerRunning();
+        card.connecting = client.isConnecting();
+        card.serial = client.connectedSerial();
+        if (card.serial.empty()) card.serial = m_slotSerial[slot];
+        if (slot == 1 && card.serial.empty()) card.serial = m_secondaryRetrySerial;
+        card.retrying = slot == 1 && !card.connected && !card.connecting &&
+            card.serial == m_secondaryRetrySerial && now < m_secondaryRetryAfter;
+        if (card.serial.empty()) continue;
+
+        bool listedOnline = false;
+        {
+            std::lock_guard<std::mutex> lock(m_deviceMutex);
+            for (const auto& device : m_devices) {
+                if (device.serial == card.serial && device.state == "device") {
+                    listedOnline = true;
+                    break;
+                }
+            }
+        }
+        if (listedOnline || card.connected || card.connecting) {
+            m_connectionCardMissingSince[slot] = {};
+        } else {
+            if (m_connectionCardMissingSince[slot].time_since_epoch().count() == 0)
+                m_connectionCardMissingSince[slot] = now;
+            bool graceExpired = now - m_connectionCardMissingSince[slot] >= std::chrono::seconds(8);
+            if (graceExpired && !card.retrying) continue;
+        }
+
+        auto nameIt = m_deviceDisplayNames.find(card.serial);
+        card.name = nameIt != m_deviceDisplayNames.end() && !nameIt->second.empty()
+            ? nameIt->second : card.serial;
+        bool primaryIsWifi = isWifiSerial(card.serial);
+        bool companionTransportOnline = false;
+        for (const auto& saved : m_prefs.savedWifiDevices) {
+            if (saved.wifiIp.empty()) continue;
+            std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
+            if (saved.serial == card.serial && onlineSerials.count(wifiSerial)) {
+                companionTransportOnline = true;
+                break;
+            }
+            if (wifiSerial == card.serial && saved.serial != wifiSerial &&
+                onlineSerials.count(saved.serial)) {
+                companionTransportOnline = true;
+                break;
+            }
+        }
+        bool activeTransferDual = card.slot == 0 && m_dualChannelAvailable &&
+            ((primaryIsWifi && m_secondaryChannelType == "USB") ||
+             (!primaryIsWifi && m_secondaryChannelType == "WiFi"));
+        card.dualTransport = card.connected && (companionTransportOnline || activeTransferDual);
+        if (card.connected) {
+            card.stage = card.dualTransport ? "Connected over USB + WiFi" :
+                (primaryIsWifi ? "Connected over WiFi" : "Connected over USB");
+        } else if (card.connecting) {
+            card.stage = client.statusText();
+            if (card.stage.empty()) card.stage = "Preparing device connection";
+        } else if (card.retrying) {
+            auto seconds = std::max(1LL, std::chrono::duration_cast<std::chrono::seconds>(
+                m_secondaryRetryAfter - now).count() + 1);
+            card.stage = "Retrying in " + std::to_string(seconds) + " seconds";
+        } else {
+            card.stage = listedOnline ? "Waiting for device" : "Device disconnected";
+        }
+        cards.push_back(std::move(card));
+    }
+
+    // Multiple transports can point to the same physical device. Present those as
+    // one device card and combine their connection state instead of double-counting it.
+    std::vector<ConnectionCard> uniqueCards;
+    uniqueCards.reserve(cards.size());
+    for (auto& card : cards) {
+        auto existing = std::find_if(uniqueCards.begin(), uniqueCards.end(), [&](const ConnectionCard& item) {
+            return item.serial == card.serial;
+        });
+        if (existing == uniqueCards.end()) {
+            uniqueCards.push_back(std::move(card));
+            continue;
+        }
+
+        bool existingWasConnected = existing->connected;
+        bool bothConnected = existingWasConnected && card.connected;
+        existing->connected = existing->connected || card.connected;
+        existing->connecting = existing->connecting || card.connecting;
+        existing->retrying = existing->retrying || card.retrying;
+        existing->dualTransport = existing->dualTransport || card.dualTransport;
+        if (existing->dualTransport && existing->connected) {
+            existing->stage = "Connected over USB + WiFi";
+        } else if (bothConnected) {
+            existing->stage = "Connected on multiple channels";
+        } else if (card.connecting || card.retrying || (!existingWasConnected && card.connected)) {
+            existing->stage = card.stage;
+        }
+    }
+    cards = std::move(uniqueCards);
+    if (cards.empty()) return;
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    int activeCount = 0;
+    for (const auto& card : cards) if (card.connecting || card.retrying) activeCount++;
+
+    bool isActive = activeCount > 0;
+    if (isActive || (int)cards.size() != m_connectionActivityPreviousCardCount)
+        m_connectionActivityVisibleUntil = now + std::chrono::seconds(isActive ? 2 : 4);
+    else if (m_connectionActivityWasActive)
+        m_connectionActivityVisibleUntil = now + std::chrono::seconds(4);
+    m_connectionActivityWasActive = isActive;
+    m_connectionActivityPreviousCardCount = (int)cards.size();
+
+    // Full cards use spare space beside the device controls. The compact indicator
+    // remains available after they fade out and at widths where cards would overlap.
+    constexpr float minActivityPanelViewportWidth = 1700.0f;
+    bool canShowFullCards = viewport->WorkSize.x >= minActivityPanelViewportWidth;
+    bool manuallyExpanded = now < m_connectionActivityManualUntil;
+    float targetAlpha = (canShowFullCards || manuallyExpanded) &&
+        (isActive || now < m_connectionActivityVisibleUntil || manuallyExpanded) ? 1.0f : 0.0f;
+    float animationStep = 1.0f - expf(-ImGui::GetIO().DeltaTime * 7.0f);
+    m_connectionActivityAlpha += (targetAlpha - m_connectionActivityAlpha) * animationStep;
+    if (m_connectionActivityAlpha < 0.01f) m_connectionActivityAlpha = 0.0f;
+
+    int dualTransportCount = 0;
+    for (const auto& card : cards) if (card.dualTransport) dualTransportCount++;
+    std::string compactSummary = activeCount > 0
+        ? std::to_string(activeCount) + " active"
+        : std::to_string(cards.size()) + (cards.size() == 1 ? " device ready" : " devices ready");
+    if (dualTransportCount > 0 && activeCount == 0)
+        compactSummary += " | " + std::to_string(dualTransportCount) + " USB + WiFi";
+    if (viewport->WorkSize.x < 1050.0f && activeCount == 0 && dualTransportCount == 0)
+        compactSummary = std::to_string(cards.size()) + " ready";
+
+    if (!canShowFullCards || m_connectionActivityAlpha < 0.98f) {
+        ImDrawList* compactDraw = ImGui::GetForegroundDrawList();
+        float compactLineHeight = ImGui::GetTextLineHeight();
+        float chipWidth = ImGui::CalcTextSize(compactSummary.c_str()).x + 34.0f;
+        ImVec2 chipMax(viewport->WorkPos.x + viewport->WorkSize.x - 12.0f,
+            viewport->WorkPos.y + compactLineHeight + 14.0f);
+        ImVec2 chipMin(chipMax.x - chipWidth, viewport->WorkPos.y + 4.0f);
+        const ImVec2 mousePos = ImGui::GetIO().MousePos;
+        bool chipHovered = mousePos.x >= chipMin.x && mousePos.x <= chipMax.x &&
+            mousePos.y >= chipMin.y && mousePos.y <= chipMax.y;
+        ImVec4 chipBackground = m_resolvedLightTheme ? ImVec4(0.92f, 0.95f, 0.99f, 0.98f)
+            : ImVec4(0.04f, 0.06f, 0.09f, 0.98f);
+        if (chipHovered) {
+            ImVec4 hover = ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered);
+            chipBackground.x = (chipBackground.x + hover.x) * 0.5f;
+            chipBackground.y = (chipBackground.y + hover.y) * 0.5f;
+            chipBackground.z = (chipBackground.z + hover.z) * 0.5f;
+        }
+        compactDraw->AddRectFilled(chipMin, chipMax, ImGui::ColorConvertFloat4ToU32(chipBackground), 7.0f);
+        compactDraw->AddRect(chipMin, chipMax, ImGui::GetColorU32(ImGuiCol_Border), 7.0f);
+        ImVec4 indicatorColor = activeCount > 0 ? ImVec4(0.30f, 0.68f, 1.0f, 1.0f)
+            : ImVec4(0.25f, 0.92f, 0.55f, 1.0f);
+        compactDraw->AddCircleFilled(ImVec2(chipMin.x + 13.0f, (chipMin.y + chipMax.y) * 0.5f), 4.0f,
+            ImGui::ColorConvertFloat4ToU32(indicatorColor));
+        compactDraw->AddText(ImVec2(chipMin.x + 24.0f, chipMin.y + 5.0f),
+            ImGui::GetColorU32(ImGuiCol_Text), compactSummary.c_str());
+
+        if (chipHovered && ImGui::GetIO().MouseClicked[ImGuiMouseButton_Left]) {
+            m_connectionActivityVisibleUntil = now + std::chrono::seconds(6);
+            m_connectionActivityManualUntil = m_connectionActivityVisibleUntil;
+        }
+        if (chipHovered) {
+            ImGui::BeginTooltip();
+            ImGui::TextColored(m_theme.gradientPrimary, "Click to show connection cards");
+            ImGui::Separator();
+            for (const auto& card : cards) {
+                ImGui::BulletText("%s", card.name.c_str());
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", card.stage.c_str());
+            }
+            ImGui::EndTooltip();
+        }
+    }
+
+    if ((!canShowFullCards && !manuallyExpanded) || m_connectionActivityAlpha == 0.0f) return;
+
+    float width = canShowFullCards ? std::min(580.0f, viewport->WorkSize.x * 0.48f)
+        : std::min(580.0f, viewport->WorkSize.x - 24.0f);
+    float lineHeight = ImGui::GetTextLineHeight();
+    float headerTop = 9.0f;
+    float cardTopOffset = headerTop + lineHeight + 10.0f;
+    float cardHeight = lineHeight * 2.0f + 24.0f;
+    float height = cardTopOffset + cardHeight + 9.0f;
+    ImVec2 panelMin(viewport->WorkPos.x + viewport->WorkSize.x - width - 16.0f,
+        viewport->WorkPos.y + 58.0f - (1.0f - m_connectionActivityAlpha) * 8.0f);
+    ImVec2 panelMax(panelMin.x + width, panelMin.y + height);
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    auto fadedColor = [&](ImVec4 color) {
+        color.w *= m_connectionActivityAlpha;
+        return ImGui::ColorConvertFloat4ToU32(color);
+    };
+    auto fadedStyleColor = [&](ImGuiCol color) {
+        return fadedColor(ImGui::GetStyleColorVec4(color));
+    };
+    ImVec4 panelBackground = m_resolvedLightTheme ? ImVec4(0.975f, 0.984f, 1.0f, 0.97f)
+        : ImVec4(0.027f, 0.035f, 0.052f, 0.97f);
+    ImVec4 panelBorder = ImGui::GetStyleColorVec4(ImGuiCol_Border);
+    draw->AddRectFilled(panelMin, panelMax, fadedColor(panelBackground), 10.0f);
+    draw->AddRect(panelMin, panelMax, fadedColor(panelBorder), 10.0f, 0, 1.0f);
+
+    draw->AddText(ImVec2(panelMin.x + 13.0f, panelMin.y + 9.0f),
+        fadedColor(m_theme.gradientPrimary),
+        "DEVICE CONNECTIONS");
+    std::string summary = activeCount > 0 ? std::to_string(activeCount) + " active" : "All ready";
+    draw->AddText(ImVec2(panelMax.x - 13.0f - ImGui::CalcTextSize(summary.c_str()).x, panelMin.y + 9.0f),
+        fadedStyleColor(ImGuiCol_TextDisabled), summary.c_str());
+
+    float gap = 8.0f;
+    float cardWidth = (width - 24.0f - gap * (cards.size() - 1)) / (float)cards.size();
+    float cardTop = panelMin.y + cardTopOffset;
+    for (int i = 0; i < (int)cards.size(); ++i) {
+        const auto& card = cards[i];
+        ImVec4 accent = card.connected ? ImVec4(0.25f, 0.92f, 0.55f, 1.0f) :
+            (card.connecting ? ImVec4(0.30f, 0.68f, 1.0f, 1.0f) : ImVec4(1.0f, 0.68f, 0.24f, 1.0f));
+        ImU32 accentColor = fadedColor(accent);
+        ImVec2 cardMin(panelMin.x + 12.0f + i * (cardWidth + gap), cardTop);
+        ImVec2 cardMax(cardMin.x + cardWidth, cardMin.y + cardHeight);
+        ImVec4 cardBase = m_resolvedLightTheme ? ImVec4(0.94f, 0.96f, 0.99f, 0.98f)
+            : ImVec4(0.022f, 0.029f, 0.044f, 0.98f);
+        float cardTint = m_resolvedLightTheme ? 0.07f : 0.075f;
+        cardBase.x += accent.x * cardTint;
+        cardBase.y += accent.y * cardTint;
+        cardBase.z += accent.z * cardTint;
+        draw->AddRectFilled(cardMin, cardMax, fadedColor(cardBase), 7.0f);
+        draw->AddRect(cardMin, cardMax, fadedStyleColor(ImGuiCol_Border), 7.0f);
+        ImVec2 indicator(cardMin.x + 14.0f, cardMin.y + 8.0f + lineHeight * 0.5f);
+            if (card.connecting) {
+                float phase = (float)ImGui::GetTime() * 4.2f;
+                for (int dot = 0; dot < 6; ++dot) {
+                    float angle = phase + dot * 1.0471976f;
+                    float alpha = 0.25f + 0.75f * (float)(dot + 1) / 6.0f;
+                    draw->AddCircleFilled(ImVec2(indicator.x + cosf(angle) * 5.0f,
+                        indicator.y + sinf(angle) * 5.0f), 1.6f,
+                        fadedColor(ImVec4(accent.x, accent.y, accent.z, alpha)));
+                }
+            } else {
+                float pulse = card.connected ? 1.0f : 0.65f + 0.35f * sinf((float)ImGui::GetTime() * 3.0f);
+                draw->AddCircleFilled(indicator, 4.5f,
+                    fadedColor(ImVec4(accent.x, accent.y, accent.z, pulse)));
+            }
+
+        std::string title = card.name;
+        if (title.size() > 27) title = title.substr(0, 24) + "...";
+        std::string stage = card.stage;
+        if (stage.size() > 36) stage = stage.substr(0, 33) + "...";
+        float titleY = cardMin.y + 7.0f;
+        float stageY = titleY + lineHeight + 5.0f;
+        draw->AddText(ImVec2(cardMin.x + 28.0f, titleY), fadedStyleColor(ImGuiCol_Text), title.c_str());
+        draw->AddText(ImVec2(cardMin.x + 28.0f, stageY), fadedStyleColor(ImGuiCol_TextDisabled), stage.c_str());
+
+            float barLeft = cardMin.x + 8.0f;
+            float barRight = cardMax.x - 8.0f;
+            float barY = cardMax.y - 5.0f;
+            draw->AddRectFilled(ImVec2(barLeft, barY), ImVec2(barRight, barY + 2.0f),
+                fadedStyleColor(ImGuiCol_FrameBg), 1.0f);
+            if (card.connecting) {
+                float travel = barRight - barLeft;
+                float head = fmodf((float)ImGui::GetTime() * 120.0f, travel + 55.0f) - 55.0f;
+                float start = std::max(barLeft, barLeft + head);
+                float end = std::min(barRight, barLeft + head + 55.0f);
+                if (end > start) draw->AddRectFilled(ImVec2(start, barY), ImVec2(end, barY + 2.0f),
+                    fadedColor(accent), 1.0f);
+            } else if (card.connected) {
+                draw->AddRectFilled(ImVec2(barLeft, barY), ImVec2(barRight, barY + 2.0f),
+                    accentColor, 1.0f);
+            }
+    }
+}
+
+void App::renderPanel(FilePanel& panel, PanelSide side) {
+    if (panel.isApps) {
+        renderAppsPanel(panel, side);
+        return;
+    }
+
+    const char* label = panel.isAndroid ? "Android" : "Windows";
+    ImVec4 labelColor = panel.isAndroid ? ImVec4(0.3f,0.85f,0.4f,1) : ImVec4(0.40f,0.65f,1,1);
+
+    // The connection manager is a persistent pane mode. It is also used as the
+    // setup fallback when an Android pane has no connected device.
+    bool connectionSetupActive = m_primaryReconnectActive || m_wifiTransitionActive || m_device.isConnecting() ||
+        m_deviceSlots[1].isConnecting();
+    if (panel.isConnections || (panel.isAndroid &&
+        (!deviceFor(panel).isServerRunning() || connectionSetupActive))) {
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 1.0f);
+
+        std::string sideId = side == PanelSide::Left ? "L" : "R";
+        if (modernSmallButton(("PC##Connections" + sideId).c_str())) switchPanelMode(panel, false);
+        ImGui::SameLine(0, 2);
+        if (modernSmallButton(("Android##Connections" + sideId).c_str())) switchPanelMode(panel, true);
+        ImGui::SameLine(0, 2);
+        if (modernSmallButton(("Apps##Connections" + sideId).c_str())) switchPanelToApps(panel);
+        ImGui::SameLine(0, 2);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.28f, 0.46f, 1));
+        modernSmallButton(("Connections##Connections" + sideId).c_str());
+        ImGui::PopStyleColor();
+
+        float availH = ImGui::GetContentRegionAvail().y;
+        float centerY = availH * 0.3f;
+        ImGui::SetCursorPosY(centerY);
+
+        // Center content
+        float availW = ImGui::GetContentRegionAvail().x;
+        float contentW = 360.0f;
+        float padX = (availW - contentW) * 0.5f;
+        if (padX > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + padX);
+
+        ImGui::BeginGroup();
+
+        ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Connection Manager");
+        ImGui::Spacing();
+        ImGui::Spacing();
+
+        if (connectionSetupActive) {
+            std::string status = m_device.statusText();
+            if (status.empty()) status = "Preparing USB and WiFi connections...";
+            float progressCardWidth = std::min(contentW, availW);
+
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.035f, 0.065f, 0.105f, 0.96f));
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.16f, 0.35f, 0.58f, 0.85f));
+            ImGui::BeginChild("##ConnectionProgressCard", ImVec2(progressCardWidth, 124.0f), ImGuiChildFlags_Borders,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            ImVec2 cardPos = ImGui::GetWindowPos();
+            ImVec2 spinnerCenter(cardPos.x + 28.0f, cardPos.y + 52.0f);
+            float phase = (float)ImGui::GetTime() * 8.0f;
+            for (int i = 0; i < 12; ++i) {
+                float angle = ((float)i / 12.0f) * 6.2831853f - 1.5707963f;
+                float intensity = 0.20f + 0.80f * std::max(0.0f, std::cos(angle - phase));
+                ImVec2 dot(spinnerCenter.x + std::cos(angle) * 11.0f,
+                           spinnerCenter.y + std::sin(angle) * 11.0f);
+                drawList->AddCircleFilled(dot, 2.3f, IM_COL32(74, 174, 255, (int)(255.0f * intensity)));
+            }
+
+            ImGui::SetCursorPos(ImVec2(54.0f, 15.0f));
+            ImGui::TextColored(ImVec4(0.34f, 0.73f, 1.0f, 1.0f), "Establishing device connections");
+            ImGui::SetCursorPos(ImVec2(54.0f, 42.0f));
+            ImGui::PushTextWrapPos(progressCardWidth - 12.0f);
+            ImGui::TextDisabled("%s", status.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::SetCursorPos(ImVec2(54.0f, 78.0f));
+            ImGui::PushTextWrapPos(progressCardWidth - 12.0f);
+            ImGui::TextDisabled("File panes will appear when the active channels are ready.");
+            ImGui::PopTextWrapPos();
+
+            ImGui::EndChild();
+            ImGui::PopStyleColor(2);
+            ImGui::Spacing();
+        }
+
+        // Show other connected devices the user can switch to
+        int onlineDeviceCount = 0;
+        std::vector<int> physicalDeviceIndices;
+        {
+            std::lock_guard<std::mutex> lk(m_deviceMutex);
+            std::map<std::string, int> physicalDeviceIndex;
+            for (int i = 0; i < (int)m_devices.size(); ++i) {
+                const auto& device = m_devices[i];
+                if (device.state != "device") continue;
+
+                std::string identity = device.serial;
+                for (const auto& saved : m_prefs.savedWifiDevices) {
+                    if (saved.wifiIp.empty()) continue;
+                    std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
+                    if ((saved.serial == device.serial || wifiSerial == device.serial) &&
+                        !saved.serial.empty() && saved.serial != wifiSerial) {
+                        identity = saved.serial;
+                        break;
+                    }
+                }
+
+                auto existing = physicalDeviceIndex.find(identity);
+                if (existing == physicalDeviceIndex.end()) {
+                    physicalDeviceIndex.emplace(identity, i);
+                    physicalDeviceIndices.push_back(i);
+                } else if (isWifiSerial(m_devices[existing->second].serial) && !isWifiSerial(device.serial)) {
+                    int previousIndex = existing->second;
+                    existing->second = i;
+                    auto indexIt = std::find(physicalDeviceIndices.begin(), physicalDeviceIndices.end(), previousIndex);
+                    if (indexIt != physicalDeviceIndices.end()) *indexIt = i;
+                }
+            }
+            onlineDeviceCount = (int)physicalDeviceIndices.size();
+            auto samePhysicalDevice = [&](const std::string& first, const std::string& second) {
+                if (first == second) return true;
+                for (const auto& saved : m_prefs.savedWifiDevices) {
+                    if (saved.wifiIp.empty()) continue;
+                    std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
+                    if ((first == saved.serial && second == wifiSerial) ||
+                        (first == wifiSerial && second == saved.serial))
+                        return true;
+                }
+                return false;
+            };
+            if (onlineDeviceCount > 0) {
+                ImGui::TextDisabled("Available devices:");
+                ImGui::Spacing();
+                for (int i : physicalDeviceIndices) {
+                    bool isSel = (m_selectedDevice == i);
+                    std::string label = m_devices[i].serial;
+                    if (!m_devices[i].model.empty()) label = m_devices[i].model + " (" + m_devices[i].serial + ")";
+                    if (isSel) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
+                    }
+                    if (modernSmallButton(label.c_str())) {
+                        std::string selectedSerial = m_devices[i].serial;
+                        bool alreadyConnected = (m_slotConnected[0] &&
+                            samePhysicalDevice(m_slotSerial[0], selectedSerial) && m_device.isServerRunning()) ||
+                            (m_slotConnected[1] && samePhysicalDevice(m_slotSerial[1], selectedSerial) &&
+                             m_deviceSlots[1].isServerRunning());
+                        if (!isSel && alreadyConnected) {
+                            m_statusMessage = "Device is already connected. Select it from an Android pane.";
+                            m_statusTime = std::chrono::steady_clock::now();
+                        } else if (!isSel) {
+                            m_selectedDevice = i;
+                        }
+                        if (!isSel && !alreadyConnected) {
+                            m_lastDeviceSerial.clear();
+                            panel.needsRefresh = true;
+                            postAsync("Connecting to " + selectedSerial + "...", [this, selectedSerial]() {
+                                connectDeviceBySerialNow(selectedSerial);
+                            });
+                        }
+                    }
+                    if (isSel) ImGui::PopStyleColor(2);
+                }
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+            }
+        }
+
+        // Show saved WiFi devices the user can connect to directly
+        if (!m_prefs.savedWifiDevices.empty()) {
+            ImGui::TextDisabled("Saved WiFi devices:");
+            ImGui::Spacing();
+            int deleteSavedDevice = -1;
+            for (int si = 0; si < (int)m_prefs.savedWifiDevices.size(); si++) {
+                auto& w = m_prefs.savedWifiDevices[si];
+                if (w.wifiIp.empty()) continue;
+                std::string connectAddr = w.wifiIp + ":" + std::to_string(w.port);
+                std::string displayLabel;
+                if (!w.model.empty())
+                    displayLabel = w.model + " (" + connectAddr + ")";
+                else if (!w.serial.empty() && w.serial != connectAddr)
+                    displayLabel = w.serial + " (" + connectAddr + ")";
+                else
+                    displayLabel = connectAddr;
+                std::string btnLabel = "Connect##saved" + std::to_string(si);
+                // Auto-connect on launch checkbox
+                std::string autoLabel = "Auto##auto" + std::to_string(si);
+                if (ImGui::Checkbox(autoLabel.c_str(), &w.autoConnect)) {
+                    m_prefs.save();
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Automatically connect to this device\nwhen the app launches");
+                ImGui::SameLine();
+                if (modernSmallButton(btnLabel.c_str())) {
+                    int savedIdx = si;
+                    postAsync("Connecting to " + connectAddr + "...", [this, connectAddr, savedIdx]() {
+                        std::string result = m_device.runAdbCommand("connect " + connectAddr);
+                        if (result.find("connected") != std::string::npos &&
+                            result.find("failed") == std::string::npos) {
+                            m_statusMessage = "Connected: " + connectAddr;
+                            m_prefs.wifiAutoConnect = true;
+                            // Backfill model if missing
+                            if (savedIdx < (int)m_prefs.savedWifiDevices.size() &&
+                                m_prefs.savedWifiDevices[savedIdx].model.empty()) {
+                                std::string displayName = queryDeviceDisplayName(connectAddr);
+                                if (!displayName.empty()) {
+                                    m_prefs.savedWifiDevices[savedIdx].model = displayName;
+                                    m_prefs.save();
+                                }
+                            }
+                            connectDeviceBySerialNow(connectAddr);
+                        } else {
+                            m_statusMessage = "Connect failed: " + result;
+                        }
+                        m_statusTime = std::chrono::steady_clock::now();
+                    });
+                }
+                ImGui::SameLine();
+                std::string delLabel = "Delete##saved" + std::to_string(si);
+                if (modernSmallButton(delLabel.c_str())) {
+                    deleteSavedDevice = si;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Remove this saved device");
+                ImGui::SameLine();
+                ImGui::Text("%s", displayLabel.c_str());
+            }
+            if (deleteSavedDevice >= 0 && deleteSavedDevice < (int)m_prefs.savedWifiDevices.size()) {
+                std::string removed = m_prefs.savedWifiDevices[deleteSavedDevice].model;
+                if (removed.empty()) {
+                    auto& w = m_prefs.savedWifiDevices[deleteSavedDevice];
+                    removed = w.wifiIp + ":" + std::to_string(w.port);
+                }
+                m_prefs.savedWifiDevices.erase(m_prefs.savedWifiDevices.begin() + deleteSavedDevice);
+                m_prefs.save();
+                m_statusMessage = "Removed saved device: " + removed;
+                m_statusTime = std::chrono::steady_clock::now();
+            }
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+        }
+
+        if (!connectionSetupActive) {
+            ImGui::TextDisabled("1. Connect your phone via USB cable");
+            ImGui::TextDisabled("2. Enable Developer Options and USB Debugging");
+            ImGui::TextDisabled("3. When prompted, tap Allow to authorize this computer");
+            ImGui::Spacing();
+            ImGui::TextDisabled("For wireless transfers, use the setup wizard below.");
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            float btn1W = ImGui::CalcTextSize("Run Setup Wizard").x + ImGui::GetStyle().FramePadding.x * 2;
+            float btn2W = ImGui::CalcTextSize("WiFi ADB Pairing (Android 11+)").x + ImGui::GetStyle().FramePadding.x * 2;
+            float btnW = std::max(btn1W, btn2W);
+
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (contentW - btnW) * 0.5f);
+            if (modernButton("Run Setup Wizard", ImVec2(btnW, 0))) {
+                m_showWifiWizard = true;
+                m_wizardStep = 0;
+            }
+            ImGui::PopStyleColor(2);
+
+            ImGui::Spacing();
+
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f, 0.35f, 0.10f, 1));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.50f, 0.15f, 1));
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (contentW - btnW) * 0.5f);
+            if (modernButton("WiFi ADB Pairing (Android 11+)", ImVec2(btnW, 0))) {
+                m_showWifiPairing = true;
+                m_pairingIp[0] = '\0';
+                m_pairingCode[0] = '\0';
+            }
+            ImGui::PopStyleColor(2);
+
+            ImGui::Spacing();
+            ImGui::Spacing();
+        }
+
+        if (onlineDeviceCount == 0) {
+            char waitText[32];
+            float t = (float)fmod(ImGui::GetTime() * 0.8, 1.0);
+            int dots = (int)(t * 4) % 4;
+            snprintf(waitText, sizeof(waitText), "Waiting for device%.*s", dots, "...");
+            float textW = ImGui::CalcTextSize(waitText).x;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (contentW - textW) * 0.5f);
+            ImGui::TextDisabled("%s", waitText);
+        } else {
+            std::string deviceText = std::to_string(onlineDeviceCount) +
+                (onlineDeviceCount == 1 ? " device available" : " devices available");
+            float textW = ImGui::CalcTextSize(deviceText.c_str()).x;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (contentW - textW) * 0.5f);
+            ImGui::TextColored(ImVec4(0.3f, 0.85f, 0.45f, 1), "%s", deviceText.c_str());
+        }
+
+        ImGui::EndGroup();
+        ImGui::PopStyleVar();
+        return;
+    }
+
+    // Fade-in animation after navigation
+    {
+        auto& navTime = (side == PanelSide::Left) ? m_lastNavTimeLeft : m_lastNavTimeRight;
+        float elapsed = (float)std::chrono::duration<double>(std::chrono::steady_clock::now() - navTime).count();
+        float alpha = std::min(elapsed / 0.15f, 1.0f); // 150ms fade
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * alpha);
+    }
+
+    // --- Navigation bar: Back / Forward / Up + Breadcrumb ---
+    bool canBack = panel.navHistoryPos > 0;
+    bool canFwd = panel.navHistoryPos >= 0 && panel.navHistoryPos < (int)panel.navHistory.size() - 1;
+
+    auto triggerNavAnim = [&]() {
+        if (side == PanelSide::Left) m_lastNavTimeLeft = std::chrono::steady_clock::now();
+        else m_lastNavTimeRight = std::chrono::steady_clock::now();
+    };
+
+    ImGui::BeginDisabled(!canBack);
+    if (modernSmallButton(("<##B" + std::string(label)).c_str())) {
+        panel.navHistoryPos--;
+        panel.currentPath = panel.navHistory[panel.navHistoryPos];
+        panel.selectedIndices.clear(); panel.focusedIndex = -1;
+        panel.searchFilter[0] = '\0'; panel.needsRefresh = true;
+        strcpy_s(panel.pathInput, panel.currentPath.c_str());
+        triggerNavAnim();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0, 2);
+
+    ImGui::BeginDisabled(!canFwd);
+    if (modernSmallButton((">##F" + std::string(label)).c_str())) {
+        panel.navHistoryPos++;
+        panel.currentPath = panel.navHistory[panel.navHistoryPos];
+        panel.selectedIndices.clear(); panel.focusedIndex = -1;
+        panel.searchFilter[0] = '\0'; panel.needsRefresh = true;
+        strcpy_s(panel.pathInput, panel.currentPath.c_str());
+        triggerNavAnim();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0, 4);
+
+    if (modernSmallButton(("^##U" + std::string(label)).c_str())) navigateUp(panel);
+    ImGui::SameLine(0, 6);
+
+    // Panel mode toggle: Windows / Android / Apps
+    {
+        std::string winId = std::string("PC##") + (side == PanelSide::Left ? "L" : "R");
+        std::string andId = std::string("Android##") + (side == PanelSide::Left ? "L" : "R");
+        std::string appsId = std::string("Apps##") + (side == PanelSide::Left ? "L" : "R");
+        std::string connectionsId = std::string("Connections##") + (side == PanelSide::Left ? "L" : "R");
+
+        if (!panel.isAndroid) {
+            // Windows is active — show it highlighted, Android as clickable
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.22f, 0.38f, 1));
+            modernSmallButton(winId.c_str());
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0, 2);
+            if (modernSmallButton(andId.c_str())) switchPanelMode(panel, true);
+            ImGui::SameLine(0, 2);
+            if (modernSmallButton(appsId.c_str())) switchPanelToApps(panel);
+            ImGui::SameLine(0, 2);
+            if (modernSmallButton(connectionsId.c_str())) switchPanelToConnections(panel);
+        } else {
+            // Android is active
+            if (modernSmallButton(winId.c_str())) switchPanelMode(panel, false);
+            ImGui::SameLine(0, 2);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.30f, 0.15f, 1));
+            modernSmallButton(andId.c_str());
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0, 2);
+            if (modernSmallButton(appsId.c_str())) switchPanelToApps(panel);
+            ImGui::SameLine(0, 2);
+            if (modernSmallButton(connectionsId.c_str())) switchPanelToConnections(panel);
+
+            // Device indicator / selector - always visible when in Android mode
+            {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+
+                // Count online devices
+                int onlineCount = 0;
+                for (auto& d : m_devices) if (d.state == "device") onlineCount++;
+
+                // Helper: get friendly display name for a device slot
+                auto getSlotName = [&](int slot) -> std::string {
+                    if (slot < 0 || slot >= 2 || !m_slotConnected[slot]) return "No device";
+                    auto it = m_deviceDisplayNames.find(m_slotSerial[slot]);
+                    if (it != m_deviceDisplayNames.end()) return it->second;
+                    for (auto& d : m_devices) {
+                        if (d.serial == m_slotSerial[slot])
+                            return d.model.empty() ? d.serial : d.model;
+                    }
+                    return m_slotSerial[slot];
+                };
+                auto channelBadgeText = [&](int slot) -> const char* {
+                    if (slot == 0 && m_dualChannelAvailable && m_activeChannelCount > 1) return "dual";
+                    if (slot >= 0 && slot < 2 && m_slotConnected[slot]) {
+                        auto pipes = m_prefs.pipePreferencesFor(m_slotSerial[slot]);
+                        if (pipes.usbPipeCount > 1 || pipes.wifiPipeCount > 1) return "multi";
+                    }
+                    return "single";
+                };
+                auto channelBadgeColor = [&](int slot) -> ImVec4 {
+                    auto pipes = (slot >= 0 && slot < 2) ? m_prefs.pipePreferencesFor(m_slotSerial[slot]) : DevicePipePreference{};
+                    if ((slot == 0 && m_dualChannelAvailable && m_activeChannelCount > 1) ||
+                        (slot >= 0 && slot < 2 && m_slotConnected[slot] &&
+                         (pipes.usbPipeCount > 1 || pipes.wifiPipeCount > 1)))
+                        return ImVec4(0.25f, 0.80f, 0.35f, 1.0f);
+                    return ImVec4(0.95f, 0.65f, 0.25f, 1.0f);
+                };
+                auto showChannelTooltip = [&](int slot) {
+                    if (slot == 0 && m_dualChannelAvailable && m_activeChannelCount > 1) {
+                        ImGui::SetTooltip("%d transfer channels available for this device", m_activeChannelCount);
+                    } else if (slot >= 0 && slot < 2 && m_slotConnected[slot] && [&] {
+                        auto pipes = m_prefs.pipePreferencesFor(m_slotSerial[slot]);
+                        return pipes.usbPipeCount > 1 || pipes.wifiPipeCount > 1;
+                    }()) {
+                        ImGui::SetTooltip("Extra transfer channels will be opened for this device when a transfer starts");
+                    } else if (slot == 0) {
+                        ImGui::SetTooltip("Single-channel transfer for this device");
+                    } else {
+                        ImGui::SetTooltip("Secondary devices use a separate single-channel connection");
+                    }
+                };
+
+                // Slot colors for visual distinction between devices
+                static const ImVec4 slotColors[] = {
+                    ImVec4(0.35f, 0.65f, 1.0f, 1.0f),  // slot 0: blue
+                    ImVec4(0.2f,  0.85f, 0.5f, 1.0f),   // slot 1: green
+                };
+
+                int slotIdx = panel.deviceSlot;
+                ImVec4 slotColor = slotColors[slotIdx < 2 ? slotIdx : 0];
+
+                if (onlineCount >= 1 && m_slotConnected[slotIdx]) {
+                    ImGui::SameLine(0, 8);
+
+                    // Draw colored dot indicator
+                    ImVec2 dotPos = ImGui::GetCursorScreenPos();
+                    dotPos.x += 4.0f;
+                    dotPos.y += ImGui::GetFrameHeight() * 0.5f;
+                    ImGui::GetWindowDrawList()->AddCircleFilled(dotPos, 4.0f,
+                        ImGui::ColorConvertFloat4ToU32(slotColor));
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14);
+
+                    std::string currentName = getSlotName(slotIdx);
+
+                    if (onlineCount > 1) {
+                        // Multiple devices: dropdown to switch
+                        std::string comboId = "##DevSlot" + std::string(side == PanelSide::Left ? "L" : "R");
+                        ImGui::SetNextItemWidth(200);
+                        if (ImGui::BeginCombo(comboId.c_str(), currentName.c_str())) {
+                            for (int di = 0; di < 2; di++) {
+                                if (!m_slotConnected[di]) continue;
+                                bool isSel = (panel.deviceSlot == di);
+                                std::string devName = getSlotName(di);
+                                // Show serial in parentheses for disambiguation, unique ImGui ID per slot
+                                std::string fullLabel = devName + "  (" + m_slotSerial[di] + ")  [" +
+                                    channelBadgeText(di) + "]##slot" + std::to_string(di);
+
+                                ImVec4 itemColor = slotColors[di < 2 ? di : 0];
+                                if (isSel) ImGui::PushStyleColor(ImGuiCol_Text, itemColor);
+
+                                if (ImGui::Selectable(fullLabel.c_str(), isSel)) {
+                                    if (panel.deviceSlot != di) {
+                                        panel.deviceSlot = di;
+                                        panel.currentPath = m_slotStorageRoot[di].empty() ? "/" : m_slotStorageRoot[di];
+                                        strcpy_s(panel.pathInput, panel.currentPath.c_str());
+                                        panel.needsRefresh = true;
+                                        panel.navHistory.clear();
+                                        panel.navHistoryPos = -1;
+                                    }
+                                }
+                                if (isSel) ImGui::PopStyleColor();
+                            }
+                            ImGui::EndCombo();
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Switch which device this panel browses");
+                    } else {
+                        // Single device: show name as colored label
+                        ImGui::TextColored(slotColor, "%s", currentName.c_str());
+                    }
+                    ImGui::SameLine(0, 6);
+                    ImGui::TextColored(channelBadgeColor(slotIdx), "%s", channelBadgeText(slotIdx));
+                    if (ImGui::IsItemHovered()) showChannelTooltip(slotIdx);
+                }
+            }
+        }
+    }
+    ImGui::SameLine(0, 6);
+
+    // Breadcrumb path — clickable segments
+    {
+        char sep = panel.isAndroid ? '/' : '\\';
+        std::string path = panel.currentPath;
+        std::vector<std::pair<std::string, std::string>> crumbs; // {segment, full path}
+
+        if (panel.isAndroid) {
+            if (!path.empty() && path[0] == '/') {
+                crumbs.push_back({"/", "/"});
+                path = path.substr(1);
+            }
+            std::string accum = "/";
+            size_t pos = 0;
+            while (pos < path.size()) {
+                size_t next = path.find('/', pos);
+                if (next == std::string::npos) next = path.size();
+                std::string seg = path.substr(pos, next - pos);
+                if (!seg.empty()) {
+                    accum += seg;
+                    crumbs.push_back({seg, accum});
+                    accum += "/";
+                }
+                pos = next + 1;
+            }
+        } else {
+            // Windows: "C:\Users\Foo" -> ["C:\", "Users", "Foo"]
+            if (path.size() >= 2 && path[1] == ':') {
+                std::string root = path.substr(0, 3); // "C:\"
+                crumbs.push_back({root, root});
+                path = (path.size() > 3) ? path.substr(3) : "";
+            }
+            std::string accum = crumbs.empty() ? "" : crumbs[0].second;
+            size_t pos = 0;
+            while (pos < path.size()) {
+                size_t next = path.find('\\', pos);
+                if (next == std::string::npos) next = path.size();
+                std::string seg = path.substr(pos, next - pos);
+                if (!seg.empty()) {
+                    appendPathSeparator(accum, '\\');
+                    accum += seg;
+                    crumbs.push_back({seg, accum});
+                }
+                pos = next + 1;
+            }
+        }
+
+        for (size_t ci = 0; ci < crumbs.size(); ci++) {
+            if (ci > 0) {
+                ImGui::SameLine(0, 0);
+                alignTextToCompactFrame();
+                ImGui::TextDisabled("%c", sep);
+                ImGui::SameLine(0, 0);
+            }
+            ImGui::PushID((int)ci);
+            if (ci < crumbs.size() - 1) {
+                // Clickable
+                if (modernSmallButton(crumbs[ci].first.c_str()))
+                    navigateToDirectory(panel, crumbs[ci].second);
+            } else {
+                // Current (non-clickable, highlighted)
+                alignTextToCompactFrame();
+                ImGui::TextColored(ImVec4(0.5f,0.75f,1,1), "%s", crumbs[ci].first.c_str());
+            }
+            ImGui::PopID();
+        }
+    }
+
+    // Filter bar
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint(("##Filter" + std::string(label)).c_str(), "Search / filter...", panel.searchFilter, sizeof(panel.searchFilter));
+    ImGui::Separator();
+
+    renderFavoritesBar(panel, side);
+    if (!m_prefs.favoritePaths.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+    }
+
+    if (!panel.isAndroid) {
+        for (const auto& d : getWindowsDrives()) { if (modernSmallButton(d.c_str())) navigateToDirectory(panel, d + "\\"); ImGui::SameLine(); }
+        ImGui::NewLine();
+    } else {
+        // Dynamic bookmarks based on detected storage
+        std::string root = m_androidStorageRoot.empty() ? "/sdcard" : m_androidStorageRoot;
+
+        // Storage volumes (internal + SD cards)
+        for (size_t vi = 0; vi < m_androidVolumes.size(); vi++) {
+            std::string label = (vi == 0) ? "Internal" : "SD " + std::to_string(vi);
+            if (modernSmallButton(label.c_str())) navigateToDirectory(panel, m_androidVolumes[vi]);
+            ImGui::SameLine();
+        }
+        if (m_androidVolumes.empty()) {
+            if (modernSmallButton("Storage")) navigateToDirectory(panel, root);
+            ImGui::SameLine();
+        }
+
+        // Common subfolders
+        const char* subfolders[] = {"Download", "DCIM", "Documents", "Pictures", "Music"};
+        for (const char* sub : subfolders) {
+            if (modernSmallButton(sub)) navigateToDirectory(panel, root + "/" + sub);
+            ImGui::SameLine();
+        }
+
+        // Root access button
+        if (modernSmallButton("/")) navigateToDirectory(panel, "/");
+        ImGui::SameLine();
+        ImGui::NewLine();
+    }
+
+    // Ctrl+A — select all
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && ImGui::IsKeyPressed(ImGuiKey_A) && ImGui::GetIO().KeyCtrl) {
+        for (int i = 0; i < panel.entryCount(); i++) panel.selectedIndices.insert(i);
+    }
+
+    ImGuiTableFlags tf = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable;
+    if (ImGui::BeginTable(("##Tbl" + std::string(label)).c_str(), 3, tf)) {
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_DefaultSort, 0.55f);
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthStretch, 0.20f);
+        ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_WidthStretch, 0.25f);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+
+        // Handle sort specs
+        if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+            if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                int col = specs->Specs[0].ColumnIndex;
+                bool desc = specs->Specs[0].SortDirection == ImGuiSortDirection_Descending;
+                panel.sortColumn = col;
+                panel.sortDescending = desc;
+                // Re-sort entries
+                if (panel.isAndroid) {
+                    std::sort(panel.androidEntries.begin(), panel.androidEntries.end(),
+                        [col, desc](const DeviceFileEntry& a, const DeviceFileEntry& b) {
+                            if (a.isDirectory() != b.isDirectory()) return a.isDirectory();
+                            int cmp;
+                            if (col == 1) cmp = (a.size < b.size) ? -1 : (a.size > b.size) ? 1 : 0;
+                            else if (col == 2) cmp = (a.mtime < b.mtime) ? -1 : (a.mtime > b.mtime) ? 1 : 0;
+                            else cmp = _stricmp(a.name.c_str(), b.name.c_str());
+                            return desc ? cmp > 0 : cmp < 0;
+                        });
+                } else {
+                    std::sort(panel.windowsEntries.begin(), panel.windowsEntries.end(),
+                        [col, desc](const WindowsFileEntry& a, const WindowsFileEntry& b) {
+                            if (a.isDirectory != b.isDirectory) return a.isDirectory > b.isDirectory;
+                            int cmp;
+                            if (col == 1) cmp = (a.size < b.size) ? -1 : (a.size > b.size) ? 1 : 0;
+                            else if (col == 2) cmp = a.dateModified.compare(b.dateModified);
+                            else cmp = _stricmp(a.name.c_str(), b.name.c_str());
+                            return desc ? cmp > 0 : cmp < 0;
+                        });
+                }
+                specs->SpecsDirty = false;
+            }
+        }
+
+        // ".." - hide at drive root (e.g. "C:\") or filesystem root ("/")
+        bool atRoot = false;
+        if (!panel.isAndroid) {
+            // Windows: at root if path is "X:\" (3 chars)
+            atRoot = (panel.currentPath.size() <= 3 && panel.currentPath.size() >= 2 && panel.currentPath[1] == ':');
+        } else {
+            atRoot = (panel.currentPath == "/");
+        }
+        if (!atRoot) {
+            ImGui::TableNextRow(); ImGui::TableNextColumn();
+            if (ImGui::Selectable("[..]##up", false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick))
+                if (ImGui::IsMouseDoubleClicked(0)) navigateUp(panel);
+            ImGui::TableNextColumn(); ImGui::TableNextColumn();
+        }
+
+        std::string filter(panel.searchFilter);
+        std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+
+        // Track row screen positions for rubber-band selection
+        struct RowInfo { int index; float yMin, yMax; };
+        std::vector<RowInfo> visibleRows;
+
+        std::unique_lock<std::mutex> compareContentLock;
+        if (m_compareEnabled && m_compareContentEnabled) {
+            compareContentLock = std::unique_lock<std::mutex>(m_compareMutex);
+        }
+
+        int count = panel.entryCount();
+        for (int i = 0; i < count; i++) {
+            std::string name = panel.entryName(i);
+            if (!filter.empty()) {
+                std::string nl = name;
+                std::transform(nl.begin(), nl.end(), nl.begin(), ::tolower);
+                if (nl.find(filter) == std::string::npos) continue;
+            }
+            if (!panel.showHidden && !panel.isAndroid) {
+                if (!name.empty() && name[0] == '.') continue;
+                if (i < (int)panel.windowsEntries.size() && panel.windowsEntries[i].isHidden) continue;
+            }
+
+            bool isDir = panel.entryIsDir(i);
+            bool isSel = panel.selectedIndices.count(i) > 0;
+            CompareContentInfo contentInfo;
+            if (compareContentLock.owns_lock()) {
+                auto contentIt = m_compareContent.find(normalizeCompareName(name));
+                if (contentIt != m_compareContent.end()) contentInfo = contentIt->second;
+            }
+            CompareContentState contentState = contentInfo.state;
+
+            ImGui::TableNextRow();
+            bool compareHighlight = isCompareHighlighted(panel, side, i);
+            if (contentState == CompareContentState::SizeMismatch ||
+                contentState == CompareContentState::HashMismatch) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(110, 34, 34, 155));
+            } else if (contentState == CompareContentState::HashError) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(90, 52, 115, 150));
+            } else if (contentState == CompareContentState::HashMatch) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(30, 82, 48, 120));
+            } else if (contentState == CompareContentState::HashPending) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(70, 70, 78, 100));
+            } else if (compareHighlight) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(122, 92, 18, 150));
+            }
+            ImGui::TableNextColumn();
+
+            // Track row screen position for rubber-band
+            float rowYMin = ImGui::GetCursorScreenPos().y;
+
+            std::string icon = getFileIcon(name, isDir);
+            std::string compareTag;
+            if (contentState == CompareContentState::SizeMismatch) compareTag = " [size diff]";
+            else if (contentState == CompareContentState::HashPending) compareTag = " [hashing]";
+            else if (contentState == CompareContentState::HashMatch) compareTag = " [hash ok]";
+            else if (contentState == CompareContentState::HashMismatch) compareTag = " [hash diff]";
+            else if (contentState == CompareContentState::HashError) compareTag = " [hash error]";
+            std::string sid = icon + " " + name + compareTag + "##" + std::to_string(i);
+
+            bool pushedTextColor = true;
+            if (isDir) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f,0.70f,1,1));
+            else if (contentState == CompareContentState::SizeMismatch ||
+                     contentState == CompareContentState::HashMismatch) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f,0.55f,0.50f,1));
+            else if (contentState == CompareContentState::HashError) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f,0.65f,1.0f,1));
+            else if (contentState == CompareContentState::HashMatch) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,1.0f,0.68f,1));
+            else if (contentState == CompareContentState::HashPending) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.78f,0.78f,0.84f,1));
+            else if (compareHighlight) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f,0.86f,0.42f,1));
+            else pushedTextColor = false;
+            if (isSel) ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.15f,0.28f,0.50f,0.90f));
+
+            ImGuiSelectableFlags sf = ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick;
+            if (ImGui::Selectable(sid.c_str(), isSel, sf)) {
+                ImGuiIO& io = ImGui::GetIO();
+                if (io.KeyCtrl) { if (isSel) panel.selectedIndices.erase(i); else panel.selectedIndices.insert(i); }
+                else if (io.KeyShift && panel.focusedIndex >= 0) {
+                    int lo = std::min(panel.focusedIndex, i), hi = std::max(panel.focusedIndex, i);
+                    for (int j = lo; j <= hi; j++) panel.selectedIndices.insert(j);
+                } else { panel.selectedIndices.clear(); panel.selectedIndices.insert(i); }
+                panel.focusedIndex = i;
+                m_lastFocusedPanel = &panel;
+
+                if (ImGui::IsMouseDoubleClicked(0)) {
+                    if (isDir) {
+                        std::string sep = panel.isAndroid ? "/" : "\\";
+                        std::string np = panel.currentPath;
+                        appendPathSeparator(np, sep[0]);
+                        np += name;
+                        navigateToDirectory(panel, np);
+                    } else if (endsWithCI(name, ".mcraw") && !panel.isAndroid) {
+                        // Windows side: mount MCRAW via ProjFS and navigate to mount point
+                        std::string mcrawFullPath = panel.currentPath;
+                        appendPathSeparator(mcrawFullPath, '\\');
+                        mcrawFullPath += name;
+                        FilePanel* targetPanel = &panel;
+                        postAsync("Mounting MCRAW...", [this, mcrawFullPath, targetPanel]() {
+                            std::string mountPath = McrawMountManager::instance().mountMcraw(mcrawFullPath);
+                            if (!mountPath.empty()) {
+                                targetPanel->insideMcraw = true;
+                                targetPanel->mcrawFilePath = mcrawFullPath;
+                                navigateToDirectory(*targetPanel, mountPath);
+                            } else {
+                                m_statusMessage = "Failed to mount MCRAW";
+                                m_statusTime = std::chrono::steady_clock::now();
+                            }
+                        });
+                    } else if (endsWithCI(name, ".mcraw") && panel.isAndroid) {
+                        // Android side: navigate into MCRAW as virtual directory (protocol-based)
+                        std::string np = panel.currentPath;
+                        appendPathSeparator(np, '/');
+                        np += name;
+                        navigateToDirectory(panel, np);
+                    } else if (panel.insideMcraw && panel.isAndroid) {
+                        // Double-clicked virtual item inside Android MCRAW — pull to temp and open
+                        std::string vname = name;
+                        std::string mcraw = panel.mcrawFilePath;
+                        postAsync("Extracting " + vname + "...", [this, mcraw, vname]() {
+                            char tmpDir[MAX_PATH];
+                            GetTempPathA(MAX_PATH, tmpDir);
+                            std::string tmpPath = std::string(tmpDir) + vname;
+                            uint64_t outSize = 0;
+                            if (m_device.pullMcrawItem(mcraw, vname, tmpPath, outSize)) {
+                                ShellExecuteA(nullptr, "open", tmpPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                            } else {
+                                m_statusMessage = "Failed to extract " + vname;
+                                m_statusTime = std::chrono::steady_clock::now();
+                            }
+                        });
+                    } else if (!panel.isAndroid) {
+                        // Open file on Windows side
+                        std::string fp = panel.currentPath;
+                        appendPathSeparator(fp, '\\');
+                        fp += name;
+                        if (endsWithCI(name, ".apk"))
+                            requestApkInstall(fp);
+                        else
+                            ShellExecuteA(nullptr, "open", fp.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    } else {
+                        // Double-clicked a file on Android side — pull to temp and open
+                        openAndroidFile(panel, i);
+                    }
+                }
+            }
+
+            if (contentState != CompareContentState::Unknown && ImGui::IsItemHovered()) {
+                if (contentState == CompareContentState::SizeMismatch) {
+                    ImGui::SetTooltip("Size differs\nLeft: %s\nRight: %s",
+                        formatSize(contentInfo.leftSize).c_str(), formatSize(contentInfo.rightSize).c_str());
+                } else if (contentState == CompareContentState::HashPending) {
+                    ImGui::SetTooltip("Hash check is queued or running");
+                } else if (contentState == CompareContentState::HashMatch) {
+                    ImGui::SetTooltip("Size and SHA-256 hash match\nSHA-256: %s", contentInfo.leftHash.c_str());
+                } else if (contentState == CompareContentState::HashMismatch) {
+                    ImGui::SetTooltip("Same size, different SHA-256 hash\nLeft: %s\nRight: %s",
+                        contentInfo.leftHash.c_str(), contentInfo.rightHash.c_str());
+                } else if (contentState == CompareContentState::HashError) {
+                    ImGui::SetTooltip("Hash check failed\n%s", contentInfo.detail.c_str());
+                }
+            }
+
+            // --- Drag source — auto-select item if not already selected ---
+            if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+                if (panel.selectedIndices.count(i) == 0) {
+                    panel.selectedIndices.clear();
+                    panel.selectedIndices.insert(i);
+                    panel.focusedIndex = i;
+                }
+                DragPayload dp;
+                dp.isAndroid = panel.isAndroid;
+                ImGui::SetDragDropPayload("FILE_DRAG", &dp, sizeof(dp));
+                int selCount = (int)panel.selectedIndices.size();
+                if (selCount == 1) {
+                    ImGui::Text("Move: %s", name.c_str());
+                } else {
+                    ImGui::Text("Move %d files", selCount);
+                }
+                m_dragSourcePanel = &panel;
+                m_isDragging = true;
+                ImGui::EndDragDropSource();
+            }
+
+            if (isSel) ImGui::PopStyleColor(); // header
+            if (pushedTextColor) ImGui::PopStyleColor(); // text
+
+            // Right-click context - preserve multi-selection if clicking an already-selected item
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                if (panel.selectedIndices.count(i) == 0) {
+                    // Clicked outside selection - select only this item
+                    panel.selectedIndices.clear();
+                    panel.selectedIndices.insert(i);
+                }
+                panel.focusedIndex = i; m_contextPanel = &panel; m_contextIndex = i;
+                ImGui::OpenPopup("##FileContextMenu");
+            }
+
+            ImGui::TableNextColumn();
+            if (!isDir) ImGui::TextDisabled("%s", formatSize(panel.entrySize(i)).c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", panel.entryDate(i).c_str());
+
+            // Record row extent for rubber-band
+            float rowYMax = ImGui::GetCursorScreenPos().y;
+            visibleRows.push_back({i, rowYMin, rowYMax});
+        }
+
+        renderContextMenu(panel);
+
+        // Right-click on empty space in the table area — background context menu
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !ImGui::IsAnyItemHovered() &&
+            ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
+            m_contextPanel = &panel;
+            m_contextIndex = -1;
+            panel.selectedIndices.clear();
+            m_lastFocusedPanel = &panel;
+            ImGui::OpenPopup("##BgContextMenu");
+        }
+        if (ImGui::BeginPopup("##BgContextMenu")) {
+            if (m_contextPanel == &panel) {
+                if (ImGui::MenuItem("New Folder...")) {
+                    memset(m_newFolderName, 0, sizeof(m_newFolderName));
+                    m_contextPanel = &panel; m_showNewFolderPopup = true;
+                }
+                if (!m_clipboardPaths.empty()) {
+                    const char* pasteLabel = m_clipboardCut ? "Move Here" : "Paste";
+                    if (ImGui::MenuItem(pasteLabel, "Ctrl+V")) {
+                        performClipboardPaste(panel);
+                    }
+                }
+            }
+            ImGui::EndPopup();
+        }
+
+        ImGui::EndTable();
+
+        // --- Rubber-band (lasso) selection ---
+        ImVec2 tableMin = ImGui::GetItemRectMin();
+        ImVec2 tableMax = ImGui::GetItemRectMax();
+        ImVec2 mousePos = ImGui::GetMousePos();
+
+        // Start rubber-band on mouse down in the table area (not on a Selectable)
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::GetIO().KeyCtrl &&
+            mousePos.x >= tableMin.x && mousePos.x <= tableMax.x &&
+            mousePos.y >= tableMin.y && mousePos.y <= tableMax.y &&
+            !ImGui::IsAnyItemHovered() && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
+            panel.rubberBandActive = true;
+            panel.rubberBandStart = mousePos;
+            panel.rubberBandEnd = mousePos;
+            if (!ImGui::GetIO().KeyShift)
+                panel.selectedIndices.clear();
+            m_lastFocusedPanel = &panel;
+        }
+
+        if (panel.rubberBandActive) {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                panel.rubberBandEnd = mousePos;
+
+                // Calculate selection rect (normalized)
+                float selMinY = std::min(panel.rubberBandStart.y, panel.rubberBandEnd.y);
+                float selMaxY = std::max(panel.rubberBandStart.y, panel.rubberBandEnd.y);
+                float selMinX = std::min(panel.rubberBandStart.x, panel.rubberBandEnd.x);
+                float selMaxX = std::max(panel.rubberBandStart.x, panel.rubberBandEnd.x);
+
+                // Select rows that overlap the rubber-band rect
+                panel.selectedIndices.clear();
+                for (auto& row : visibleRows) {
+                    if (row.yMax > selMinY && row.yMin < selMaxY) {
+                        panel.selectedIndices.insert(row.index);
+                    }
+                }
+
+                // Draw the rubber-band rectangle
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddRectFilled(
+                    ImVec2(selMinX, selMinY), ImVec2(selMaxX, selMaxY),
+                    IM_COL32(60, 120, 220, 50));
+                dl->AddRect(
+                    ImVec2(selMinX, selMinY), ImVec2(selMaxX, selMaxY),
+                    IM_COL32(80, 140, 240, 180));
+            } else {
+                panel.rubberBandActive = false;
+            }
+        }
+    }
+
+    ImGui::PopStyleVar(); // alpha fade
+}
+
+void App::drawProgressBar(float fraction, const char* overlayText, float height,
+                           ImVec4 barColor, ImVec4 bgColor) {
+    fraction = std::clamp(fraction, 0.0f, 1.0f);
+    if (m_resolvedLightTheme) bgColor = ImGui::GetStyleColorVec4(ImGuiCol_FrameBg);
+    ImVec2 size(ImGui::GetContentRegionAvail().x, height);
+    ImGui::PushID(overlayText ? overlayText : "");
+    ImGui::PushID((int)std::round(height * 10.0f));
+    ImGui::InvisibleButton("##ModernProgress", size);
+    ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+    ImGui::PopID();
+    ImGui::PopID();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    float rounding = std::min(ImGui::GetStyle().FrameRounding, height * 0.5f);
+    draw->AddRectFilled(ImVec2(mn.x, mn.y + 2.0f), ImVec2(mx.x, mx.y + 2.0f),
+        IM_COL32(0, 0, 0, m_resolvedLightTheme ? 22 : 70), rounding);
+    draw->AddRectFilled(mn, mx, ImGui::ColorConvertFloat4ToU32(bgColor), rounding);
+    if (fraction > 0.0f) {
+        ImVec2 fillMax(mn.x + (mx.x - mn.x) * fraction, mx.y);
+        draw->AddRectFilled(mn, fillMax, ImGui::ColorConvertFloat4ToU32(barColor), rounding);
+        ImVec4 highlight(std::min(1.0f, barColor.x + 0.18f), std::min(1.0f, barColor.y + 0.18f),
+            std::min(1.0f, barColor.z + 0.18f), 0.72f);
+        draw->AddLine(ImVec2(mn.x + rounding, mn.y + 1.0f),
+            ImVec2(std::max(mn.x + rounding, fillMax.x - rounding), mn.y + 1.0f),
+            ImGui::ColorConvertFloat4ToU32(highlight), 1.0f);
+    }
+    draw->AddRect(mn, mx, ImGui::GetColorU32(ImGuiCol_Border), rounding);
+    const char* progressText = overlayText ? overlayText : "";
+    ImVec2 ts = ImGui::CalcTextSize(progressText);
+    ImVec2 tp(mn.x + (mx.x - mn.x - ts.x) * 0.5f, mn.y + (mx.y - mn.y - ts.y) * 0.5f);
+    draw->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, m_resolvedLightTheme ? 60 : 180), progressText);
+    draw->AddText(tp, ImGui::GetColorU32(ImGuiCol_Text), progressText);
+}
+
+void App::renderTransferOverlay() {
+    std::shared_ptr<TransferBatch> batch;
+    int queueSize = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_batchMutex);
+        queueSize = (int)m_batchQueue.size();
+        // Find active or most recent batch
+        for (auto& b : m_batchQueue) {
+            BatchState s = b->state.load();
+            if (s == BatchState::Running || s == BatchState::Paused || s == BatchState::Verifying || s == BatchState::WaitingConflict) { batch = b; break; }
+        }
+        // If none active, show the last completed/stopped one
+        if (!batch && !m_batchQueue.empty()) {
+            batch = m_batchQueue.back();
+        }
+    }
+
+    if (!batch) {
+        m_overlayVisible = false;
+        return;
+    }
+
+    // Auto-show overlay when a batch starts
+    BatchState st = batch->state.load();
+    if (st == BatchState::Running || st == BatchState::Paused || st == BatchState::Queued || st == BatchState::Verifying || st == BatchState::WaitingConflict) {
+        if (!m_overlayWasOpen) { m_overlayVisible = true; m_overlayWasOpen = true; }
+    }
+
+    // Auto-dismiss on success (no CRC failures)
+    if (st == BatchState::Completed && m_prefs.autoDismissTransfer && m_overlayVisible) {
+        if (batch->crcFailCount() == 0) {
+            m_overlayVisible = false;
+            m_overlayWasOpen = false;
+            std::lock_guard<std::mutex> lk(m_batchMutex);
+            while (!m_batchQueue.empty()) {
+                BatchState s = m_batchQueue.front()->state.load();
+                if (s == BatchState::Completed || s == BatchState::Failed || s == BatchState::Stopped)
+                    m_batchQueue.pop_front();
+                else break;
+            }
+        }
+    }
+
+    // Smooth fade for overlay
+    if (m_overlayVisible)
+        m_overlayFade = std::min(m_overlayFade + ImGui::GetIO().DeltaTime * 6.0f, 1.0f);
+    else
+        m_overlayFade = std::max(m_overlayFade - ImGui::GetIO().DeltaTime * 8.0f, 0.0f);
+
+    if (m_overlayFade <= 0.01f && !m_overlayVisible) {
+        // Show a small indicator in status bar instead (handled in renderStatusBar)
+        return;
+    }
+
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_overlayFade);
+
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    // Auto-size: fixed width, height expands to fit content
+    ImVec2 vpSize = ImGui::GetMainViewport()->Size;
+    static float trackedWidth = 520.0f;
+    // Track the max width this window has needed (only grows, never shrinks during a batch)
+    // Use content width to ensure text/bars always fit
+    float minW = std::max(trackedWidth, (batch->useMultiNic || batch->useParallelChannels) ? 650.0f : 520.0f);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(minW, 0), ImVec2(vpSize.x * 0.9f, vpSize.y * 0.85f));
+
+    ImGuiWindowFlags wf = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize;
+    bool open = m_overlayVisible;
+    ImGui::Begin("Transfer Progress", &open, wf);
+    m_overlayVisible = open; // user closed via X
+
+    float totalProg   = batch->totalProgress.load();
+    float curFileProg = batch->curFileProgress.load();
+    uint64_t totalBytes = batch->totalBytes.load();
+    uint64_t totalTx    = batch->totalTransferred.load();
+    uint64_t curFSize   = batch->curFileSize.load();
+    uint64_t curFTx     = batch->curFileTransferred.load();
+    double speed  = batch->speedBytesPerSec.load();
+    double eta    = batch->etaSeconds.load();
+    int curIdx    = batch->currentFileIndex.load();
+    int totalFiles = batch->totalFiles();
+    if (totalBytes > 0 && totalTx > totalBytes) totalTx = totalBytes;
+    totalProg = std::clamp(totalProg, 0.0f, 1.0f);
+    curFileProg = std::clamp(curFileProg, 0.0f, 1.0f);
+
+    uint64_t totalDisplayTx = totalTx;
+    float totalDisplayProg = totalBytes > 0
+        ? (float)std::clamp((double)totalDisplayTx / (double)totalBytes, 0.0, 1.0)
+        : totalProg;
+    auto formatSizeFixed = [](uint64_t bytes, int decimals) {
+        const char* u[] = {"B", "KB", "MB", "GB", "TB"};
+        int i = 0;
+        double s = (double)bytes;
+        while (s >= 1024.0 && i < 4) { s /= 1024.0; i++; }
+
+        char buf[48];
+        if (i == 0) snprintf(buf, sizeof(buf), "%llu B", bytes);
+        else snprintf(buf, sizeof(buf), "%.*f %s", decimals, s, u[i]);
+        return std::string(buf);
+    };
+    auto formatProgressPair = [&](uint64_t done, uint64_t total) {
+        if (total > 0 && done > total) done = total;
+        std::string doneText = formatSize(done);
+        std::string totalText = formatSize(total);
+        if (total > 0 && done < total && doneText == totalText) {
+            doneText = formatSizeFixed(done, 2);
+            totalText = formatSizeFixed(total, 2);
+            if (doneText == totalText) {
+                doneText = formatSizeFixed(done, 3);
+                totalText = formatSizeFixed(total, 3);
+            }
+            if (doneText == totalText) {
+                doneText = std::to_string(done) + " B";
+                totalText = std::to_string(total) + " B";
+            }
+        }
+        return std::pair<std::string, std::string>(doneText, totalText);
+    };
+    std::string verb = batch->isMove ? "Move" : "Copy";
+    std::string direction;
+    if (batch->isCrossDevice)
+        direction = "Copy: Android -> Android (direct relay)";
+    else if (batch->isLocalCopy)
+        direction = verb + ": Windows -> Windows";
+    else if (batch->isPull)
+        direction = verb + ": Android -> Windows";
+    else
+        direction = verb + ": Windows -> Android";
+    int transferDeviceSlot = -1;
+    if (!batch->isLocalCopy && !batch->isCrossDevice)
+        transferDeviceSlot = batch->isPull ? batch->srcDeviceSlot : batch->dstDeviceSlot;
+    if (batch->useMultiNic)
+        direction += " [" + std::to_string(batch->numChannels) + " NICs]";
+    else if (batch->useParallelChannels)
+        direction += " [" + std::to_string(batch->numChannels) + " channels]";
+    else if (transferDeviceSlot >= 0)
+        direction += " [single channel]";
+
+    // Header
+    ImGui::TextColored(ImVec4(0.5f,0.7f,1,1), "%s", direction.c_str());
+    ImGui::SameLine();
+    if (queueSize > 1) ImGui::TextDisabled("(%d batches queued)", queueSize);
+    if (transferDeviceSlot > 0 && !batch->useParallelChannels && !batch->useMultiNic) {
+        ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.25f, 1), "Secondary device, single channel");
+    }
+
+    ImGui::Separator();
+
+    // --- Current file / per-channel progress ---
+    if (st == BatchState::Running || st == BatchState::Paused || st == BatchState::WaitingConflict) {
+        if (batch->useParallelChannels || batch->useMultiNic) {
+            // Multi-channel: show separate progress for each channel
+            ImVec4 chColors[] = {
+                {0.25f, 0.55f, 0.95f, 0.9f}, // blue
+                {0.30f, 0.75f, 0.40f, 0.9f}, // green
+                {0.85f, 0.55f, 0.25f, 0.9f}, // orange
+                {0.75f, 0.35f, 0.85f, 0.9f}, // purple
+                {0.85f, 0.75f, 0.25f, 0.9f}, // yellow
+                {0.35f, 0.80f, 0.80f, 0.9f}, // cyan
+                {0.85f, 0.35f, 0.45f, 0.9f}, // red
+                {0.55f, 0.75f, 0.55f, 0.9f}, // light green
+            };
+
+            int nCh = batch->numChannels;
+            for (int ch = 0; ch < nCh; ch++) {
+                auto& cp = batch->channels[ch];
+                if (cp.channelName.empty() && cp.filesCompleted.load() == 0 && cp.bytesTransferred.load() == 0) continue;
+
+                double spd = cp.speed.load();
+                uint64_t tx = cp.bytesTransferred.load();
+
+                // Show current file being transferred by this channel
+                std::string curFile = cp.currentFile;
+                bool isActive = (spd > 0.01 || !curFile.empty());
+
+                // Hide channels that are permanently dead
+                if (!isActive && tx == 0) continue;
+
+                // Channel name + speed on one line
+                ImGui::TextColored(chColors[ch % 8], "%s", cp.channelName.c_str());
+                ImGui::SameLine();
+                if (spd > 0.01)
+                    ImGui::Text("%s  %s", formatSize(tx).c_str(), formatSpeed(spd).c_str());
+                else if (tx > 0)
+                    ImGui::TextDisabled("%s  (idle)", formatSize(tx).c_str());
+                else
+                    ImGui::TextDisabled("(connecting...)");
+
+                // Current file for this channel
+                if (!curFile.empty() && curFile[0] != '(') {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("  %s", curFile.c_str());
+                }
+            }
+        } else {
+            // Single-channel: show current file
+            std::string curName = (curIdx < totalFiles) ? batch->files[curIdx].displayName : "";
+            ImGui::Text("File %d / %d:", curIdx + 1, totalFiles);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.8f,0.9f,1,1), "%s", curName.c_str());
+
+            char curOvl[256];
+            snprintf(curOvl, sizeof(curOvl), "%s / %s  (%.1f%%)",
+                     formatSize(curFTx).c_str(), formatSize(curFSize).c_str(), curFileProg * 100.0f);
+            drawProgressBar(curFileProg, curOvl, 20.0f,
+                            ImVec4(0.25f,0.55f,0.95f,0.9f), ImVec4(0.04f,0.04f,0.06f,1));
+
+            ImGui::Spacing();
+        }
+    }
+
+    // --- Total progress ---
+    ImGui::Text("Total:");
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d files, %s", totalFiles, formatSize(totalBytes).c_str());
+
+    char totalOvl[256];
+    if (st == BatchState::Completed) {
+        double avgSpd = batch->finalAvgSpeed.load();
+        double totalSec = batch->finalTimeSec.load();
+        auto sizePair = formatProgressPair(totalTx, totalBytes);
+        snprintf(totalOvl, sizeof(totalOvl), "%s / %s  -  %s avg  -  Done in %s",
+                 sizePair.first.c_str(), sizePair.second.c_str(),
+                 formatSpeed(avgSpd).c_str(), formatETA(totalSec).c_str());
+        drawProgressBar(1.0f, totalOvl, 22.0f,
+                        ImVec4(0.2f,0.7f,0.3f,0.9f), ImVec4(0.04f,0.04f,0.06f,1));
+
+        // Per-channel summary for parallel transfers
+        if ((batch->useParallelChannels || batch->useMultiNic) && batch->numChannels > 1) {
+            ImGui::Spacing();
+            if (batch->isCrossDevice)
+                ImGui::TextDisabled("  Effective speed is shown in the green total bar. Rows below show per-channel relay throughput.");
+            int nCh = batch->numChannels;
+            for (int ch = 0; ch < nCh; ch++) {
+                auto& cp = batch->channels[ch];
+                if (cp.bytesTransferred.load() == 0 && cp.filesCompleted.load() == 0) continue;
+                double sec = cp.elapsedSec.load();
+                if (sec < 0.01) sec = 0.01;
+                double spd = (double)cp.bytesTransferred.load() / sec;
+                ImGui::TextDisabled("  %s: %d blocks, %s in %s (%s avg)",
+                    cp.channelName.c_str(), cp.filesCompleted.load(),
+                    formatSize(cp.bytesTransferred.load()).c_str(),
+                    formatETA(sec).c_str(), formatSpeed(spd).c_str());
+            }
+        }
+    } else if (st == BatchState::Failed || st == BatchState::Stopped) {
+        auto sizePair = formatProgressPair(totalTx, totalBytes);
+        snprintf(totalOvl, sizeof(totalOvl), "%s / %s  -  %s",
+                 sizePair.first.c_str(), sizePair.second.c_str(),
+                 st == BatchState::Stopped ? "Stopped" : "Failed");
+        drawProgressBar(totalDisplayProg, totalOvl, 22.0f,
+                        ImVec4(0.7f,0.2f,0.2f,0.9f), ImVec4(0.04f,0.04f,0.06f,1));
+    } else if (st == BatchState::Verifying) {
+        // Transfer done, CRC verification in progress — two phases
+        int phase = batch->crcPhase.load();
+        float crcProg = batch->crcProgress.load();
+
+        if (phase == 1) {
+            // Phase 1: server computing — animated pulse since we have no server-side progress
+            float t = (float)fmod(ImGui::GetTime() * 0.8, 1.0);
+            snprintf(totalOvl, sizeof(totalOvl), "Verifying: %s  -  Device computing CRC...",
+                     batch->crcFileName.c_str());
+            drawProgressBar(t, totalOvl, 22.0f,
+                            ImVec4(0.5f,0.35f,0.8f,0.7f), ImVec4(0.04f,0.04f,0.06f,1));
+        } else if (phase == 2) {
+            // Phase 2: local CRC — real progress
+            snprintf(totalOvl, sizeof(totalOvl), "Verifying: %s  -  Local CRC %.0f%%",
+                     batch->crcFileName.c_str(), crcProg * 100.0f);
+            drawProgressBar(crcProg, totalOvl, 22.0f,
+                            ImVec4(0.5f,0.4f,0.9f,0.9f), ImVec4(0.04f,0.04f,0.06f,1));
+        } else {
+            snprintf(totalOvl, sizeof(totalOvl), "Verifying: %s",
+                     batch->crcFileName.c_str());
+            drawProgressBar(0.0f, totalOvl, 22.0f,
+                            ImVec4(0.5f,0.4f,0.9f,0.9f), ImVec4(0.04f,0.04f,0.06f,1));
+        }
+    } else {
+        std::string etaStr = (eta > 0) ? ("  ETA: " + formatETA(eta)) : "";
+        std::string speedStr = formatSpeed(speed);
+        auto sizePair = formatProgressPair(totalDisplayTx, totalBytes);
+        snprintf(totalOvl, sizeof(totalOvl), "%s / %s  (%.1f%%)  -  %s%s",
+                 sizePair.first.c_str(), sizePair.second.c_str(),
+                 totalDisplayProg * 100.0f, speedStr.c_str(), etaStr.c_str());
+        float barFrac = totalDisplayProg;
+        ImVec4 barCol;
+        if (batch->disconnected.load()) barCol = ImVec4(0.8f,0.4f,0.1f,0.9f); // orange when disconnected
+        else if (st == BatchState::Paused || st == BatchState::WaitingConflict) barCol = ImVec4(0.7f,0.6f,0.1f,0.9f);
+        else barCol = ImVec4(0.25f,0.55f,0.95f,0.9f);
+        drawProgressBar(barFrac, totalOvl, 22.0f, barCol, ImVec4(0.04f,0.04f,0.06f,1));
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // --- Control buttons ---
+    bool isRunning = (st == BatchState::Running);
+    bool isPaused  = (st == BatchState::Paused);
+    bool isDone    = (st == BatchState::Completed || st == BatchState::Failed || st == BatchState::Stopped);
+    bool waitingRetry = batch->waitingForUserRetry.load();
+    bool waitingConflict = batch->waitingConflict.load();
+
+    if (waitingConflict) {
+        // File already exists — ask user what to do
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "File already exists:");
+        ImGui::TextColored(ImVec4(0.9f, 0.9f, 1, 1), "  %s", batch->conflictFileName.c_str());
+        ImGui::Spacing();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
+        if (modernButton("Overwrite", ImVec2(100, 0))) {
+            batch->conflictResponse = ConflictAction::Overwrite;
+            m_batchCV.notify_all();
+        }
+        ImGui::SameLine();
+        if (modernButton("Overwrite All", ImVec2(120, 0))) {
+            batch->conflictResponse = ConflictAction::OverwriteAll;
+            m_batchCV.notify_all();
+        }
+        ImGui::PopStyleColor(2);
+
+        ImGui::SameLine();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f, 0.35f, 0.10f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.50f, 0.15f, 1));
+        if (modernButton("Skip", ImVec2(100, 0))) {
+            batch->conflictResponse = ConflictAction::Skip;
+            m_batchCV.notify_all();
+        }
+        ImGui::SameLine();
+        if (modernButton("Skip All", ImVec2(120, 0))) {
+            batch->conflictResponse = ConflictAction::SkipAll;
+            m_batchCV.notify_all();
+        }
+        ImGui::PopStyleColor(2);
+
+    } else if (waitingRetry) {
+        // Waiting for user decision after retries exhausted
+        ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "Reconnection failed. Retry or cancel?");
+        ImGui::Spacing();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.20f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.50f, 0.28f, 1));
+        if (modernButton("Retry", ImVec2(120, 0))) {
+            batch->userRetryRequested = true;
+            m_batchCV.notify_all();
+        }
+        ImGui::PopStyleColor(2);
+
+        ImGui::SameLine();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.12f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.18f, 0.18f, 1));
+        if (modernButton("Cancel Transfer", ImVec2(140, 0))) {
+            batch->stopRequested = true;
+            batch->userRetryRequested = false;
+            // Stop is handled by progress callback checking stopRequested every chunk
+            m_batchCV.notify_all();
+        }
+        ImGui::PopStyleColor(2);
+
+    } else if (batch->disconnected.load() && !isDone) {
+        // Device disconnected during transfer - show status and manual retry
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "Device disconnected!");
+        ImGui::Spacing();
+        if (!batch->errorMessage.empty())
+            ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "%s", batch->errorMessage.c_str());
+        ImGui::Spacing();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.20f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.50f, 0.28f, 1));
+        if (modernButton("Force Retry Now", ImVec2(140, 0))) {
+            // Signal the reconnection loop to try immediately
+            batch->errorMessage = "User requested retry...";
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.12f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.18f, 0.18f, 1));
+        if (modernButton("Cancel Transfer", ImVec2(140, 0))) {
+            batch->stopRequested = true;
+            batch->userRetryRequested = false;
+            // Stop is handled by progress callback checking stopRequested every chunk
+            m_batchCV.notify_all();
+        }
+        ImGui::PopStyleColor(2);
+
+    } else if (!isDone) {
+        if (isPaused) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f,0.35f,0.20f,1));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f,0.50f,0.28f,1));
+            if (modernButton("Resume", ImVec2(90, 0))) {
+                batch->pauseRequested = false;
+                m_batchCV.notify_all();
+            }
+            ImGui::PopStyleColor(2);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f,0.35f,0.10f,1));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f,0.50f,0.15f,1));
+            if (modernButton("Pause", ImVec2(90, 0))) {
+                batch->pauseRequested = true;
+            }
+            ImGui::PopStyleColor(2);
+        }
+
+        ImGui::SameLine();
+        if (!m_confirmStopTransfer) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f,0.12f,0.12f,1));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f,0.18f,0.18f,1));
+            if (modernButton("Stop", ImVec2(90, 0))) {
+                m_confirmStopTransfer = true;
+            }
+            ImGui::PopStyleColor(2);
+        } else {
+            ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "Stop transfer?");
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f,0.12f,0.12f,1));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f,0.18f,0.18f,1));
+            if (modernButton("Yes", ImVec2(60, 0))) {
+                batch->stopRequested = true;
+                batch->pauseRequested = false;
+                // Stop is handled by progress callback checking stopRequested every chunk
+                m_batchCV.notify_all();
+                m_confirmStopTransfer = false;
+            }
+            ImGui::PopStyleColor(2);
+            ImGui::SameLine();
+            if (modernButton("No", ImVec2(60, 0))) {
+                m_confirmStopTransfer = false;
+            }
+        }
+
+        ImGui::SameLine();
+        if (modernButton("Hide", ImVec2(90, 0))) {
+            m_overlayVisible = false;
+        }
+    } else {
+        // Done - show close + maybe clear
+        if (modernButton("Close", ImVec2(90, 0))) {
+            m_overlayVisible = false;
+            m_overlayWasOpen = false;
+            // Clean up completed batches
+            std::lock_guard<std::mutex> lk(m_batchMutex);
+            while (!m_batchQueue.empty()) {
+                BatchState s = m_batchQueue.front()->state.load();
+                if (s == BatchState::Completed || s == BatchState::Failed || s == BatchState::Stopped)
+                    m_batchQueue.pop_front();
+                else break;
+            }
+        }
+
+        if (st == BatchState::Failed && !batch->errorMessage.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1,0.4f,0.4f,1), "%s", batch->errorMessage.c_str());
+        }
+
+        // CRC results summary
+        if (!batch->crcResults.empty()) {
+            int pass = batch->crcPassCount();
+            int fail = batch->crcFailCount();
+            ImGui::Spacing();
+
+            // Compute total CRC time across all files
+            double totalCrcMs = 0, totalRemoteMs = 0, totalLocalMs = 0;
+            for (auto& r : batch->crcResults) {
+                totalCrcMs += r.totalMs;
+                totalRemoteMs += r.remoteMs;
+                totalLocalMs += r.localMs;
+            }
+
+            if (fail == 0) {
+                ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "CRC verified: %d/%d files OK", pass, (int)batch->crcResults.size());
+            } else {
+                ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "CRC: %d passed, %d failed", pass, fail);
+            }
+            // Total CRC timing summary
+            if (totalCrcMs > 0) {
+                ImGui::TextDisabled("  CRC time: %.1fs total (device: %.1fs, local: %.1fs)",
+                                    totalCrcMs / 1000.0, totalRemoteMs / 1000.0, totalLocalMs / 1000.0);
+            }
+
+            // Show details for failed CRCs (always), and passed (in a collapsible)
+            if (fail > 0) {
+                // Retry button at the top so it's immediately visible
+                if (isDone && modernButton("Retry Failed Files")) {
+                    auto retryBatch = std::make_shared<TransferBatch>();
+                    retryBatch->isPull = batch->isPull;
+                    retryBatch->isLocalCopy = batch->isLocalCopy;
+                    retryBatch->srcDeviceSlot = batch->srcDeviceSlot;
+                    retryBatch->dstDeviceSlot = batch->dstDeviceSlot;
+                    retryBatch->useParallelChannels = batch->useParallelChannels;
+                    retryBatch->useMultiNic = batch->useMultiNic;
+                    retryBatch->numChannels = batch->numChannels;
+                    for (auto& r : batch->crcResults) {
+                        if (r.passed || r.sourcePath.empty()) continue;
+                        BatchFileItem item;
+                        item.sourcePath = r.sourcePath;
+                        item.destPath = r.destPath;
+                        item.displayName = r.fileName;
+                        item.fileSize = r.fileSize;
+                        retryBatch->files.push_back(std::move(item));
+                    }
+                    if (!retryBatch->files.empty()) {
+                        // Auto-overwrite for retries (the whole point is to re-copy)
+                        retryBatch->conflictAllDecision = ConflictAction::OverwriteAll;
+                        // Calculate totalBytes
+                        uint64_t retryTotal = 0;
+                        for (auto& f : retryBatch->files)
+                            retryTotal += f.fileSize;
+                        retryBatch->totalBytes = retryTotal;
+                        {
+                            std::lock_guard<std::mutex> lk(m_batchMutex);
+                            m_batchQueue.push_back(retryBatch);
+                        }
+                        m_batchCV.notify_one();
+                    }
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("(re-copies failed files)");
+                for (auto& r : batch->crcResults) {
+                    if (r.passed) continue;
+                    ImGui::TextColored(ImVec4(1,0.4f,0.4f,1), "  FAIL: %s", r.fileName.c_str());
+                    ImGui::TextColored(ImVec4(0.7f,0.5f,0.5f,1), "        %s", r.detail.c_str());
+                }
+            }
+            if (pass > 0 && ImGui::TreeNode("Passed files")) {
+                for (auto& r : batch->crcResults) {
+                    if (!r.passed) continue;
+                    // Show timing per file
+                    double throughputMBs = (r.fileSize > 0 && r.totalMs > 0)
+                        ? (r.fileSize / (1024.0 * 1024.0)) / (r.totalMs / 1000.0) : 0;
+                    ImGui::TextColored(ImVec4(0.5f,0.8f,0.5f,1), "  OK: %s", r.fileName.c_str());
+                    ImGui::TextDisabled("      %s", r.detail.c_str());
+                    if (r.totalMs > 0) {
+                        ImGui::TextDisabled("      Device: %.0fms  Local: %.0fms  Total: %.0fms  (%.1f MB/s)",
+                                            r.remoteMs, r.localMs, r.totalMs, throughputMBs);
+                    }
+                }
+                ImGui::TreePop();
+            }
+        }
+    }
+
+    // Paused indicator
+    if (isPaused) {
+        ImGui::SameLine(0, 20);
+        ImGui::TextColored(ImVec4(1,0.8f,0.2f,1), "PAUSED");
+    }
+
+    // Skipped files indicator (shown when completed)
+    if (isDone && batch->skippedFiles > 0) {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.4f, 1), "%d file(s) skipped (already existed)",
+                           batch->skippedFiles);
+    }
+
+    // Error-skipped files summary
+    if (isDone && batch->errorSkippedFiles.load() > 0) {
+        ImGui::Spacing();
+        int errSkipped = batch->errorSkippedFiles.load();
+        ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "%d file(s) skipped due to errors", errSkipped);
+        {
+            std::lock_guard<std::mutex> lk(batch->errorSkippedMutex);
+            if (!batch->errorSkippedNames.empty() && ImGui::TreeNode("Skipped files")) {
+                for (auto& name : batch->errorSkippedNames)
+                    ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "  %s", name.c_str());
+                ImGui::TreePop();
+            }
+        }
+    }
+
+    // Track max width so the window only grows, never shrinks mid-transfer
+    // Track max of window size and content width (whichever is larger)
+    float curW = std::max(ImGui::GetWindowSize().x, ImGui::GetContentRegionAvail().x + ImGui::GetStyle().WindowPadding.x * 2);
+    if (curW > trackedWidth) trackedWidth = curW;
+    if (isDone) trackedWidth = 520.0f;
+
+    ImGui::End();
+    ImGui::PopStyleVar(); // alpha fade
+}
+
+static std::string buildLogText(const std::vector<LogEntry>& entries, const std::vector<int>& visible,
+                                std::chrono::steady_clock::time_point startTime) {
+    std::string text;
+    text.reserve(visible.size() * 100);
+    char timeBuf[32];
+    for (int idx : visible) {
+        auto& e = entries[idx];
+        double secs = std::chrono::duration<double>(e.time - startTime).count();
+        const char* lvl;
+        switch (e.level) {
+            case LogLevel::Debug: lvl = "DBG"; break;
+            case LogLevel::Info:  lvl = "INF"; break;
+            case LogLevel::Warn:  lvl = "WRN"; break;
+            case LogLevel::Error: lvl = "ERR"; break;
+            default:              lvl = "???"; break;
+        }
+        { auto t = std::chrono::system_clock::to_time_t(e.wallTime);
+          auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(e.wallTime.time_since_epoch()).count() % 1000;
+          struct tm tm; localtime_s(&tm, &t);
+          snprintf(timeBuf, sizeof(timeBuf), "[%02d:%02d:%02d.%03d]", tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms); }
+        text += timeBuf;
+        text += " ["; text += lvl; text += "] ["; text += e.tag; text += "] ";
+        text += e.message;
+        text += "\n";
+    }
+    return text;
+}
+
+void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
+    if (!deviceFor(panel).isServerRunning()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.25f, 1), "No Android device connected");
+        ImGui::Spacing();
+        if (modernSmallButton(("PC##AppsNoDev" + std::string(side == PanelSide::Left ? "L" : "R")).c_str()))
+            switchPanelMode(panel, false);
+        ImGui::SameLine();
+        if (modernSmallButton(("Android##AppsNoDev" + std::string(side == PanelSide::Left ? "L" : "R")).c_str()))
+            switchPanelMode(panel, true);
+        ImGui::SameLine();
+        if (modernSmallButton(("Connections##AppsNoDev" + std::string(side == PanelSide::Left ? "L" : "R")).c_str()))
+            switchPanelToConnections(panel);
+        return;
+    }
+
+    std::string sideId = side == PanelSide::Left ? "L" : "R";
+    if (modernSmallButton(("PC##Apps" + sideId).c_str())) switchPanelMode(panel, false);
+    ImGui::SameLine(0, 2);
+    if (modernSmallButton(("Android##Apps" + sideId).c_str())) switchPanelMode(panel, true);
+    ImGui::SameLine(0, 2);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.26f, 0.08f, 1));
+    modernSmallButton(("Apps##Apps" + sideId).c_str());
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0, 2);
+    if (modernSmallButton(("Connections##Apps" + sideId).c_str())) switchPanelToConnections(panel);
+
+    ImGui::SameLine(0, 10);
+    ImGui::TextColored(m_theme.gradientPrimary, "Installed Apps");
+    {
+        std::lock_guard<std::mutex> lk(m_deviceMutex);
+        int onlineCount = 0;
+        for (auto& d : m_devices) if (d.state == "device") onlineCount++;
+        auto getSlotName = [&](int slot) -> std::string {
+            if (slot < 0 || slot >= 2 || !m_slotConnected[slot]) return "No device";
+            auto it = m_deviceDisplayNames.find(m_slotSerial[slot]);
+            if (it != m_deviceDisplayNames.end()) return it->second;
+            for (auto& d : m_devices) {
+                if (d.serial == m_slotSerial[slot])
+                    return d.model.empty() ? d.serial : d.model;
+            }
+            return m_slotSerial[slot];
+        };
+        if (onlineCount > 1) {
+            ImGui::SameLine(0, 8);
+            std::string comboId = "##AppsDevSlot" + sideId;
+            std::string currentName = getSlotName(panel.deviceSlot);
+            ImGui::SetNextItemWidth(200);
+            if (ImGui::BeginCombo(comboId.c_str(), currentName.c_str())) {
+                for (int di = 0; di < 2; di++) {
+                    if (!m_slotConnected[di]) continue;
+                    bool selected = panel.deviceSlot == di;
+                    std::string label = getSlotName(di) + " (" + m_slotSerial[di] + ")##appsSlot" + std::to_string(di);
+                    if (ImGui::Selectable(label.c_str(), selected)) {
+                        if (panel.deviceSlot != di) {
+                            panel.deviceSlot = di;
+                            panel.appEntries.clear();
+                            panel.selectedIndices.clear();
+                            panel.refreshInProgress = false;
+                            panel.needsRefresh = true;
+                        }
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Switch which device this app list uses");
+        } else {
+            ImGui::SameLine(0, 8);
+            ImGui::TextDisabled("%s", getSlotName(panel.deviceSlot).c_str());
+        }
+    }
+    ImGui::SameLine(0, 10);
+    if (modernSmallButton(("Refresh##Apps" + sideId).c_str())) panel.needsRefresh = true;
+
+    ImGui::SameLine(0, 10);
+    bool hasSelection = !panel.selectedIndices.empty();
+    ImGui::BeginDisabled(!hasSelection || m_asyncBusy.load());
+    if (modernSmallButton(("Uninstall##Apps" + sideId).c_str())) {
+        std::vector<std::string> packages;
+        for (int idx : panel.selectedIndices)
+            if (panel.validIndex(idx)) packages.push_back(panel.appEntries[idx].packageName);
+        std::string prompt = "Uninstall " + std::to_string(packages.size()) + " selected app(s) for the current Android user?";
+        if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Uninstall", MB_YESNO | MB_ICONWARNING) != IDYES)
+            packages.clear();
+        if (packages.empty()) { ImGui::EndDisabled(); return; }
+        int slot = panel.deviceSlot;
+        FilePanel* refreshPanel = &panel;
+        postAsync("Uninstalling app...", [this, packages, slot, refreshPanel]() {
+            int ok = 0;
+            std::string details;
+            std::string serial = m_slotSerial[slot];
+            for (const auto& pkg : packages) {
+                std::string out;
+                if (deviceForSlot(slot).uninstallPackage(serial, pkg, out, false, true, false)) ok++;
+                else details += pkg + ": " + out + "\n";
+            }
+            refreshPanel->needsRefresh = true;
+            if (ok == (int)packages.size()) {
+                showNotification("Uninstall Complete", "Removed " + std::to_string(ok) + " app(s) for the current Android user.", false);
+                m_statusMessage = "Uninstalled " + std::to_string(ok) + " app(s)";
+            } else {
+                showNotification("Uninstall Failed", details.empty() ? "No apps were removed." : details, true);
+                m_statusMessage = "Uninstall failed";
+            }
+            m_statusTime = std::chrono::steady_clock::now();
+        });
+    }
+    ImGui::SameLine(0, 4);
+    if (modernSmallButton(("Root Uninstall##Apps" + sideId).c_str())) {
+        std::vector<std::string> packages;
+        for (int idx : panel.selectedIndices)
+            if (panel.validIndex(idx)) packages.push_back(panel.appEntries[idx].packageName);
+        std::string prompt = "Use root uninstall for " + std::to_string(packages.size()) + " selected app(s)?";
+        if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Root Uninstall", MB_YESNO | MB_ICONWARNING) != IDYES)
+            packages.clear();
+        if (packages.empty()) { ImGui::EndDisabled(); return; }
+        int slot = panel.deviceSlot;
+        FilePanel* refreshPanel = &panel;
+        postAsync("Root uninstalling app...", [this, packages, slot, refreshPanel]() {
+            int ok = 0;
+            std::string details;
+            std::string serial = m_slotSerial[slot];
+            if (!deviceForSlot(slot).isRootAvailable(serial)) {
+                showNotification("Root Access Unavailable",
+                    "Root uninstall requires a rooted device with ADB root permission granted for this device.", true);
+                return;
+            }
+            for (const auto& pkg : packages) {
+                std::string out;
+                if (deviceForSlot(slot).uninstallPackage(serial, pkg, out, false, true, true)) ok++;
+                else details += pkg + ": " + out + "\n";
+            }
+            refreshPanel->needsRefresh = true;
+            if (ok == (int)packages.size()) {
+                showNotification("Root Uninstall Complete", "Removed " + std::to_string(ok) + " app(s) for the current Android user.", false);
+                m_statusMessage = "Root uninstalled " + std::to_string(ok) + " app(s)";
+            } else {
+                showNotification("Root Uninstall Failed", details.empty() ? "No apps were removed." : details, true);
+                m_statusMessage = "Root uninstall failed";
+            }
+            m_statusTime = std::chrono::steady_clock::now();
+        });
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Uses root for the package manager command. System partitions may still be read-only.");
+
+    ImGui::SameLine(0, 10);
+    ImGui::SetNextItemWidth(220);
+    ImGui::InputText(("Search##AppsSearch" + sideId).c_str(), panel.searchFilter, sizeof(panel.searchFilter));
+    if (panel.refreshInProgress) {
+        ImGui::SameLine(0, 10);
+        ImGui::TextDisabled("Loading...");
+    }
+    ImGui::Separator();
+
+    std::string filter(panel.searchFilter);
+    std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+    auto appVisible = [&](const InstalledAppEntry& app) {
+        if (panel.appTypeFilter == 1 && app.isSystem) return false;
+        if (panel.appTypeFilter == 2 && !app.isSystem) return false;
+        if (filter.empty()) return true;
+        std::string hay = app.appName + " " + app.packageName + " " + app.apkPath;
+        std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+        return hay.find(filter) != std::string::npos;
+    };
+
+    ImGui::TextDisabled("Show");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120);
+    const char* appTypeLabels[] = { "All apps", "User apps", "System apps" };
+    ImGui::Combo(("##AppTypeFilter" + sideId).c_str(), &panel.appTypeFilter, appTypeLabels, 3);
+    ImGui::SameLine(0, 10);
+    if (modernSmallButton(("Select All##Apps" + sideId).c_str())) {
+        for (int i = 0; i < (int)panel.appEntries.size(); ++i)
+            if (appVisible(panel.appEntries[i])) panel.selectedIndices.insert(i);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Select every app currently shown by the type and search filters");
+    ImGui::SameLine(0, 4);
+    if (modernSmallButton(("Clear Selection##Apps" + sideId).c_str())) panel.selectedIndices.clear();
+    ImGui::SameLine(0, 10);
+    int visibleCount = 0;
+    for (const auto& app : panel.appEntries) if (appVisible(app)) visibleCount++;
+    ImGui::TextDisabled("%d shown, %d selected", visibleCount, (int)panel.selectedIndices.size());
+    ImGui::Separator();
+
+    ImGuiTableFlags tf = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable;
+    if (ImGui::BeginTable(("##AppsTbl" + sideId).c_str(), 4, tf)) {
+        ImGui::TableSetupColumn("App Name", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_DefaultSort, 0.28f);
+        ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch, 0.32f);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 78.0f);
+        ImGui::TableSetupColumn("APK Path", ImGuiTableColumnFlags_WidthStretch, 0.40f);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+
+        if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
+            if (specs->SpecsDirty && specs->SpecsCount > 0) {
+                int col = specs->Specs[0].ColumnIndex;
+                bool desc = specs->Specs[0].SortDirection == ImGuiSortDirection_Descending;
+                std::sort(panel.appEntries.begin(), panel.appEntries.end(),
+                    [col, desc](const InstalledAppEntry& a, const InstalledAppEntry& b) {
+                        int cmp = 0;
+                        if (col == 1) cmp = _stricmp(a.packageName.c_str(), b.packageName.c_str());
+                        else if (col == 2) cmp = (int)a.isSystem - (int)b.isSystem;
+                        else if (col == 3) cmp = _stricmp(a.apkPath.c_str(), b.apkPath.c_str());
+                        else {
+                            const std::string& aName = a.appName.empty() ? a.packageName : a.appName;
+                            const std::string& bName = b.appName.empty() ? b.packageName : b.appName;
+                            cmp = _stricmp(aName.c_str(), bName.c_str());
+                        }
+                        return desc ? cmp > 0 : cmp < 0;
+                    });
+                panel.selectedIndices.clear();
+                specs->SpecsDirty = false;
+            }
+        }
+
+        for (int i = 0; i < (int)panel.appEntries.size(); i++) {
+            const auto& app = panel.appEntries[i];
+            if (!appVisible(app)) continue;
+
+            bool selected = panel.selectedIndices.count(i) > 0;
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            std::string displayName = app.appName.empty() ? app.packageName : app.appName;
+            std::string rowId = displayName + "##app" + std::to_string(i);
+            if (ImGui::Selectable(rowId.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                ImGuiIO& io = ImGui::GetIO();
+                if (io.KeyCtrl) {
+                    if (selected) panel.selectedIndices.erase(i);
+                    else panel.selectedIndices.insert(i);
+                } else {
+                    panel.selectedIndices.clear();
+                    panel.selectedIndices.insert(i);
+                }
+                panel.focusedIndex = i;
+                m_lastFocusedPanel = &panel;
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(app.packageName.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextColored(app.isSystem ? ImVec4(1.0f, 0.72f, 0.34f, 1) : ImVec4(0.55f, 1.0f, 0.65f, 1),
+                "%s", app.isSystem ? "System" : "User");
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", app.apkPath.c_str());
+        }
+        ImGui::EndTable();
+    }
+}
+
+std::string App::getBackupsRootPath() const {
+    char exePath[MAX_PATH];
+    DWORD len = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::filesystem::path dir = (len > 0 && len < MAX_PATH)
+        ? std::filesystem::path(exePath).parent_path()
+        : std::filesystem::current_path();
+    return pathToUtf8(dir / "Backups");
+}
+
+void App::refreshBackupManagerApps() {
+    int slot = m_backupManagerSlot & 1;
+    if (!m_slotConnected[slot] || m_slotSerial[slot].empty()) {
+        m_backupManagerApps.clear();
+        m_backupManagerNeedsAppRefresh = false;
+        return;
+    }
+    std::string serial = m_slotSerial[slot];
+    postAsync("Loading backup app list...", [this, slot, serial]() {
+        std::vector<InstalledAppEntry> apps = deviceForSlot(slot).listInstalledApps(serial, true);
+        std::vector<BackupManagerAppRow> rows;
+        rows.reserve(apps.size());
+        for (auto& app : apps) rows.push_back({ app, false });
+        UiMessage message;
+        message.setBackupApps = true;
+        message.backupApps = std::move(rows);
+        message.markBackupAppsFresh = true;
+        postUiMessage(std::move(message));
+    });
+}
+
+void App::probeBackupManagerRootAccess() {
+    int slot = m_backupManagerSlot & 1;
+    if (!m_slotConnected[slot] || m_slotSerial[slot].empty()) return;
+    std::string serial = m_slotSerial[slot];
+    if (m_backupRootAccess == BackupRootAccess::Checking && m_backupRootAccessSerial == serial) return;
+    if (m_backupRootAccessSerial == serial && m_backupRootAccess != BackupRootAccess::Unknown) return;
+
+    m_backupRootAccess = BackupRootAccess::Checking;
+    m_backupRootAccessSerial = serial;
+    std::string adbPath = deviceForSlot(slot).getAdbPath();
+    postAsync("Checking backup capabilities...", [this, slot, serial, adbPath]() {
+        DeviceClient probe;
+        if (!adbPath.empty()) probe.setAdbPath(adbPath);
+        bool available = !probe.getAdbPath().empty() && probe.isRootAvailable(serial);
+        UiMessage message;
+        message.backupRootProbeComplete = true;
+        message.backupRootAvailable = available;
+        message.backupRootSlot = slot;
+        message.backupRootSerial = serial;
+        postUiMessage(std::move(message));
+    });
+}
+
+void App::refreshBackupManagerBackups() {
+    std::vector<BackupManagerBackupRow> rows;
+    std::filesystem::path root = toFsPath(getBackupsRootPath());
+    std::error_code ec;
+    std::filesystem::path jobsRoot = root / "Jobs";
+    if (std::filesystem::exists(jobsRoot, ec)) {
+        for (auto jobIt = std::filesystem::directory_iterator(jobsRoot, ec);
+             !ec && jobIt != std::filesystem::directory_iterator(); jobIt.increment(ec)) {
+            if (!jobIt->is_directory(ec)) continue;
+            std::ifstream jf(jobIt->path() / "job.json", std::ios::binary);
+            if (!jf) continue;
+            nlohmann::json meta = nlohmann::json::parse(jf, nullptr, false);
+            if (meta.is_discarded()) continue;
+            BackupManagerBackupRow row;
+            row.isJob = true;
+            row.record.packageName = meta.value("name", "Backup job");
+            row.record.serial = meta.value("serial", "");
+            row.record.created = meta.value("created", pathToUtf8(jobIt->path().filename()));
+            row.record.backupPath = pathToUtf8(jobIt->path());
+            row.appCount = meta.value("appCount", 0);
+            row.record.sizeBytes = directorySizeBytes(jobIt->path());
+            row.contentsSummary = std::to_string(row.appCount) + " app";
+            if (row.appCount != 1) row.contentsSummary += "s";
+            if (meta.contains("contents") && meta["contents"].is_array()) {
+                std::string parts;
+                for (auto& item : meta["contents"]) {
+                    std::string s = item.get<std::string>();
+                    if (s.empty()) continue;
+                    if (!parts.empty()) parts += " ";
+                    parts += s;
+                }
+                if (!parts.empty()) row.contentsSummary += "  " + parts;
+            }
+            if (meta.contains("packages") && meta["packages"].is_array()) {
+                for (const auto& package : meta["packages"])
+                    if (package.is_string()) row.searchText += " " + package.get<std::string>();
+            }
+            std::filesystem::path jobApps = jobIt->path() / "Apps";
+            std::error_code labelEc;
+            for (auto packageIt = std::filesystem::directory_iterator(jobApps, labelEc);
+                 !labelEc && packageIt != std::filesystem::directory_iterator(); packageIt.increment(labelEc)) {
+                if (!packageIt->is_directory(labelEc)) continue;
+                for (auto backupIt = std::filesystem::directory_iterator(packageIt->path(), labelEc);
+                     !labelEc && backupIt != std::filesystem::directory_iterator(); backupIt.increment(labelEc)) {
+                    std::ifstream appMetaFile(backupIt->path() / "backup.json", std::ios::binary);
+                    if (!appMetaFile) continue;
+                    nlohmann::json appMeta = nlohmann::json::parse(appMetaFile, nullptr, false);
+                    if (appMeta.is_discarded()) continue;
+                    row.searchText += " " + appMeta.value("label", "") + " " + appMeta.value("packageName", "");
+                }
+            }
+            rows.push_back(std::move(row));
+        }
+    }
+
+    if (std::filesystem::exists(root, ec)) {
+        for (auto pkgIt = std::filesystem::directory_iterator(root, ec);
+             !ec && pkgIt != std::filesystem::directory_iterator(); pkgIt.increment(ec)) {
+            if (!pkgIt->is_directory(ec)) continue;
+            if (_stricmp(pathToUtf8(pkgIt->path().filename()).c_str(), "Jobs") == 0) continue;
+            for (auto bakIt = std::filesystem::directory_iterator(pkgIt->path(), ec);
+                 !ec && bakIt != std::filesystem::directory_iterator(); bakIt.increment(ec)) {
+                if (!bakIt->is_directory(ec)) continue;
+                std::ifstream mf(bakIt->path() / "backup.json", std::ios::binary);
+                if (!mf) continue;
+                nlohmann::json meta = nlohmann::json::parse(mf, nullptr, false);
+                if (meta.is_discarded()) continue;
+                AppBackupRecord rec;
+                rec.packageName = meta.value("packageName", "");
+                rec.label = meta.value("label", "");
+                rec.serial = meta.value("serial", "");
+                rec.created = meta.value("created", "");
+                rec.backupPath = pathToUtf8(bakIt->path());
+                if (meta.contains("has")) {
+                    rec.hasApk = meta["has"].value("apk", false);
+                    rec.hasData = meta["has"].value("data", false);
+                    rec.hasDeviceProtectedData = meta["has"].value("data_de", false);
+                    rec.hasExternalData = meta["has"].value("external", false);
+                    rec.hasObb = meta["has"].value("obb", false);
+                    rec.hasMedia = meta["has"].value("media", false);
+                }
+                rec.sizeBytes = directorySizeBytes(bakIt->path());
+                if (!rec.packageName.empty()) {
+                    BackupManagerBackupRow row;
+                    row.record = rec;
+                    row.contentsSummary = "";
+                    if (rec.hasApk) row.contentsSummary += "APK ";
+                    if (rec.hasData) row.contentsSummary += "Data ";
+                    if (rec.hasDeviceProtectedData) row.contentsSummary += "DE ";
+                    if (rec.hasExternalData) row.contentsSummary += "Ext ";
+                    if (rec.hasObb) row.contentsSummary += "OBB ";
+                    if (rec.hasMedia) row.contentsSummary += "Media ";
+                    rows.push_back(std::move(row));
+                }
+            }
+        }
+    }
+    std::sort(rows.begin(), rows.end(), [](const BackupManagerBackupRow& a, const BackupManagerBackupRow& b) {
+        if (a.record.created != b.record.created) return a.record.created > b.record.created;
+        return _stricmp(a.record.packageName.c_str(), b.record.packageName.c_str()) < 0;
+    });
+    m_backupManagerBackups = std::move(rows);
+    m_backupManagerBackupSelectionAnchor = -1;
+    m_backupManagerNeedsBackupRefresh = false;
+}
+
+bool App::backupManagerAppVisible(const BackupManagerAppRow& row) const {
+    if (row.app.isSystem && !m_backupShowSystemApps) return false;
+    std::string filter(m_backupManagerSearch);
+    std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+    if (filter.empty()) return true;
+    std::string hay = row.app.appName + " " + row.app.packageName + " " + row.app.apkPath;
+    std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+    return hay.find(filter) != std::string::npos;
+}
+
+void App::setBackupManagerAppSelection(bool selected, bool visibleOnly) {
+    for (auto& row : m_backupManagerApps) {
+        if (row.app.isSystem && !m_backupShowSystemApps) {
+            row.selected = false;
+            continue;
+        }
+        if (!visibleOnly || backupManagerAppVisible(row))
+            row.selected = selected;
+    }
+}
+
+void App::invertBackupManagerAppSelection(bool visibleOnly) {
+    for (auto& row : m_backupManagerApps) {
+        if (row.app.isSystem && !m_backupShowSystemApps) {
+            row.selected = false;
+            continue;
+        }
+        if (!visibleOnly || backupManagerAppVisible(row))
+            row.selected = !row.selected;
+    }
+}
+
+void App::openBackupManagerJob(const BackupManagerBackupRow& row) {
+    m_backupManagerJobApps.clear();
+    m_backupManagerJobAppSelectionAnchor = -1;
+    m_backupManagerJobOpen = true;
+    m_backupManagerOpenJobPath = row.record.backupPath;
+    m_backupManagerOpenJobTitle = row.record.packageName;
+
+    std::filesystem::path appsRoot = toFsPath(row.record.backupPath);
+    if (row.isJob) appsRoot /= "Apps";
+    std::error_code ec;
+    for (auto pkgIt = std::filesystem::directory_iterator(appsRoot, ec);
+         !ec && pkgIt != std::filesystem::directory_iterator(); pkgIt.increment(ec)) {
+        if (!pkgIt->is_directory(ec)) continue;
+        for (auto bakIt = std::filesystem::directory_iterator(pkgIt->path(), ec);
+             !ec && bakIt != std::filesystem::directory_iterator(); bakIt.increment(ec)) {
+            if (!bakIt->is_directory(ec)) continue;
+            std::ifstream mf(bakIt->path() / "backup.json", std::ios::binary);
+            if (!mf) continue;
+            nlohmann::json meta = nlohmann::json::parse(mf, nullptr, false);
+            if (meta.is_discarded()) continue;
+            AppBackupRecord rec;
+            rec.packageName = meta.value("packageName", "");
+            rec.label = meta.value("label", "");
+            rec.serial = meta.value("serial", "");
+            rec.created = meta.value("created", "");
+            rec.backupPath = pathToUtf8(bakIt->path());
+            if (meta.contains("has")) {
+                rec.hasApk = meta["has"].value("apk", false);
+                rec.hasData = meta["has"].value("data", false);
+                rec.hasDeviceProtectedData = meta["has"].value("data_de", false);
+                rec.hasExternalData = meta["has"].value("external", false);
+                rec.hasObb = meta["has"].value("obb", false);
+                rec.hasMedia = meta["has"].value("media", false);
+            }
+            rec.sizeBytes = directorySizeBytes(bakIt->path());
+            if (!rec.packageName.empty()) m_backupManagerJobApps.push_back({ rec, false });
+        }
+    }
+    std::sort(m_backupManagerJobApps.begin(), m_backupManagerJobApps.end(), [](const BackupManagerJobAppRow& a, const BackupManagerJobAppRow& b) {
+        return _stricmp(a.record.packageName.c_str(), b.record.packageName.c_str()) < 0;
+    });
+
+    if (!row.isJob && m_backupManagerJobApps.empty()) {
+        m_backupManagerJobApps.push_back({ row.record, false });
+    }
+}
+
+void App::closeBackupManagerJob() {
+    m_backupManagerJobOpen = false;
+    m_backupManagerOpenJobPath.clear();
+    m_backupManagerOpenJobTitle.clear();
+    m_backupManagerJobApps.clear();
+    m_backupManagerJobAppSelectionAnchor = -1;
+}
+
+void App::startBackupManagerBackup() {
+    int slot = m_backupManagerSlot & 1;
+    std::vector<std::string> packages;
+    std::unordered_map<std::string, std::string> appLabels;
+    for (const auto& row : m_backupManagerApps)
+        if (row.selected && (m_backupShowSystemApps || !row.app.isSystem)) {
+            packages.push_back(row.app.packageName);
+            appLabels[row.app.packageName] = row.app.appName;
+        }
+    if (packages.empty()) return;
+    LOG_INFO("BackupManager", "Backup requested for " + std::to_string(packages.size()) + " package(s)");
+    std::string prompt = "Back up " + std::to_string(packages.size()) + " selected app(s) to the PC?";
+    if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Backup", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+
+    std::string serial = m_slotSerial[slot];
+    std::string adbPath = deviceForSlot(slot).getAdbPath();
+    AppBackupOptions options;
+    options.includeApk = m_backupIncludeApk;
+    options.includeData = m_backupIncludeData;
+    options.includeDeviceProtectedData = m_backupIncludeDeData;
+    options.includeExternalData = m_backupIncludeExternalData;
+    options.includeObb = m_backupIncludeObb;
+    options.includeMedia = m_backupIncludeMedia;
+    options.excludeCache = m_backupExcludeCache;
+    bool requiresRoot = options.includeData || options.includeDeviceProtectedData;
+    std::string created = backupJobStamp();
+    std::filesystem::path jobDir = toFsPath(getBackupsRootPath()) / "Jobs" / created;
+    std::filesystem::path appsDir = jobDir / "Apps";
+    std::error_code ec;
+    std::filesystem::create_directories(appsDir, ec);
+    std::string root = pathToUtf8(appsDir);
+    LOG_INFO("BackupManager", "Backup confirmed. serial=" + serial + " job=" + pathToUtf8(jobDir));
+    m_backupProgressActive = true;
+    m_backupProgressIsRestore = false;
+    m_backupProgressCurrent = 0;
+    m_backupProgressTotal = (int)packages.size();
+    m_backupProgressStage = 0;
+    m_backupProgressStageTotal = 1;
+    m_backupProgressBytes = 0;
+    m_backupProgressTotalBytes = 0;
+    m_backupProgressPackage.clear();
+    m_backupProgressStageLabel = "Starting backup";
+    m_backupPauseRequested = false;
+    m_backupCancelRequested = false;
+    m_backupProgressPackages.clear();
+    m_backupProgressPackages.reserve(packages.size());
+    for (const auto& packageName : packages) {
+        auto label = appLabels.find(packageName);
+        m_backupProgressPackages.push_back(
+            label != appLabels.end() && !label->second.empty() ? label->second : packageName);
+    }
+    m_backupProgressActiveAppIndex = -1;
+    m_backupAppProgress.assign(packages.size(), 0.0f);
+    m_backupDisplayedAppProgress.assign(packages.size(), 0.0f);
+    m_backupAppActive.assign(packages.size(), false);
+    m_backupDisplayedOverallProgress = 0.0f;
+
+    postAsync("Backing up apps...", [this, slot, serial, adbPath, packages, appLabels, root, created, jobPath = pathToUtf8(jobDir), options, requiresRoot]() {
+        int ok = 0;
+        std::string details;
+        std::vector<std::string> successfulPackages;
+        try {
+            if (serial.empty()) {
+                LOG_ERROR("BackupManager", "Backup aborted. Selected device serial was empty.");
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = false;
+                message.hasNotification = true;
+                message.notificationTitle = "Backup Failed";
+                message.notificationMessage = "The selected device is no longer connected.";
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+            DeviceClient backupClient;
+            if (!adbPath.empty()) backupClient.setAdbPath(adbPath);
+            if (backupClient.getAdbPath().empty() && !backupClient.findAdb()) {
+                LOG_ERROR("BackupManager", "Backup aborted. ADB was not found.");
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = false;
+                message.hasNotification = true;
+                message.notificationTitle = "Backup Failed";
+                message.notificationMessage = "ADB was not found.";
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+
+            DeviceClient& slotClient = deviceForSlot(slot);
+            if (requiresRoot && !backupClient.isRootAvailable(serial)) {
+                LOG_ERROR("BackupManager", "Root access check failed for " + serial);
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = false;
+                message.hasNotification = true;
+                message.notificationTitle = "Root Required";
+                message.notificationMessage = "Private app data requires root access. Choose Standard Backup to continue with APK and shared app folders only.";
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+            if (requiresRoot && (!slotClient.isServerRunning() || !slotClient.useRoot())) {
+                LOG_INFO("BackupManager", "Starting root device server for backup on " + serial);
+                if (!slotClient.startServer(serial, m_preferAdbForward, true)) {
+                    UiMessage message;
+                    message.hasBackupProgress = true;
+                    message.backupProgressActive = false;
+                    message.hasNotification = true;
+                    message.notificationTitle = "Root Required";
+                    message.notificationMessage = "Backup Manager requires its device helper to run as root. Enable Root for this device and approve the request in your root manager.\n\nDetails: " + slotClient.lastError();
+                    message.notificationIsError = true;
+                    postUiMessage(std::move(message));
+                    return;
+                }
+            }
+            if (requiresRoot) {
+                m_prefs.setRootEnabledForSerial(serial, true);
+                m_prefs.save();
+            }
+            DeviceClient& backupWorkClient = slotClient.isServerRunning() ? slotClient : backupClient;
+            std::vector<std::unique_ptr<DeviceClient>> parallelClients;
+            std::vector<DeviceClient*> workers;
+            if (backupWorkClient.isServerRunning() && backupWorkClient.useRoot()) {
+                int targetWorkers = std::min(3, (int)packages.size());
+                for (int i = 0; i < targetWorkers; ++i) {
+                    auto client = std::make_unique<DeviceClient>();
+                    if (!client->connectParallelFrom(backupWorkClient)) break;
+                    workers.push_back(client.get());
+                    parallelClients.push_back(std::move(client));
+                }
+            }
+            if (workers.empty()) workers.push_back(&backupWorkClient);
+
+            std::atomic<int> nextPackage{0};
+            std::atomic<int> completedPackages{0};
+            std::mutex resultMutex;
+            auto backupWorker = [&](DeviceClient* client) {
+                while (true) {
+                    {
+                        std::unique_lock<std::mutex> lock(m_backupControlMutex);
+                        m_backupControlCV.wait(lock, [this]() {
+                            return !m_backupPauseRequested.load() || m_backupCancelRequested.load();
+                        });
+                    }
+                    if (m_backupCancelRequested.load()) return;
+                    int packageIndex = nextPackage.fetch_add(1);
+                    if (packageIndex >= (int)packages.size()) return;
+                    const auto& pkg = packages[packageIndex];
+                    AppBackupRecord rec;
+                    std::string out;
+                    try {
+                        LOG_INFO("BackupManager", "Starting package backup: " + pkg);
+                        auto progressCb = [this, packageIndex, &completedPackages, totalPackages = (int)packages.size()](const AppBackupProgress& progress) {
+                            {
+                                std::unique_lock<std::mutex> lock(m_backupControlMutex);
+                                m_backupControlCV.wait(lock, [this]() {
+                                    return !m_backupPauseRequested.load() || m_backupCancelRequested.load();
+                                });
+                            }
+                            if (m_backupCancelRequested.load()) return false;
+                            float byteFraction = progress.bytesTotal > 0
+                                ? std::clamp((float)progress.bytesTransferred / (float)progress.bytesTotal, 0.0f, 1.0f)
+                                : 0.0f;
+                            float appFraction = ((float)progress.stageIndex + byteFraction) /
+                                (float)std::max(1, progress.stageCount);
+                            UiMessage message;
+                            message.hasBackupProgress = true;
+                            message.backupProgressActive = true;
+                            message.backupProgressCurrent = completedPackages.load();
+                            message.backupProgressTotal = totalPackages;
+                            message.backupProgressStage = progress.stageIndex;
+                            message.backupProgressStageTotal = progress.stageCount;
+                            message.backupProgressBytes = progress.bytesTransferred;
+                            message.backupProgressTotalBytes = progress.bytesTotal;
+                            message.backupProgressPackage = progress.packageName;
+                            message.backupProgressStageLabel = progress.stageLabel;
+                            message.backupProgressAppIndex = packageIndex;
+                            message.backupProgressAppFraction = std::clamp(appFraction, 0.0f, 1.0f);
+                            postUiMessage(std::move(message));
+                            return true;
+                        };
+                        auto label = appLabels.find(pkg);
+                        bool packageOk = client->backupApp(serial, pkg,
+                            label == appLabels.end() ? std::string{} : label->second,
+                            root, options, rec, out, progressCb);
+                        if (packageOk) {
+                            std::lock_guard<std::mutex> lock(resultMutex);
+                            ok++;
+                            successfulPackages.push_back(pkg);
+                            LOG_INFO("BackupManager", "Package backup complete: " + pkg + " -> " + rec.backupPath);
+                        } else if (!m_backupCancelRequested.load()) {
+                            std::lock_guard<std::mutex> lock(resultMutex);
+                            details += pkg + ": " + out + "\n";
+                            LOG_ERROR("BackupManager", "Package backup failed: " + pkg + ": " + out);
+                        }
+                    } catch (const std::exception& e) {
+                        std::lock_guard<std::mutex> lock(resultMutex);
+                        details += pkg + ": " + e.what() + "\n";
+                        LOG_ERROR("BackupManager", "Package backup exception: " + pkg + ": " + e.what());
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lock(resultMutex);
+                        details += pkg + ": Unexpected backup failure.\n";
+                        LOG_ERROR("BackupManager", "Package backup unknown exception: " + pkg);
+                    }
+                    completedPackages.fetch_add(1);
+                    if (!m_backupCancelRequested.load()) {
+                        UiMessage completedMessage;
+                        completedMessage.hasBackupProgress = true;
+                        completedMessage.backupProgressActive = true;
+                        completedMessage.backupProgressTotal = (int)packages.size();
+                        completedMessage.backupProgressCurrent = completedPackages.load();
+                        completedMessage.backupProgressAppIndex = packageIndex;
+                        completedMessage.backupProgressAppFraction = 1.0f;
+                        postUiMessage(std::move(completedMessage));
+                    }
+                }
+            };
+            std::vector<std::thread> backupThreads;
+            for (DeviceClient* client : workers) backupThreads.emplace_back(backupWorker, client);
+            for (auto& thread : backupThreads) thread.join();
+            bool cancelled = m_backupCancelRequested.load();
+            LOG_INFO("BackupManager", std::string(cancelled ? "Backup cancelled. ok=" : "Backup finished. ok=") + std::to_string(ok) + " total=" + std::to_string(packages.size()));
+            nlohmann::json job;
+            job["format"] = "FastEnoughBackupJob";
+            job["formatVersion"] = 1;
+            job["name"] = "Backup job " + created;
+            job["created"] = created;
+            job["serial"] = serial;
+            job["appCount"] = ok;
+            job["requestedAppCount"] = packages.size();
+            job["cancelled"] = cancelled;
+            job["packages"] = successfulPackages;
+            nlohmann::json contents = nlohmann::json::array();
+            if (options.includeApk) contents.push_back("APK");
+            if (options.includeData) contents.push_back("Data");
+            if (options.includeDeviceProtectedData) contents.push_back("DE");
+            if (options.includeExternalData) contents.push_back("External");
+            if (options.includeObb) contents.push_back("OBB");
+            if (options.includeMedia) contents.push_back("Media");
+            job["contents"] = contents;
+            std::ofstream jf(toFsPath(jobPath) / "job.json", std::ios::binary);
+            jf << job.dump(2);
+            jf.close();
+            if (cancelled && ok == 0) {
+                std::error_code removeEc;
+                std::filesystem::remove_all(toFsPath(jobPath), removeEc);
+            }
+            UiMessage message;
+            message.refreshBackupList = true;
+            message.hasStatus = true;
+            message.status = cancelled ? "Backup cancelled after " + std::to_string(ok) + " app(s)" :
+                "Backed up " + std::to_string(ok) + " app(s)";
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.backupProgressCurrent = ok;
+            message.backupProgressTotal = (int)packages.size();
+            message.backupProgressStageLabel = cancelled ? "Backup cancelled" : "Backup finished";
+            message.hasNotification = true;
+            std::string backupSummary = "Completed apps: " + std::to_string(ok) + " of " +
+                std::to_string(packages.size()) + "\n\nIncluded content\n";
+            if (options.includeApk) backupSummary += "APK files\n";
+            if (options.includeData) backupSummary += "App data\n";
+            if (options.includeDeviceProtectedData) backupSummary += "Device protected data\n";
+            if (options.includeExternalData) backupSummary += "External data\n";
+            if (options.includeObb) backupSummary += "OBB data\n";
+            if (options.includeMedia) backupSummary += "Media data\n";
+            if (cancelled) {
+                message.notificationTitle = "Backup Cancelled";
+                message.notificationMessage = backupSummary + "\n" + (ok > 0
+                    ? "Completed app backups were kept. Partial app files were removed."
+                    : "No completed app backups were kept.");
+                message.notificationIsError = false;
+            } else if (ok == (int)packages.size()) {
+                message.notificationTitle = "Backup Complete";
+                message.notificationMessage = backupSummary + "\nAll selected apps were saved to the Backups folder.";
+                message.notificationIsError = false;
+            } else {
+                if (details.size() > 3000) details = details.substr(0, 3000) + "\nMore errors were omitted.";
+                message.notificationTitle = "Backup Finished With Errors";
+                message.notificationMessage = backupSummary + "\nIssues\n" +
+                    (details.empty() ? "Some backups failed." : details);
+                message.notificationIsError = true;
+            }
+            postUiMessage(std::move(message));
+        } catch (const std::exception& e) {
+            LOG_ERROR("BackupManager", std::string("Backup task exception: ") + e.what());
+            UiMessage message;
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.hasNotification = true;
+            message.notificationTitle = "Backup Failed";
+            message.notificationMessage = e.what();
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        } catch (...) {
+            LOG_ERROR("BackupManager", "Backup task unknown exception");
+            UiMessage message;
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.hasNotification = true;
+            message.notificationTitle = "Backup Failed";
+            message.notificationMessage = "Unexpected backup failure.";
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        }
+    });
+}
+
+void App::startBackupManagerRestore() {
+    std::vector<std::string> backups;
+    if (m_backupManagerJobOpen) {
+        for (const auto& row : m_backupManagerJobApps) {
+            if (row.selected) backups.push_back(row.record.backupPath);
+        }
+        if (backups.empty()) {
+            for (const auto& row : m_backupManagerJobApps)
+                backups.push_back(row.record.backupPath);
+        }
+    } else {
+        for (const auto& row : m_backupManagerBackups) {
+            if (!row.selected) continue;
+            if (!row.isJob) {
+                backups.push_back(row.record.backupPath);
+                continue;
+            }
+            std::filesystem::path appsRoot = toFsPath(row.record.backupPath) / "Apps";
+            std::error_code ec;
+            for (auto pkgIt = std::filesystem::directory_iterator(appsRoot, ec);
+                 !ec && pkgIt != std::filesystem::directory_iterator(); pkgIt.increment(ec)) {
+                if (!pkgIt->is_directory(ec)) continue;
+                for (auto bakIt = std::filesystem::directory_iterator(pkgIt->path(), ec);
+                     !ec && bakIt != std::filesystem::directory_iterator(); bakIt.increment(ec)) {
+                    if (bakIt->is_directory(ec) && std::filesystem::exists(bakIt->path() / "backup.json", ec))
+                        backups.push_back(pathToUtf8(bakIt->path()));
+                }
+            }
+        }
+    }
+    startBackupManagerRestorePaths(std::move(backups));
+}
+
+void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
+    int slot = m_backupManagerSlot & 1;
+    if (backups.empty()) return;
+    LOG_INFO("BackupManager", "Restore requested for " + std::to_string(backups.size()) + " backup(s)");
+    std::string prompt = "Restore " + std::to_string(backups.size()) + " selected backup(s) to the selected device?";
+    if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Restore", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+
+    std::string serial = m_slotSerial[slot];
+    std::string adbPath = deviceForSlot(slot).getAdbPath();
+    AppBackupOptions options;
+    options.includeApk = m_backupIncludeApk;
+    options.includeData = m_backupIncludeData;
+    options.includeDeviceProtectedData = m_backupIncludeDeData;
+    options.includeExternalData = m_backupIncludeExternalData;
+    options.includeObb = m_backupIncludeObb;
+    options.includeMedia = m_backupIncludeMedia;
+    options.grantRuntimePermissions = m_backupRestorePermissions;
+    options.allowDowngrade = m_backupAllowDowngrade;
+    bool requiresRoot = options.includeData || options.includeDeviceProtectedData;
+
+    LOG_INFO("BackupManager", "Restore confirmed. serial=" + serial);
+    m_backupProgressActive = true;
+    m_backupProgressIsRestore = true;
+    m_backupProgressCurrent = 0;
+    m_backupProgressTotal = (int)backups.size();
+    m_backupProgressStage = 0;
+    m_backupProgressStageTotal = 1;
+    m_backupProgressBytes = 0;
+    m_backupProgressTotalBytes = 0;
+    m_backupProgressPackage.clear();
+    m_backupProgressStageLabel = "Starting restore";
+    m_backupProgressPackages.clear();
+    m_backupProgressActiveAppIndex = -1;
+    std::unordered_map<std::string, std::string> installedLabels;
+    for (const auto& row : m_backupManagerApps) {
+        if (!row.app.appName.empty()) installedLabels[row.app.packageName] = row.app.appName;
+    }
+    for (const auto& backup : backups) {
+        std::ifstream mf(toFsPath(backup) / "backup.json", std::ios::binary);
+        nlohmann::json meta = nlohmann::json::parse(mf, nullptr, false);
+        std::string fallback = pathToUtf8(toFsPath(backup).filename());
+        if (meta.is_discarded()) {
+            m_backupProgressPackages.push_back(std::move(fallback));
+            continue;
+        }
+        std::string packageName = meta.value("packageName", fallback);
+        std::string appName = meta.value("label", "");
+        if (appName.empty()) {
+            auto installed = installedLabels.find(packageName);
+            if (installed != installedLabels.end()) appName = installed->second;
+        }
+        m_backupProgressPackages.push_back(appName.empty() ? packageName : appName);
+    }
+    m_backupAppProgress.assign(backups.size(), 0.0f);
+    m_backupDisplayedAppProgress.assign(backups.size(), 0.0f);
+    m_backupAppActive.assign(backups.size(), false);
+    m_backupDisplayedOverallProgress = 0.0f;
+
+    postAsync("Restoring backups...", [this, slot, serial, adbPath, backups, options, requiresRoot]() {
+        int ok = 0;
+        std::string details;
+        try {
+            DeviceClient restoreClient;
+            if (!adbPath.empty()) restoreClient.setAdbPath(adbPath);
+            if (restoreClient.getAdbPath().empty() && !restoreClient.findAdb()) {
+                LOG_ERROR("BackupManager", "Restore aborted. ADB was not found.");
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = false;
+                message.backupProgressIsRestore = true;
+                message.hasNotification = true;
+                message.notificationTitle = "Restore Failed";
+                message.notificationMessage = "ADB was not found.";
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+
+            DeviceClient& slotClient = deviceForSlot(slot);
+            if (serial.empty() || (requiresRoot && !restoreClient.isRootAvailable(serial))) {
+                LOG_ERROR("BackupManager", "Restore root access check failed for " + serial);
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = false;
+                message.backupProgressIsRestore = true;
+                message.hasNotification = true;
+                message.notificationTitle = "Root Required";
+                message.notificationMessage = "Private app data requires root access. Choose Standard Backup to restore APK and shared app folders only.";
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+            if (requiresRoot && (!slotClient.isServerRunning() || !slotClient.useRoot())) {
+                LOG_INFO("BackupManager", "Starting root device server for restore on " + serial);
+                if (!slotClient.startServer(serial, m_preferAdbForward, true)) {
+                    UiMessage message;
+                    message.hasBackupProgress = true;
+                    message.backupProgressActive = false;
+                    message.backupProgressIsRestore = true;
+                    message.hasNotification = true;
+                    message.notificationTitle = "Root Required";
+                    message.notificationMessage = "Backup Manager requires its device helper to run as root. Enable Root for this device and approve the request in your root manager.\n\nDetails: " + slotClient.lastError();
+                    message.notificationIsError = true;
+                    postUiMessage(std::move(message));
+                    return;
+                }
+            }
+            if (requiresRoot) {
+                m_prefs.setRootEnabledForSerial(serial, true);
+                m_prefs.save();
+            }
+            DeviceClient& restoreWorkClient = slotClient.isServerRunning() ? slotClient : restoreClient;
+            AppBackupOptions restoreOptions = options;
+            std::vector<bool> apkInstalled(backups.size(), true);
+            bool usedBatchInstall = options.includeApk && restoreWorkClient.isServerRunning() && restoreWorkClient.useRoot();
+            if (usedBatchInstall) {
+                UiMessage batchMessage;
+                batchMessage.hasBackupProgress = true;
+                batchMessage.backupProgressActive = true;
+                batchMessage.backupProgressIsRestore = true;
+                batchMessage.backupProgressCurrent = 0;
+                batchMessage.backupProgressTotal = (int)backups.size();
+                batchMessage.backupProgressStageLabel = "Uploading APK batch";
+                postUiMessage(std::move(batchMessage));
+                std::string installOutput;
+                auto installProgress = [this](uint64_t done, uint64_t total) {
+                    UiMessage message;
+                    message.hasBackupProgress = true;
+                    message.backupProgressActive = true;
+                    message.backupProgressIsRestore = true;
+                    message.backupProgressBytes = done;
+                    message.backupProgressTotalBytes = total;
+                    message.backupProgressStageLabel = "Uploading APK batch";
+                    postUiMessage(std::move(message));
+                    return true;
+                };
+                auto appInstallProgress = [this](const AppInstallProgress& progress) {
+                    UiMessage message;
+                    message.hasBackupProgress = true;
+                    message.backupProgressActive = true;
+                    message.backupProgressIsRestore = true;
+                    message.backupProgressTotal = (int)m_backupProgressPackages.size();
+                    message.backupProgressPackage = progress.packageName;
+                    message.backupProgressStageLabel = progress.stageLabel;
+                    message.backupProgressAppIndex = progress.backupIndex;
+                    message.backupProgressAppFraction = progress.appProgress * 0.45f;
+                    postUiMessage(std::move(message));
+                    return true;
+                };
+                if (!restoreWorkClient.installBackupApksBatch(backups, options, apkInstalled, installOutput,
+                        installProgress, appInstallProgress)) {
+                    details += installOutput;
+                    LOG_ERROR("BackupManager", "Batch APK install completed with errors: " + installOutput);
+                }
+                restoreOptions.includeApk = false;
+            }
+            for (int backupIndex = 0; backupIndex < (int)backups.size(); backupIndex++) {
+                const auto& backup = backups[backupIndex];
+                std::string out;
+                std::string packageName;
+                {
+                    std::ifstream mf(toFsPath(backup) / "backup.json", std::ios::binary);
+                    nlohmann::json meta = nlohmann::json::parse(mf, nullptr, false);
+                    if (!meta.is_discarded()) packageName = meta.value("packageName", "");
+                }
+                UiMessage progressMessage;
+                progressMessage.hasBackupProgress = true;
+                progressMessage.backupProgressActive = true;
+                progressMessage.backupProgressIsRestore = true;
+                progressMessage.backupProgressCurrent = backupIndex;
+                progressMessage.backupProgressTotal = (int)backups.size();
+                progressMessage.backupProgressStage = 0;
+                progressMessage.backupProgressStageTotal = 1;
+                progressMessage.backupProgressPackage = packageName.empty() ? backup : packageName;
+                progressMessage.backupProgressStageLabel = "Restoring app";
+                postUiMessage(std::move(progressMessage));
+                LOG_INFO("BackupManager", "Starting restore: " + backup);
+                auto progressCb = [this, backupIndex, usedBatchInstall, totalBackups = (int)backups.size()](const AppBackupProgress& progress) {
+                    float byteFraction = progress.bytesTotal > 0
+                        ? std::clamp((float)progress.bytesTransferred / (float)progress.bytesTotal, 0.0f, 1.0f)
+                        : 0.0f;
+                    float stageFraction = ((float)progress.stageIndex + byteFraction) /
+                        (float)std::max(1, progress.stageCount);
+                    float appFraction = usedBatchInstall
+                        ? 0.45f + std::clamp(stageFraction, 0.0f, 1.0f) * 0.55f
+                        : std::clamp(stageFraction, 0.0f, 1.0f);
+                    UiMessage message;
+                    message.hasBackupProgress = true;
+                    message.backupProgressActive = true;
+                    message.backupProgressIsRestore = true;
+                    message.backupProgressCurrent = backupIndex;
+                    message.backupProgressTotal = totalBackups;
+                    message.backupProgressStage = progress.stageIndex;
+                    message.backupProgressStageTotal = progress.stageCount;
+                    message.backupProgressBytes = progress.bytesTransferred;
+                    message.backupProgressTotalBytes = progress.bytesTotal;
+                    message.backupProgressPackage = progress.packageName;
+                    message.backupProgressStageLabel = progress.stageLabel;
+                    message.backupProgressAppIndex = backupIndex;
+                    message.backupProgressAppFraction = appFraction;
+                    postUiMessage(std::move(message));
+                    return true;
+                };
+                if (!apkInstalled[backupIndex]) {
+                    LOG_ERROR("BackupManager", "Skipping data restore because APK install failed: " + backup);
+                    continue;
+                }
+                if (restoreWorkClient.restoreAppBackup(serial, backup, restoreOptions, out, progressCb)) {
+                    ok++;
+                    UiMessage completeMessage;
+                    completeMessage.hasBackupProgress = true;
+                    completeMessage.backupProgressActive = true;
+                    completeMessage.backupProgressIsRestore = true;
+                    completeMessage.backupProgressCurrent = ok;
+                    completeMessage.backupProgressTotal = (int)backups.size();
+                    completeMessage.backupProgressPackage = packageName;
+                    completeMessage.backupProgressStageLabel = "App restored";
+                    completeMessage.backupProgressAppIndex = backupIndex;
+                    completeMessage.backupProgressAppFraction = 1.0f;
+                    postUiMessage(std::move(completeMessage));
+                    LOG_INFO("BackupManager", "Restore complete: " + backup);
+                } else {
+                    details += backup + ":\n" + out + "\n";
+                    LOG_ERROR("BackupManager", "Restore failed: " + backup + ": " + out);
+                }
+            }
+            LOG_INFO("BackupManager", "Restore finished. ok=" + std::to_string(ok) + " total=" + std::to_string(backups.size()));
+            UiMessage message;
+            message.refreshAppList = true;
+            message.hasStatus = true;
+            message.status = "Restored " + std::to_string(ok) + " backup(s)";
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.backupProgressIsRestore = true;
+            message.backupProgressCurrent = ok;
+            message.backupProgressTotal = (int)backups.size();
+            message.backupProgressStageLabel = "Restore finished";
+            message.hasNotification = true;
+            std::string restoreSummary = "Restored apps: " + std::to_string(ok) + " of " +
+                std::to_string(backups.size()) + "\n\nRequested content\n";
+            if (options.includeApk) restoreSummary += "APK installation\n";
+            if (options.includeData) restoreSummary += "App data\n";
+            if (options.includeDeviceProtectedData) restoreSummary += "Device protected data\n";
+            if (options.includeExternalData) restoreSummary += "External data\n";
+            if (options.includeObb) restoreSummary += "OBB data\n";
+            if (options.includeMedia) restoreSummary += "Media data\n";
+            if (ok == (int)backups.size()) {
+                message.notificationTitle = "Restore Complete";
+                message.notificationMessage = restoreSummary + "\nAll selected apps were restored successfully.";
+                message.notificationIsError = false;
+            } else {
+                message.notificationTitle = "Restore Finished With Errors";
+                message.notificationMessage = restoreSummary + "\nIssues\n" +
+                    (details.empty() ? "Some restores failed." : details);
+                message.notificationIsError = true;
+            }
+            postUiMessage(std::move(message));
+        } catch (const std::exception& e) {
+            LOG_ERROR("BackupManager", std::string("Restore task exception: ") + e.what());
+            UiMessage message;
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.backupProgressIsRestore = true;
+            message.hasNotification = true;
+            message.notificationTitle = "Restore Failed";
+            message.notificationMessage = e.what();
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        } catch (...) {
+            LOG_ERROR("BackupManager", "Restore task unknown exception");
+            UiMessage message;
+            message.hasBackupProgress = true;
+            message.backupProgressActive = false;
+            message.backupProgressIsRestore = true;
+            message.hasNotification = true;
+            message.notificationTitle = "Restore Failed";
+            message.notificationMessage = "Unexpected restore failure.";
+            message.notificationIsError = true;
+            postUiMessage(std::move(message));
+        }
+    });
+}
+
+void App::renderBackupManagerWindow() {
+    if (m_backupManagerNeedsBackupRefresh) refreshBackupManagerBackups();
+    if (m_backupManagerNeedsAppRefresh && !m_asyncBusy.load()) refreshBackupManagerApps();
+    probeBackupManagerRootAccess();
+
+    ImGui::Separator();
+    ImGui::TextColored(m_theme.gradientPrimary, "Backup Manager");
+    ImGui::SameLine();
+    if (modernButton("Back to File Manager")) {
+        m_showBackupManager = false;
+        return;
+    }
+
+    std::string root = getBackupsRootPath();
+    ImGui::SameLine();
+    ImGui::TextDisabled("Storage: %s", root.c_str());
+    ImGui::SameLine();
+    if (modernSmallButton("Open Folder")) {
+        CreateDirectoryW(toWide(root).c_str(), nullptr);
+        ShellExecuteA(nullptr, "explore", root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Device");
+    ImGui::SameLine();
+    auto slotLabel = [&](int slot) -> std::string {
+        if (!m_slotConnected[slot]) return "No device";
+        auto it = m_deviceDisplayNames.find(m_slotSerial[slot]);
+        if (it != m_deviceDisplayNames.end()) return it->second;
+        return m_slotSerial[slot];
+    };
+    ImGui::SetNextItemWidth(260);
+    if (ImGui::BeginCombo("##BackupDevice", slotLabel(m_backupManagerSlot).c_str())) {
+        for (int slot = 0; slot < 2; slot++) {
+            bool enabled = m_slotConnected[slot];
+            ImGui::BeginDisabled(!enabled);
+            bool selected = m_backupManagerSlot == slot;
+            std::string label = slotLabel(slot) + "##backupSlot" + std::to_string(slot);
+            if (ImGui::Selectable(label.c_str(), selected)) {
+                m_backupManagerSlot = slot;
+                m_backupManagerNeedsAppRefresh = true;
+                m_backupRootAccess = BackupRootAccess::Unknown;
+                m_backupRootAccessSerial.clear();
+                m_showBackupRootChoice = false;
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+            ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (modernSmallButton("Refresh")) {
+        m_backupManagerNeedsAppRefresh = true;
+        m_backupManagerNeedsBackupRefresh = true;
+    }
+    bool hasDevice = m_slotConnected[m_backupManagerSlot & 1];
+    bool backupRootEnabled = m_backupRootAccess == BackupRootAccess::Available;
+    ImGui::SameLine();
+    if (m_backupRootAccess == BackupRootAccess::Checking)
+        ImGui::TextColored(ImVec4(0.35f, 0.70f, 1.0f, 1), "Checking root access...");
+    else if (backupRootEnabled)
+        ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1), "Root access available, full backup enabled");
+    else if (m_backupRootAccess == BackupRootAccess::Unavailable)
+        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1), "Standard backup, private app data unavailable");
+    else
+        ImGui::TextDisabled("Select a connected device to check backup capabilities");
+
+    ImGui::Separator();
+    ImGui::Checkbox("APK", &m_backupIncludeApk);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!backupRootEnabled);
+    ImGui::Checkbox("App data", &m_backupIncludeData);
+    ImGui::SameLine();
+    ImGui::Checkbox("Device protected", &m_backupIncludeDeData);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::Checkbox("External", &m_backupIncludeExternalData);
+    ImGui::SameLine();
+    ImGui::Checkbox("OBB", &m_backupIncludeObb);
+    ImGui::SameLine();
+    ImGui::Checkbox("Media", &m_backupIncludeMedia);
+    ImGui::Checkbox("Skip cache folders", &m_backupExcludeCache);
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Show system apps", &m_backupShowSystemApps) && !m_backupShowSystemApps) {
+        for (auto& row : m_backupManagerApps)
+            if (row.app.isSystem) row.selected = false;
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Restore permissions", &m_backupRestorePermissions);
+    ImGui::SameLine();
+    ImGui::Checkbox("Allow downgrade", &m_backupAllowDowngrade);
+
+    if (m_showBackupRootChoice) {
+        ImGui::OpenPopup("Backup capabilities");
+        m_showBackupRootChoice = false;
+    }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Backup capabilities", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.25f, 1), "Root access was not detected");
+        ImGui::Spacing();
+        ImGui::TextWrapped("Fast Enough can still back up APK files and shared app folders. Private app data and device-protected data require root access.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("Choose how you want to continue for this device.");
+        ImGui::Spacing();
+        if (modernButton("Use Standard Backup", ImVec2(200, 0))) {
+            m_backupIncludeData = false;
+            m_backupIncludeDeData = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (modernButton("Check Root Again", ImVec2(200, 0))) {
+            m_backupRootAccess = BackupRootAccess::Unknown;
+            m_backupRootAccessSerial.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    ImGui::Separator();
+    bool anyApp = false;
+    for (const auto& row : m_backupManagerApps)
+        if (row.selected && (m_backupShowSystemApps || !row.app.isSystem)) { anyApp = true; break; }
+    bool anyBackup = false;
+    for (const auto& row : m_backupManagerBackups) if (row.selected) { anyBackup = true; break; }
+    int selectedJobCount = 0;
+    for (const auto& row : m_backupManagerBackups)
+        if (row.selected && row.isJob) selectedJobCount++;
+
+    bool showBackupProgress = m_backupProgressActive || (!m_backupProgressStageLabel.empty() && m_asyncBusy.load());
+    float bottomBarH = showBackupProgress
+        ? (ImGui::GetFrameHeightWithSpacing() * (!m_backupAppProgress.empty() ? 6.0f : 4.0f) + 18.0f)
+        : (ImGui::GetFrameHeightWithSpacing() + 12.0f);
+    float availableY = ImGui::GetContentRegionAvail().y;
+    float bodyH = availableY - bottomBarH - ImGui::GetStyle().ItemSpacing.y;
+    if (bodyH < 80.0f) bodyH = 80.0f;
+    float columnW = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
+
+    std::string filter(m_backupManagerSearch);
+    std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+    std::string backupFilter(m_backupManagerBackupSearch);
+    std::transform(backupFilter.begin(), backupFilter.end(), backupFilter.begin(), ::tolower);
+    std::string jobAppFilter(m_backupManagerJobAppSearch);
+    std::transform(jobAppFilter.begin(), jobAppFilter.end(), jobAppFilter.begin(), ::tolower);
+
+    auto applyRowSelection = [](auto& rows, const std::vector<int>& visibleIndices,
+                                int rowIndex, int& anchor) {
+        ImGuiIO& io = ImGui::GetIO();
+        if (io.KeyShift && anchor >= 0) {
+            auto anchorPosition = std::find(visibleIndices.begin(), visibleIndices.end(), anchor);
+            auto rowPosition = std::find(visibleIndices.begin(), visibleIndices.end(), rowIndex);
+            if (anchorPosition != visibleIndices.end() && rowPosition != visibleIndices.end()) {
+                if (!io.KeyCtrl)
+                    for (auto& candidate : rows) candidate.selected = false;
+                auto first = std::min(anchorPosition, rowPosition);
+                auto last = std::max(anchorPosition, rowPosition);
+                for (auto position = first; position <= last; ++position)
+                    rows[*position].selected = true;
+                return;
+            }
+        }
+        if (io.KeyCtrl) {
+            rows[rowIndex].selected = !rows[rowIndex].selected;
+        } else {
+            for (auto& candidate : rows) candidate.selected = false;
+            rows[rowIndex].selected = true;
+        }
+        anchor = rowIndex;
+    };
+
+    auto appDisplayName = [&](const AppBackupRecord& record) -> std::string {
+        if (!record.label.empty()) return record.label;
+        for (const auto& installed : m_backupManagerApps)
+            if (installed.app.packageName == record.packageName && !installed.app.appName.empty())
+                return installed.app.appName;
+        return record.packageName;
+    };
+
+    ImGui::BeginChild("##BackupAppsPane", ImVec2(columnW, bodyH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+            ImGui::TextColored(m_theme.gradientPrimary, "Installed Apps");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputText("##BackupAppSearch", m_backupManagerSearch, sizeof(m_backupManagerSearch));
+        if (modernSmallButton("Select Visible")) setBackupManagerAppSelection(true, true);
+        ImGui::SameLine();
+        if (modernSmallButton("Select All")) setBackupManagerAppSelection(true, false);
+        ImGui::SameLine();
+        if (modernSmallButton("Clear")) setBackupManagerAppSelection(false, false);
+        ImGui::SameLine();
+        if (modernSmallButton("Invert Visible")) invertBackupManagerAppSelection(true);
+        if (!hasDevice) ImGui::TextDisabled("Connect a device to list installed apps.");
+        float tableH = ImGui::GetContentRegionAvail().y;
+        if (tableH < 80.0f) tableH = 80.0f;
+        std::vector<int> visibleAppIndices;
+        for (int i = 0; i < (int)m_backupManagerApps.size(); ++i) {
+            const auto& row = m_backupManagerApps[i];
+            if (row.app.isSystem && !m_backupShowSystemApps) continue;
+            std::string hay = row.app.appName + " " + row.app.packageName + " " + row.app.apkPath;
+            std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+            if (filter.empty() || hay.find(filter) != std::string::npos) visibleAppIndices.push_back(i);
+        }
+        if (ImGui::BeginTable("##BackupAppsTable", 4,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_Borders |
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                ImVec2(0, tableH))) {
+            ImGui::TableSetupColumn("App Name", ImGuiTableColumnFlags_WidthStretch, 0.30f);
+            ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch, 0.36f);
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableSetupColumn("APK Path", ImGuiTableColumnFlags_WidthStretch, 0.34f);
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableHeadersRow();
+            for (int i : visibleAppIndices) {
+                auto& row = m_backupManagerApps[i];
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                std::string displayName = row.app.appName.empty() ? row.app.packageName : row.app.appName;
+                std::string id = displayName + "##bmapp" + std::to_string(i);
+                if (ImGui::Selectable(id.c_str(), row.selected, ImGuiSelectableFlags_SpanAllColumns))
+                    applyRowSelection(m_backupManagerApps, visibleAppIndices, i, m_backupManagerAppSelectionAnchor);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(row.app.packageName.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", row.app.isSystem ? "System" : "User");
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", row.app.apkPath.c_str());
+            }
+            ImGui::EndTable();
+        }
+    ImGui::EndChild();
+
+    ImGui::SameLine(0, 12.0f);
+
+    ImGui::BeginChild("##BackupRestorePane", ImVec2(0, bodyH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+        if (m_backupManagerJobOpen) {
+            std::vector<int> visibleJobAppIndices;
+            for (int i = 0; i < (int)m_backupManagerJobApps.size(); ++i) {
+                const auto& record = m_backupManagerJobApps[i].record;
+                std::string hay = appDisplayName(record) + " " + record.packageName + " " +
+                    record.created + " " + record.backupPath;
+                std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+                if (jobAppFilter.empty() || hay.find(jobAppFilter) != std::string::npos)
+                    visibleJobAppIndices.push_back(i);
+            }
+            ImGui::TextColored(m_theme.gradientSecondary, "Backup Job");
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", m_backupManagerOpenJobTitle.c_str());
+            ImGui::SameLine();
+            if (modernSmallButton("Back to Jobs")) closeBackupManagerJob();
+            ImGui::SameLine();
+            if (modernSmallButton("Select Visible")) {
+                for (int index : visibleJobAppIndices) m_backupManagerJobApps[index].selected = true;
+            }
+            ImGui::SameLine();
+            if (modernSmallButton("Clear")) {
+                for (auto& row : m_backupManagerJobApps) row.selected = false;
+            }
+            bool anyJobApp = false;
+            for (const auto& row : m_backupManagerJobApps) if (row.selected) { anyJobApp = true; break; }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!hasDevice || m_asyncBusy.load() || m_backupManagerJobApps.empty());
+            if (modernSmallButton("Restore Whole Job")) {
+                std::vector<std::string> paths;
+                for (const auto& row : m_backupManagerJobApps) paths.push_back(row.record.backupPath);
+                startBackupManagerRestorePaths(std::move(paths));
+            }
+            ImGui::EndDisabled();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputTextWithHint("##BackupJobAppSearch", "Search app name or package...",
+                m_backupManagerJobAppSearch, sizeof(m_backupManagerJobAppSearch));
+
+            bool restoreJobSelection = false;
+            ImGui::BeginDisabled(!hasDevice || m_asyncBusy.load() || !anyJobApp);
+            restoreJobSelection = modernButton("Restore Selected Apps  |  Drop Selection Here", ImVec2(-1.0f, 0.0f));
+            ImGui::EndDisabled();
+            if (ImGui::BeginDragDropTarget()) {
+                if (ImGui::AcceptDragDropPayload("BM_JOB_APP_SELECTION") && hasDevice && !m_asyncBusy.load())
+                    restoreJobSelection = true;
+                ImGui::EndDragDropTarget();
+            }
+            if (restoreJobSelection) {
+                std::vector<std::string> paths;
+                for (const auto& row : m_backupManagerJobApps)
+                    if (row.selected) paths.push_back(row.record.backupPath);
+                if (!paths.empty()) startBackupManagerRestorePaths(std::move(paths));
+            }
+
+            tableH = ImGui::GetContentRegionAvail().y;
+            if (tableH < 80.0f) tableH = 80.0f;
+            if (ImGui::BeginTable("##BackupJobAppsTable", 5,
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_Borders |
+                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                    ImVec2(0, tableH))) {
+                ImGui::TableSetupColumn("App Name", ImGuiTableColumnFlags_WidthStretch, 0.25f);
+                ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch, 0.29f);
+                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                ImGui::TableSetupColumn("Contents", ImGuiTableColumnFlags_WidthStretch, 0.32f);
+                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableHeadersRow();
+                for (int i : visibleJobAppIndices) {
+                    auto& row = m_backupManagerJobApps[i];
+                    std::string contents;
+                    if (row.record.hasApk) contents += "APK ";
+                    if (row.record.hasData) contents += "Data ";
+                    if (row.record.hasDeviceProtectedData) contents += "DE ";
+                    if (row.record.hasExternalData) contents += "Ext ";
+                    if (row.record.hasObb) contents += "OBB ";
+                    if (row.record.hasMedia) contents += "Media ";
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    std::string displayName = appDisplayName(row.record);
+                    std::string id = displayName + "##bmjobapp" + std::to_string(i);
+                    if (ImGui::Selectable(id.c_str(), row.selected, ImGuiSelectableFlags_SpanAllColumns))
+                        applyRowSelection(m_backupManagerJobApps, visibleJobAppIndices, i,
+                            m_backupManagerJobAppSelectionAnchor);
+                    if (ImGui::BeginDragDropSource()) {
+                        if (!row.selected) {
+                            for (auto& candidate : m_backupManagerJobApps) candidate.selected = false;
+                            row.selected = true;
+                            m_backupManagerJobAppSelectionAnchor = i;
+                        }
+                        int selectedCount = 0;
+                        for (const auto& candidate : m_backupManagerJobApps)
+                            if (candidate.selected) selectedCount++;
+                        ImGui::SetDragDropPayload("BM_JOB_APP_SELECTION", &selectedCount, sizeof(selectedCount));
+                        ImGui::Text("Restore %d selected app%s", selectedCount, selectedCount == 1 ? "" : "s");
+                        ImGui::EndDragDropSource();
+                    }
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(row.record.packageName.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", row.record.created.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", contents.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", formatSize(row.record.sizeBytes).c_str());
+                }
+                ImGui::EndTable();
+            }
+        } else {
+            std::vector<int> visibleBackupIndices;
+            for (int i = 0; i < (int)m_backupManagerBackups.size(); ++i) {
+                const auto& row = m_backupManagerBackups[i];
+                std::string hay = appDisplayName(row.record) + " " + row.record.packageName + " " +
+                    row.record.created + " " + row.record.backupPath + " " + row.searchText;
+                std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
+                if (backupFilter.empty() || hay.find(backupFilter) != std::string::npos)
+                    visibleBackupIndices.push_back(i);
+            }
+            ImGui::TextColored(m_theme.gradientSecondary, "Saved Backups");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputTextWithHint("##BackupSearch", "Search jobs, app names, or packages...",
+                m_backupManagerBackupSearch, sizeof(m_backupManagerBackupSearch));
+            if (modernSmallButton("Open Job")) {
+                for (const auto& row : m_backupManagerBackups) {
+                    if (!row.selected) continue;
+                    openBackupManagerJob(row);
+                    break;
+                }
+            }
+            ImGui::BeginDisabled(selectedJobCount == 0 || m_asyncBusy.load());
+            if (modernSmallButton("Delete Selected Jobs")) {
+                std::string prompt = "Permanently delete " + std::to_string(selectedJobCount) + " selected backup job";
+                if (selectedJobCount != 1) prompt += "s";
+                prompt += " and all files inside?";
+                if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Delete Backup Jobs", MB_YESNO | MB_ICONWARNING) == IDYES) {
+                    std::vector<std::string> paths;
+                    for (const auto& row : m_backupManagerBackups)
+                        if (row.selected && row.isJob) paths.push_back(row.record.backupPath);
+                    std::string jobsRoot = pathToUtf8(toFsPath(getBackupsRootPath()) / "Jobs");
+                    postAsync("Deleting backup jobs...", [this, paths, jobsRoot]() {
+                        std::error_code ec;
+                        std::filesystem::path allowed = std::filesystem::weakly_canonical(toFsPath(jobsRoot), ec);
+                        int deleted = 0;
+                        for (const auto& value : paths) {
+                            ec.clear();
+                            std::filesystem::path target = std::filesystem::weakly_canonical(toFsPath(value), ec);
+                            if (ec || _wcsicmp(target.parent_path().c_str(), allowed.c_str()) != 0) {
+                                LOG_ERROR("BackupManager", "Refused to delete backup outside the Jobs folder: " + value);
+                                continue;
+                            }
+                            uintmax_t removed = std::filesystem::remove_all(target, ec);
+                            if (!ec && removed > 0) deleted++;
+                            else if (ec) LOG_ERROR("BackupManager", "Could not delete backup job: " + value + ": " + ec.message());
+                        }
+                        UiMessage message;
+                        message.refreshBackupList = true;
+                        message.hasStatus = true;
+                        message.status = "Deleted " + std::to_string(deleted) + " backup job(s)";
+                        message.hasNotification = true;
+                        message.notificationTitle = deleted == (int)paths.size() ? "Backup Jobs Deleted" : "Some Jobs Could Not Be Deleted";
+                        message.notificationMessage = "Deleted " + std::to_string(deleted) + " of " + std::to_string(paths.size()) + " selected backup job(s).";
+                        message.notificationIsError = deleted != (int)paths.size();
+                        postUiMessage(std::move(message));
+                    });
+                }
+            }
+            ImGui::EndDisabled();
+
+            bool restoreBackupSelection = false;
+            ImGui::BeginDisabled(!hasDevice || !anyBackup || m_asyncBusy.load());
+            restoreBackupSelection = modernButton(
+                "Restore Selected Backups  |  Drop Selection Here", ImVec2(-1.0f, 0.0f));
+            ImGui::EndDisabled();
+            if (ImGui::BeginDragDropTarget()) {
+                if (ImGui::AcceptDragDropPayload("BM_BACKUP_SELECTION") && hasDevice && !m_asyncBusy.load())
+                    restoreBackupSelection = true;
+                ImGui::EndDragDropTarget();
+            }
+            if (restoreBackupSelection) startBackupManagerRestore();
+
+            tableH = ImGui::GetContentRegionAvail().y;
+            if (tableH < 80.0f) tableH = 80.0f;
+            if (ImGui::BeginTable("##BackupsTable", 4,
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_Borders |
+                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                    ImVec2(0, tableH))) {
+                ImGui::TableSetupColumn("Backup", ImGuiTableColumnFlags_WidthStretch, 0.42f);
+                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                ImGui::TableSetupColumn("Contents", ImGuiTableColumnFlags_WidthStretch, 0.35f);
+                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableHeadersRow();
+                for (int i : visibleBackupIndices) {
+                    auto& row = m_backupManagerBackups[i];
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    std::string displayName = row.isJob ? row.record.packageName : appDisplayName(row.record);
+                    std::string id = displayName + "##bmbak" + std::to_string(i);
+                    if (ImGui::Selectable(id.c_str(), row.selected, ImGuiSelectableFlags_SpanAllColumns))
+                        applyRowSelection(m_backupManagerBackups, visibleBackupIndices, i,
+                            m_backupManagerBackupSelectionAnchor);
+                    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        openBackupManagerJob(row);
+                    }
+                    if (ImGui::BeginDragDropSource()) {
+                        if (!row.selected) {
+                            for (auto& candidate : m_backupManagerBackups) candidate.selected = false;
+                            row.selected = true;
+                            m_backupManagerBackupSelectionAnchor = i;
+                        }
+                        int selectedCount = 0;
+                        for (const auto& candidate : m_backupManagerBackups)
+                            if (candidate.selected) selectedCount++;
+                        ImGui::SetDragDropPayload("BM_BACKUP_SELECTION", &selectedCount, sizeof(selectedCount));
+                        ImGui::Text("Restore %d selected backup%s", selectedCount,
+                            selectedCount == 1 ? "" : "s");
+                        ImGui::EndDragDropSource();
+                    }
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", row.record.created.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", row.contentsSummary.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", formatSize(row.record.sizeBytes).c_str());
+                }
+                ImGui::EndTable();
+            }
+        }
+    ImGui::EndChild();
+
+    float backupButtonW = ImGui::CalcTextSize("Back Up Selected Apps").x + ImGui::GetStyle().FramePadding.x * 2.0f + 28.0f;
+    float restoreButtonW = ImGui::CalcTextSize("Restore Selected Backups").x + ImGui::GetStyle().FramePadding.x * 2.0f + 28.0f;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_ChildBg));
+    ImGui::BeginChild("##BackupManagerBottomBar", ImVec2(0, bottomBarH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+    ImGui::SetCursorPosX(8.0f);
+    ImGui::BeginDisabled(!hasDevice || !anyApp || m_asyncBusy.load());
+    if (modernButton("Back Up Selected Apps", ImVec2(backupButtonW, 0))) startBackupManagerBackup();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!hasDevice || !anyBackup || m_asyncBusy.load());
+    if (modernButton("Restore Selected Backups", ImVec2(restoreButtonW, 0))) startBackupManagerRestore();
+    ImGui::EndDisabled();
+    if (m_backupProgressActive && !m_backupProgressIsRestore) {
+        ImGui::SameLine();
+        bool paused = m_backupPauseRequested.load();
+        if (modernButton(paused ? "Resume Backup" : "Pause Backup")) {
+            m_backupPauseRequested = !paused;
+            m_backupProgressStageLabel = paused ? "Resuming backup" : "Backup paused";
+            m_backupControlCV.notify_all();
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(m_backupCancelRequested.load());
+        if (modernButton("Cancel Backup")) {
+            m_backupCancelRequested = true;
+            m_backupPauseRequested = false;
+            m_backupProgressStageLabel = "Cancelling backup";
+            m_backupControlCV.notify_all();
+        }
+        ImGui::EndDisabled();
+    }
+
+    std::string statusText;
+    if (m_asyncBusy.load()) {
+        statusText = m_asyncStatus;
+    } else {
+        auto elapsed = std::chrono::steady_clock::now() - m_statusTime;
+        if (!m_statusMessage.empty() && elapsed < std::chrono::seconds(15))
+            statusText = m_statusMessage;
+        else if (hasDevice)
+            statusText = "Ready";
+        else
+            statusText = "No device connected";
+    }
+    float statusW = ImGui::CalcTextSize(statusText.c_str()).x;
+    float rightX = ImGui::GetWindowWidth() - statusW - 16.0f;
+    if (rightX > ImGui::GetCursorPosX() + 20.0f) ImGui::SameLine(rightX);
+    else ImGui::SameLine(0, 20);
+    ImGui::TextColored(hasDevice ? ImVec4(0.3f, 0.9f, 0.5f, 1) : ImVec4(0.9f, 0.65f, 0.25f, 1),
+        "%s", statusText.c_str());
+
+    if (showBackupProgress && !m_backupAppProgress.empty()) {
+        float smoothing = std::clamp(ImGui::GetIO().DeltaTime * 7.0f, 0.0f, 1.0f);
+        if (m_backupDisplayedAppProgress.size() != m_backupAppProgress.size())
+            m_backupDisplayedAppProgress.assign(m_backupAppProgress.size(), 0.0f);
+        float targetOverall = 0.0f;
+        for (size_t i = 0; i < m_backupAppProgress.size(); ++i) {
+            m_backupDisplayedAppProgress[i] +=
+                (m_backupAppProgress[i] - m_backupDisplayedAppProgress[i]) * smoothing;
+            targetOverall += m_backupAppProgress[i];
+        }
+        targetOverall /= (float)m_backupAppProgress.size();
+        m_backupDisplayedOverallProgress +=
+            (targetOverall - m_backupDisplayedOverallProgress) * smoothing;
+
+        int appIndex = m_backupProgressActiveAppIndex;
+        if (appIndex < 0 || appIndex >= (int)m_backupAppProgress.size() || !m_backupAppActive[appIndex])
+            appIndex = -1;
+        if (appIndex < 0) {
+            for (int i = (int)m_backupAppProgress.size() - 1; i >= 0; --i) {
+                if (m_backupAppActive[i]) { appIndex = i; break; }
+            }
+        }
+
+        ImGui::SetCursorPosX(8.0f);
+        if (m_backupProgressIsRestore)
+            ImGui::TextDisabled("Total restore progress");
+        else
+            ImGui::TextDisabled("Total progress  %d of %d apps finished",
+                std::clamp(m_backupProgressCurrent, 0, m_backupProgressTotal), m_backupProgressTotal);
+        ImGui::SetCursorPosX(8.0f);
+        char totalText[64];
+        snprintf(totalText, sizeof(totalText), "%.0f%%", m_backupDisplayedOverallProgress * 100.0f);
+        drawProgressBar(m_backupDisplayedOverallProgress, totalText, 22.0f,
+            ImVec4(0.95f, 0.72f, 0.0f, 1.0f), ImVec4(0.04f, 0.05f, 0.08f, 1.0f));
+
+        if (appIndex >= 0 && appIndex < (int)m_backupProgressPackages.size()) {
+            ImGui::SetCursorPosX(8.0f);
+            ImGui::TextDisabled("App progress  %s", m_backupProgressPackages[appIndex].c_str());
+            ImGui::SetCursorPosX(8.0f);
+            char appText[64];
+            snprintf(appText, sizeof(appText), "%.0f%%", m_backupDisplayedAppProgress[appIndex] * 100.0f);
+            drawProgressBar(m_backupDisplayedAppProgress[appIndex], appText, 20.0f,
+                ImVec4(0.95f, 0.72f, 0.0f, 1.0f), ImVec4(0.04f, 0.05f, 0.08f, 1.0f));
+        }
+        ImGui::SetCursorPosX(8.0f);
+        if (!m_backupProgressStageLabel.empty()) ImGui::TextDisabled("%s", m_backupProgressStageLabel.c_str());
+    } else if (showBackupProgress) {
+        int totalApps = std::max(1, m_backupProgressTotal);
+        int stageTotal = std::max(1, m_backupProgressStageTotal);
+        float stageFraction = (float)std::clamp(m_backupProgressStage, 0, stageTotal) / (float)stageTotal;
+        if (m_backupProgressTotalBytes > 0) {
+            stageFraction = ((float)m_backupProgressStage + std::clamp((float)m_backupProgressBytes / (float)m_backupProgressTotalBytes, 0.0f, 1.0f)) / (float)stageTotal;
+        }
+        float overallFraction = ((float)std::clamp(m_backupProgressCurrent, 0, totalApps) + std::clamp(stageFraction, 0.0f, 1.0f)) / (float)totalApps;
+        overallFraction = std::clamp(overallFraction, 0.0f, 1.0f);
+
+        ImGui::SetCursorPosX(8.0f);
+        std::string line = std::string(m_backupProgressIsRestore ? "Restore " : "Backup ") +
+            std::to_string(std::min(m_backupProgressCurrent + 1, totalApps)) + " of " +
+            std::to_string(totalApps);
+        if (!m_backupProgressPackage.empty()) line += "  " + m_backupProgressPackage;
+        ImGui::TextDisabled("%s", line.c_str());
+
+        ImGui::SetCursorPosX(8.0f);
+        char overallText[64];
+        snprintf(overallText, sizeof(overallText), "%.0f%%", overallFraction * 100.0f);
+        ImGui::ProgressBar(overallFraction, ImVec2(-8.0f, 22.0f), overallText);
+
+        ImGui::SetCursorPosX(8.0f);
+        std::string stageLine;
+        if (!m_backupProgressStageLabel.empty()) stageLine = m_backupProgressStageLabel;
+        if (m_backupProgressBytes > 0) {
+            if (!stageLine.empty()) stageLine += "  ";
+            stageLine += formatSize(m_backupProgressBytes);
+            if (m_backupProgressTotalBytes > 0) stageLine += " / " + formatSize(m_backupProgressTotalBytes);
+        }
+        if (!stageLine.empty()) ImGui::TextDisabled("%s", stageLine.c_str());
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+}
+
+void App::openAndroidFile(FilePanel& panel, int index) {
+    if (!panel.isAndroid || !panel.validIndex(index)) return;
+    if (panel.entryIsDir(index)) return;
+
+    std::string name = panel.entryName(index);
+    std::string remotePath = panel.currentPath;
+    appendPathSeparator(remotePath, '/');
+    remotePath += name;
+
+    m_statusMessage = "Opening: " + name + "...";
+    m_statusTime = std::chrono::steady_clock::now();
+
+    int slot = panel.deviceSlot;
+    postAsync("Opening: " + name, [this, remotePath, name, slot]() {
+        char tempBuf[MAX_PATH];
+        GetTempPathA(MAX_PATH, tempBuf);
+        std::string tempDir = std::string(tempBuf) + "FastEnough\\";
+        CreateDirectoryA(tempDir.c_str(), nullptr);
+
+        std::string localPath = tempDir + name;
+        uint64_t outSize = 0;
+
+        LOG_INFO("UI", "Pulling to temp: " + remotePath + " -> " + localPath);
+        bool ok = deviceForSlot(slot).pullFile(remotePath, localPath, outSize, nullptr);
+        if (ok) {
+            LOG_INFO("UI", "Opening: " + localPath);
+            ShellExecuteA(nullptr, "open", localPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            m_statusMessage = "Opened: " + name;
+        } else {
+            LOG_ERROR("UI", "Failed to pull file: " + remotePath);
+            m_statusMessage = "Failed to open: " + name;
+        }
+        m_statusTime = std::chrono::steady_clock::now();
+    });
+}
+
+void App::renderCopyMoveDialog() {
+    if (!m_showCopyMoveDialog || !m_pendingBatch) return;
+
+    ImGui::OpenPopup("Copy or Move?");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+    if (ImGui::BeginPopupModal("Copy or Move?", &m_showCopyMoveDialog,
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+        int fileCount = (int)m_pendingBatch->files.size();
+        if (fileCount == 1)
+            ImGui::Text("%s", m_pendingBatch->files[0].displayName.c_str());
+        else
+            ImGui::Text("%d files selected", fileCount);
+
+        ImGui::Spacing();
+
+        // Check if same partition (for local copies — suggest move)
+        bool sameDrive = false;
+        if (m_pendingBatch->isLocalCopy && fileCount > 0) {
+            auto& src = m_pendingBatch->files[0].sourcePath;
+            auto& dst = m_pendingBatch->files[0].destPath;
+            if (src.size() >= 2 && dst.size() >= 2)
+                sameDrive = (toupper(src[0]) == toupper(dst[0]));
+            if (sameDrive)
+                ImGui::TextDisabled("Same drive — move will be instant");
+        }
+
+        ImGui::Spacing();
+
+        float buttonW = 120.0f;
+        float spacing = ImGui::GetStyle().ItemSpacing.x;
+        float totalW = buttonW * 2 + spacing;
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - totalW) * 0.5f);
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
+        if (modernButton("Copy", ImVec2(buttonW, 30))) {
+            m_pendingBatch->isMove = false;
+            {
+                std::lock_guard<std::mutex> lk(m_batchMutex);
+                m_batchQueue.push_back(m_pendingBatch);
+            }
+            m_batchCV.notify_one();
+            m_overlayWasOpen = false;
+            m_pendingBatch.reset();
+            m_showCopyMoveDialog = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleColor(2);
+
+        ImGui::SameLine();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f, 0.35f, 0.10f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.50f, 0.15f, 1));
+        if (modernButton("Move", ImVec2(buttonW, 30))) {
+            m_pendingBatch->isMove = true;
+            {
+                std::lock_guard<std::mutex> lk(m_batchMutex);
+                m_batchQueue.push_back(m_pendingBatch);
+            }
+            m_batchCV.notify_one();
+            m_overlayWasOpen = false;
+            m_pendingBatch.reset();
+            m_showCopyMoveDialog = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleColor(2);
+
+        ImGui::EndPopup();
+    }
+}
+
+void App::tryAutoWifiConnect(const std::string& serial) {
+    if (m_wifiAutoSetupDone || m_dualChannelAvailable) return;
+    if (!m_prefs.wifiAutoConnect) return; // user disabled WiFi auto-connect
+
+    for (auto& w : m_prefs.savedWifiDevices) {
+        if (w.serial == serial && w.autoConnect && !w.wifiIp.empty()) {
+            // Check if WiFi serial is already in the device list (tcpip already active)
+            std::string wifiSerial = w.wifiIp + ":" + std::to_string(w.port);
+            bool alreadyInTcpip = false;
+            {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+                for (auto& d : m_devices)
+                    if (d.serial == wifiSerial) { alreadyInTcpip = true; break; }
+            }
+
+            // Verify WiFi is actually reachable before disrupting USB with tcpip
+            // Quick check: try connecting directly first (if tcpip was already set from a previous session)
+            LOG_INFO("WiFi", "Auto-connecting to saved WiFi device: " + w.wifiIp + ":" + std::to_string(w.port) +
+                     (alreadyInTcpip ? " (already in tcpip mode)" : ""));
+            m_wifiAutoSetupDone = true;
+
+            std::string ip = w.wifiIp;
+            int port = w.port;
+            // Keep a verified direct helper channel alive before asking Android
+            // to restart ADB in TCP mode. This channel is the app's bridge across
+            // the unavoidable ADB USB transport reset.
+            if (!alreadyInTcpip) {
+                m_secondaryChannel.setAdbPath(m_device.getAdbPath());
+                m_secondaryChannel.disconnectTcp();
+                if (!m_secondaryChannel.connectTcp(ip, AFM_PORT) || !m_secondaryChannel.verifyConnection()) {
+                    m_wifiAutoSetupDone = false;
+                    m_statusMessage = "WiFi helper is not reachable yet, keeping USB only";
+                    m_statusTime = std::chrono::steady_clock::now();
+                    LOG_WARN("WiFi", "Direct WiFi helper check failed, not switching ADB to TCP mode");
+                    return;
+                }
+                m_dualChannelAvailable = true;
+                m_secondaryChannelType = "WiFi";
+                LOG_INFO("WiFi", "Direct WiFi helper verified before ADB TCP transition");
+            }
+
+            postAsync("Connecting WiFi ADB...", [this, serial, ip, port, alreadyInTcpip]() {
+                if (!alreadyInTcpip) {
+                    m_wifiTransitionActive = true;
+                    m_device.runAdbCommand("-s " + serial + " tcpip " + std::to_string(port));
+                    // Give adbd time to reopen its TCP listener. During this
+                    // intentional handoff the poller keeps the USB session from
+                    // being mistaken for a failed helper.
+                    std::this_thread::sleep_for(std::chrono::seconds(8));
+                    if (!m_device.connectDirect(ip)) {
+                        LOG_WARN("WiFi", "Could not promote primary to direct WiFi during ADB TCP transition");
+                    } else {
+                        m_statusMessage = "Switching ADB to WiFi while keeping the file connection active";
+                        m_statusTime = std::chrono::steady_clock::now();
+                    }
+                    m_wifiTransitionActive = false;
+                }
+                // Connect
+                std::string result = m_device.runAdbCommand("connect " + ip + ":" + std::to_string(port));
+                if (result.find("connected") != std::string::npos || result.find("already") != std::string::npos) {
+                    LOG_INFO("WiFi", "WiFi ADB connected: " + ip);
+                    // Track USB↔WiFi serial mapping
+                    m_usbToWifiSerial = ip + ":" + std::to_string(port);
+                    m_wifiToUsbSerial = serial;
+                    // Establish secondary channel
+                    m_secondaryChannel.setAdbPath(m_device.getAdbPath());
+                    if (m_secondaryChannel.connectTcp(ip, AFM_PORT) && m_secondaryChannel.verifyConnection()) {
+                        m_dualChannelAvailable = true;
+                        m_secondaryChannelType = "WiFi";
+                        m_statusMessage = "Dual channel active: USB + WiFi";
+                        LOG_INFO("WiFi", "Dual channel established via auto-connect");
+                    } else {
+                        m_statusMessage = "WiFi connected but dual channel failed";
+                    }
+                } else {
+                    LOG_WARN("WiFi", "WiFi auto-connect failed: " + result);
+                }
+                m_statusTime = std::chrono::steady_clock::now();
+            });
+            return;
+        }
+    }
+}
+
+void App::renderWifiBanner() {
+    return; // Dual channel is now automatic via USB x2 / WiFi x2 toggles
+    if (m_wifiBannerDismissed || m_wifiAutoSetupDone || m_dualChannelAvailable) return;
+    if (!m_device.isServerRunning()) return;
+
+    // Check if USB device has WiFi and isn't already saved
+    std::string serial = m_device.connectedSerial();
+    if (serial.empty()) return;
+    for (auto& w : m_prefs.savedWifiDevices)
+        if (w.serial == serial) return; // already saved
+
+    // Detect WiFi IP (check once, not every frame)
+    if (!m_wifiBannerShown) {
+        // Rate-limit: only check every 10 seconds
+        static auto lastCheck = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - lastCheck).count() < 10.0) return;
+        lastCheck = now;
+
+        // Run on async thread to avoid blocking UI
+        postAsync("", [this, serial]() {
+            std::string wlanOut = m_device.runAdbCommand("-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+            if (wlanOut.find("inet ") != std::string::npos)
+                m_wifiBannerShown = true;
+        });
+        return;
+    }
+
+    // Show banner at top of main window
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.15f, 0.25f, 1));
+    ImGui::BeginChild("##WifiBanner", ImVec2(0, ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2), ImGuiChildFlags_Border);
+    float pad = (ImGui::GetContentRegionAvail().y - ImGui::GetFontSize()) * 0.5f;
+    ImGui::SetCursorPosY(pad);
+    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1, 1), "  WiFi detected on your phone.");
+    ImGui::SameLine();
+    ImGui::TextDisabled("Enable dual-channel for faster transfers?");
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
+    if (modernSmallButton("Set Up")) {
+        m_showWifiWizard = true;
+        m_wizardStep = 0;
+    }
+    ImGui::PopStyleColor(2);
+    ImGui::SameLine();
+    if (modernSmallButton("Dismiss")) {
+        m_wifiBannerDismissed = true;
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+void App::renderWifiWizard() {
+    if (!m_showWifiWizard) return;
+
+    ImGui::OpenPopup("WiFi Setup Wizard");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_Appearing);
+
+    if (ImGui::BeginPopupModal("WiFi Setup Wizard", &m_showWifiWizard,
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+
+        if (m_wizardStep == 0) {
+            // Step 1: Select device
+            ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Step 1: Select Device");
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // List available devices
+            std::vector<DeviceInfo> devSnap;
+            {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+                devSnap = m_devices;
+            }
+
+            int onlineCount = 0;
+            for (auto& d : devSnap) if (d.state == "device") onlineCount++;
+
+            if (onlineCount > 0) {
+                ImGui::TextDisabled("Select the device to set up WiFi ADB:");
+                ImGui::Spacing();
+
+                for (int i = 0; i < (int)devSnap.size(); i++) {
+                    if (devSnap[i].state != "device") continue;
+                    bool isWifi = isWifiSerial(devSnap[i].serial);
+
+                    std::string label = devSnap[i].serial;
+                    if (!devSnap[i].model.empty()) label = devSnap[i].model + " (" + devSnap[i].serial + ")";
+                    if (isWifi) label += "  [WiFi]";
+                    else label += "  [USB]";
+
+                    bool selected = (m_wizardSerial == devSnap[i].serial);
+                    if (ImGui::Selectable(label.c_str(), selected)) {
+                        m_wizardSerial = devSnap[i].serial;
+                    }
+                }
+
+                ImGui::Spacing();
+                if (!m_wizardSerial.empty()) {
+                    if (modernButton("Next", ImVec2(120, 0))) m_wizardStep = 1;
+                } else {
+                    ImGui::TextDisabled("Click a device above to select it.");
+                }
+            } else {
+                ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "No device detected.");
+                ImGui::Spacing();
+                ImGui::TextDisabled("1. Connect your phone with a USB cable");
+                ImGui::Spacing();
+                ImGui::TextDisabled("2. On your phone, go to Settings > Developer Options");
+                ImGui::TextDisabled("   and enable USB Debugging");
+                ImGui::Spacing();
+                ImGui::TextDisabled("3. If this is your first time connecting, a pairing");
+                ImGui::TextDisabled("   prompt will appear on your phone - tap Allow");
+                ImGui::Spacing();
+                ImGui::TextDisabled("If you don't see Developer Options, go to");
+                ImGui::TextDisabled("Settings > About Phone and tap Build Number 7 times.");
+            }
+        } else if (m_wizardStep == 1) {
+            // Step 2: Check WiFi
+            ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Step 2: WiFi Connection");
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextDisabled("Device: %s", m_wizardSerial.c_str());
+            ImGui::Spacing();
+
+            std::string serial = m_wizardSerial;
+            std::string wlanOut = m_device.runAdbCommand("-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+            m_wizardWifiIp.clear();
+            auto inetPos = wlanOut.find("inet ");
+            if (inetPos != std::string::npos) {
+                auto start = inetPos + 5;
+                auto slash = wlanOut.find('/', start);
+                if (slash != std::string::npos)
+                    m_wizardWifiIp = wlanOut.substr(start, slash - start);
+            }
+
+            if (!m_wizardWifiIp.empty()) {
+                ImGui::TextColored(ImVec4(0.3f, 1, 0.5f, 1), "WiFi connected: %s", m_wizardWifiIp.c_str());
+                ImGui::Spacing();
+                if (modernButton("Set Up Wireless Connection", ImVec2(250, 0))) {
+                    m_wizardStep = 2;
+                    m_wizardBusy = true;
+                    m_wizardStatus = "Enabling WiFi ADB...";
+                    std::string ip = m_wizardWifiIp;
+                    postAsync("Setting up WiFi ADB...", [this, serial, ip]() {
+                        // Enable tcpip on port 5555
+                        m_wizardStatus = "Running adb tcpip 5555...";
+                        m_device.runAdbCommand("-s " + serial + " tcpip 5555");
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+                        // Connect via WiFi
+                        m_wizardStatus = "Connecting to " + ip + ":5555...";
+                        std::string result = m_device.runAdbCommand("connect " + ip + ":5555");
+                        bool ok = (result.find("connected") != std::string::npos ||
+                                   result.find("already") != std::string::npos);
+
+                        if (ok) {
+                            // Save for auto-reconnect
+                            SavedWifiDevice saved;
+                            saved.serial = serial;
+                            saved.wifiIp = ip;
+                            saved.port = 5555;
+                            saved.autoConnect = true;
+                            // Query display name (marketing name preferred)
+                            saved.model = queryDeviceDisplayName(ip + ":5555");
+                            // Track USB↔WiFi serial mapping
+                            m_usbToWifiSerial = ip + ":5555";
+                            m_wifiToUsbSerial = serial;
+                            // Remove old entry for same serial
+                            auto& devices = m_prefs.savedWifiDevices;
+                            devices.erase(std::remove_if(devices.begin(), devices.end(),
+                                [&](auto& d) { return d.serial == serial; }), devices.end());
+                            devices.push_back(saved);
+                            m_prefs.wifiAutoConnect = true; // enable auto-connect after successful wizard
+                            m_prefs.save();
+
+                            // Try dual channel
+                            std::this_thread::sleep_for(std::chrono::seconds(1));
+                            m_secondaryChannel.setAdbPath(m_device.getAdbPath());
+                            if (m_secondaryChannel.connectTcp(ip, AFM_PORT) && m_secondaryChannel.verifyConnection()) {
+                                m_dualChannelAvailable = true;
+                                m_secondaryChannelType = "WiFi";
+                                m_wizardStatus = "Dual channel active!";
+                            } else {
+                                m_wizardStatus = "WiFi connected (dual channel will activate on next transfer)";
+                            }
+                            m_wifiAutoSetupDone = true;
+                        } else {
+                            m_wizardStatus = "Failed: " + result;
+                        }
+                        m_wizardBusy = false;
+                        m_wizardStep = 3;
+                    });
+                }
+            } else {
+                ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Phone is not connected to WiFi.");
+                ImGui::TextDisabled("Connect your phone to a WiFi network,\nthen click Check Again.");
+                ImGui::Spacing();
+                if (modernButton("Check Again", ImVec2(120, 0))) {} // re-renders, re-checks
+            }
+            ImGui::SameLine();
+            if (modernButton("Back", ImVec2(80, 0))) m_wizardStep = 0;
+        } else if (m_wizardStep == 2) {
+            // Step 3: Setting up
+            ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Step 3: Setting Up");
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", m_wizardStatus.c_str());
+            // Animated dots
+            float t = (float)fmod(ImGui::GetTime(), 1.0);
+            int dots = (int)(t * 4) % 4;
+            ImGui::SameLine();
+            ImGui::Text("%.*s", dots, "...");
+        } else if (m_wizardStep == 3) {
+            // Step 4: Done
+            ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Setup Complete");
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            if (m_dualChannelAvailable) {
+                ImGui::TextColored(ImVec4(0.3f, 1, 0.5f, 1), "Dual-channel is active!");
+                ImGui::Spacing();
+                ImGui::TextDisabled("Transfers will now use both USB and WiFi simultaneously.\n"
+                                    "This device will auto-connect via WiFi on future launches.\n"
+                                    "You can unplug USB and WiFi will keep working.");
+            } else if (m_wizardStatus.find("Failed") != std::string::npos) {
+                ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "%s", m_wizardStatus.c_str());
+            } else {
+                ImGui::TextColored(ImVec4(0.3f, 1, 0.5f, 1), "%s", m_wizardStatus.c_str());
+            }
+
+            ImGui::Spacing();
+            if (modernButton("Close", ImVec2(120, 0))) {
+                m_showWifiWizard = false;
+                m_wifiBannerDismissed = true;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void App::renderWifiPairingDialog() {
+    if (!m_showWifiPairing) return;
+
+    ImGui::OpenPopup("WiFi ADB Pairing");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+    if (ImGui::BeginPopupModal("WiFi ADB Pairing", &m_showWifiPairing,
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+        ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Android 11+ Wireless Debugging");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (!m_pairingDone) {
+            // Step 1: Pair
+            ImGui::TextDisabled("On your phone: Settings > Developer Options > Wireless Debugging");
+            ImGui::TextDisabled("Tap 'Pair device with pairing code' and enter the details below.");
+            ImGui::Spacing();
+
+            ImGui::SetNextItemWidth(250);
+            ImGui::InputTextWithHint("Pairing IP:Port", "e.g. 192.168.1.100:37000", m_pairingIp, sizeof(m_pairingIp));
+            ImGui::SetNextItemWidth(250);
+            ImGui::InputTextWithHint("Pairing Code", "e.g. 123456", m_pairingCode, sizeof(m_pairingCode));
+            ImGui::Spacing();
+
+            if (modernButton("Pair", ImVec2(120, 0))) {
+                std::string ip(m_pairingIp);
+                std::string code(m_pairingCode);
+                postAsync("Pairing...", [this, ip, code]() {
+                    std::string result = m_device.runAdbCommand("pair " + ip + " " + code);
+                    if (result.find("Successfully") != std::string::npos) {
+                        m_pairingDone = true;
+                        m_statusMessage = "Paired! Enter the connect IP:port from Wireless Debugging.";
+                    } else {
+                        m_statusMessage = "Pairing failed: " + result;
+                    }
+                    m_statusTime = std::chrono::steady_clock::now();
+                });
+            }
+        } else {
+            // Step 2: Connect (after successful pairing)
+            ImGui::TextColored(ImVec4(0.3f, 1, 0.5f, 1), "Paired successfully!");
+            ImGui::Spacing();
+            ImGui::TextDisabled("Now enter the connect IP:port shown at the top of");
+            ImGui::TextDisabled("the Wireless Debugging screen (NOT the pairing port).");
+            ImGui::Spacing();
+
+            ImGui::SetNextItemWidth(250);
+            ImGui::InputTextWithHint("Connect IP:Port", "e.g. 192.168.1.100:42135", m_connectIp, sizeof(m_connectIp));
+            ImGui::Spacing();
+
+            if (modernButton("Connect", ImVec2(120, 0))) {
+                std::string connectAddr(m_connectIp);
+                postAsync("Connecting...", [this, connectAddr]() {
+                    std::string result = m_device.runAdbCommand("connect " + connectAddr);
+                    if (result.find("connected") != std::string::npos || result.find("already") != std::string::npos) {
+                        // Parse IP and port from the connect address
+                        std::string ip = connectAddr;
+                        int port = 5555;
+                        auto colon = connectAddr.rfind(':');
+                        if (colon != std::string::npos) {
+                            ip = connectAddr.substr(0, colon);
+                            try { port = std::stoi(connectAddr.substr(colon + 1)); } catch (...) {}
+                        }
+                        // Save for auto-reconnect
+                        SavedWifiDevice saved;
+                        saved.serial = connectAddr; // WiFi serial IS the connect address
+                        saved.wifiIp = ip;
+                        saved.port = port;
+                        saved.autoConnect = true;
+                        // Query display name from newly connected device
+                        saved.model = queryDeviceDisplayName(connectAddr);
+                        m_prefs.savedWifiDevices.push_back(saved);
+                        m_prefs.save();
+                        m_statusMessage = "Connected via WiFi: " + connectAddr;
+                        connectDeviceBySerialNow(connectAddr);
+                    } else {
+                        m_statusMessage = "Connect failed: " + result;
+                    }
+                    m_statusTime = std::chrono::steady_clock::now();
+                });
+                m_showWifiPairing = false;
+                m_pairingDone = false;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+
+        ImGui::SameLine();
+        if (modernButton("Cancel", ImVec2(80, 0))) {
+            m_showWifiPairing = false;
+            m_pairingDone = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void App::renderCrossDeviceDialog() {
+    if (!m_showCrossDeviceDialog || !m_pendingBatch) return;
+
+    ImGui::OpenPopup("Cross-Device Transfer");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+    if (ImGui::BeginPopupModal("Cross-Device Transfer", &m_showCrossDeviceDialog,
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+        int fileCount = (int)m_pendingBatch->files.size();
+        ImGui::Text("Transfer %d file(s) between devices", fileCount);
+        ImGui::Spacing();
+
+        ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Choose transfer method:");
+        ImGui::Spacing();
+
+        bool dokanAvailable = m_pendingBatch &&
+            DeviceMountManager::instance(m_pendingBatch->srcDeviceSlot).isMounted();
+
+        // Fast PC relay option
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
+        if (modernButton("Fast via PC (multi-channel)", ImVec2(250, 0))) {
+            m_pendingBatch->useDokanRelay = false;
+            {
+                std::lock_guard<std::mutex> lk(m_batchMutex);
+                m_batchQueue.push_back(m_pendingBatch);
+            }
+            m_batchCV.notify_one();
+            m_overlayWasOpen = false;
+            m_pendingBatch.reset();
+            m_showCrossDeviceDialog = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::TextDisabled("  Streams chunks through the PC and uses\n  available USB and WiFi channels.");
+
+        ImGui::Spacing();
+
+        // Compatibility streaming option
+        ImGui::BeginDisabled(!dokanAvailable);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.25f, 0.30f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.35f, 0.35f, 0.42f, 1));
+        if (modernButton("Compatibility stream", ImVec2(250, 0))) {
+            m_pendingBatch->useDokanRelay = true;
+            {
+                std::lock_guard<std::mutex> lk(m_batchMutex);
+                m_batchQueue.push_back(m_pendingBatch);
+            }
+            m_batchCV.notify_one();
+            m_overlayWasOpen = false;
+            m_pendingBatch.reset();
+            m_showCrossDeviceDialog = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::EndDisabled();
+        if (dokanAvailable)
+            ImGui::TextDisabled("  Single stream through the PC.\n  Use only if fast mode has trouble.");
+        else
+            ImGui::TextDisabled("  Not available, mount device A via Dokan first\n  (Connection > Mount as Drive).");
+
+        ImGui::EndPopup();
+    }
+}
+
+void App::renderAboutPopup() {
+    if (m_showAboutPopup) {
+        ImGui::OpenPopup("About##AboutPopup");
+        m_showAboutPopup = false;
+    }
+
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_Appearing);
+
+    if (ImGui::BeginPopupModal("About##AboutPopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.45f, 0.70f, 1.00f, 1.00f));
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - ImGui::CalcTextSize("Fast Enough? - Android File Explorer").x) * 0.5f);
+        ImGui::Text("Fast Enough? - Android File Explorer");
+        ImGui::PopStyleColor();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::Text("Version: 1.0.14");
+        ImGui::Text("Build date: %s", __DATE__);
+        ImGui::Spacing();
+        ImGui::Text("Made by: JohnTheFarmer");
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        float buttonWidth = 120.0f;
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - buttonWidth) * 0.5f);
+        if (modernButton("Close", ImVec2(buttonWidth, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void App::renderNotificationPopup() {
+    bool show = false;
+    std::string title;
+    std::string message;
+    bool isError = false;
+    {
+        std::lock_guard<std::mutex> lk(m_notificationMutex);
+        show = m_showNotification;
+        title = m_notificationTitle;
+        message = m_notificationMessage;
+        isError = m_notificationIsError;
+        if (show) {
+            m_showNotification = false;
+        }
+    }
+    if (show) {
+        ImGui::OpenPopup("##NotificationPopup");
+    }
+    bool isBackupResult = title.rfind("Backup ", 0) == 0 || title.rfind("Restore ", 0) == 0;
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (isBackupResult) {
+        ImVec2 viewport = ImGui::GetMainViewport()->WorkSize;
+        ImGui::SetNextWindowSize(ImVec2(std::min(720.0f, viewport.x * 0.82f),
+            std::min(500.0f, viewport.y * 0.78f)), ImGuiCond_Appearing);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(520, 360), ImVec2(viewport.x * 0.92f, viewport.y * 0.90f));
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(420, 0));
+    }
+    ImGuiWindowFlags popupFlags = ImGuiWindowFlags_NoTitleBar;
+    if (!isBackupResult) popupFlags |= ImGuiWindowFlags_AlwaysAutoResize;
+    if (ImGui::BeginPopupModal("##NotificationPopup", nullptr, popupFlags)) {
+        if (isBackupResult) {
+            ImVec4 accent = isError ? ImVec4(1.0f, 0.35f, 0.35f, 1.0f) : ImVec4(0.25f, 0.90f, 0.55f, 1.0f);
+            ImGui::TextColored(accent, "%s", title.c_str());
+            ImGui::SameLine();
+            float closeX = ImGui::GetWindowWidth() - 42.0f;
+            if (closeX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(closeX);
+            if (modernSmallButton("X##CloseBackupResult")) ImGui::CloseCurrentPopup();
+            ImGui::TextDisabled("Backup Manager result");
+            ImGui::Spacing();
+
+            float cardGap = 12.0f;
+            float cardWidth = (ImGui::GetContentRegionAvail().x - cardGap) * 0.5f;
+            size_t firstBreak = message.find('\n');
+            std::string summary = firstBreak == std::string::npos ? message : message.substr(0, firstBreak);
+            if (summary.empty()) summary = "The operation finished.";
+            float cardInnerWidth = std::max(1.0f, cardWidth - ImGui::GetStyle().WindowPadding.x * 2.0f);
+            float statusContentHeight = ImGui::GetTextLineHeight() * 2.0f +
+                ImGui::GetStyle().ItemSpacing.y + ImGui::GetStyle().WindowPadding.y * 2.0f;
+            float summaryTextHeight = ImGui::CalcTextSize(summary.c_str(), nullptr, false, cardInnerWidth).y;
+            float summaryContentHeight = ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemSpacing.y +
+                summaryTextHeight + ImGui::GetStyle().WindowPadding.y * 2.0f;
+            float cardHeight = std::ceil(std::max(statusContentHeight, summaryContentHeight) + 2.0f);
+            ImVec4 cardSurface = ImGui::GetStyleColorVec4(ImGuiCol_ChildBg);
+            ImVec4 statusSurface(cardSurface.x + (accent.x - cardSurface.x) * 0.12f,
+                cardSurface.y + (accent.y - cardSurface.y) * 0.12f,
+                cardSurface.z + (accent.z - cardSurface.z) * 0.12f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, statusSurface);
+            ImGui::BeginChild("##ResultStatusCard", ImVec2(cardWidth, cardHeight), ImGuiChildFlags_Borders,
+                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            float statusGroupHeight = ImGui::GetTextLineHeight() * 2.0f + ImGui::GetStyle().ItemSpacing.y;
+            ImGui::SetCursorPosY(std::max(ImGui::GetStyle().WindowPadding.y,
+                (cardHeight - statusGroupHeight) * 0.5f));
+            ImGui::TextDisabled("STATUS");
+            const char* statusText = title.find("Cancelled") != std::string::npos ? "Cancelled" :
+                (isError ? "Completed with issues" : "Completed successfully");
+            ImGui::TextColored(accent, "%s", statusText);
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+
+            ImGui::SameLine(0, cardGap);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, cardSurface);
+            ImGui::BeginChild("##ResultSummaryCard", ImVec2(0, cardHeight), ImGuiChildFlags_Borders,
+                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            float summaryGroupHeight = ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemSpacing.y + summaryTextHeight;
+            ImGui::SetCursorPosY(std::max(ImGui::GetStyle().WindowPadding.y,
+                (cardHeight - summaryGroupHeight) * 0.5f));
+            ImGui::TextDisabled("SUMMARY");
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + cardInnerWidth);
+            ImGui::TextUnformatted(summary.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("DETAILS");
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+            ImGui::BeginChild("##ResultDetails", ImVec2(0, -58), ImGuiChildFlags_Borders,
+                ImGuiWindowFlags_AlwaysVerticalScrollbar);
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(message.empty() ? "No additional details were reported." : message.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+
+            float btnW = 110.0f;
+            ImGui::SetCursorPosX(ImGui::GetWindowWidth() - btnW - 16.0f);
+            if (modernButton("Done", ImVec2(btnW, 0))) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+        ImGui::Spacing();
+        ImVec4 titleColor = isError ? ImVec4(1, 0.4f, 0.4f, 1) : ImVec4(0.3f, 1, 0.5f, 1);
+        ImGui::TextColored(titleColor, "%s", title.c_str());
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::TextWrapped("%s", message.c_str());
+        ImGui::Spacing();
+        ImGui::Spacing();
+        float btnW = 80;
+        ImGui::SetCursorPosX((ImGui::GetWindowSize().x - btnW) * 0.5f);
+        if (modernButton("OK", ImVec2(btnW, 0)))
+            ImGui::CloseCurrentPopup();
+        ImGui::Spacing();
+        ImGui::EndPopup();
+    }
+}
+
+void App::showNotification(const std::string& title, const std::string& message, bool isError) {
+    std::lock_guard<std::mutex> lk(m_notificationMutex);
+    m_notificationTitle = title;
+    m_notificationMessage = message;
+    m_notificationIsError = isError;
+    m_showNotification = true;
+}
+
+void App::requestApkInstall(const std::string& apkPath) {
+    if (apkPath.empty()) return;
+    m_pendingApkPath = apkPath;
+    m_pendingApkDeviceIndex = 0;
+    m_apkInstallGrantPermissions = false;
+    m_apkInstallAllowDowngrade = false;
+    m_showApkInstallDialog = true;
+}
+
+void App::renderApkInstallDialog() {
+    if (m_showApkInstallDialog) {
+        ImGui::OpenPopup("Install APK");
+        m_showApkInstallDialog = false;
+    }
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImVec2 center = viewport->GetCenter();
+    float maxW = std::max(420.0f, viewport->WorkSize.x - 32.0f);
+    float maxH = std::max(260.0f, viewport->WorkSize.y - 32.0f);
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(420, 0), ImVec2(maxW, maxH));
+    if (ImGui::BeginPopupModal("Install APK", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        std::string apkName = m_pendingApkPath;
+        auto slash = apkName.find_last_of("\\/");
+        if (slash != std::string::npos) apkName = apkName.substr(slash + 1);
+
+        float wrapW = std::min(560.0f, maxW - ImGui::GetStyle().WindowPadding.x * 2.0f);
+        ImGui::SetNextItemWidth(wrapW);
+        ImGui::TextColored(ImVec4(0.45f, 0.70f, 1.0f, 1), "Install APK");
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+        ImGui::TextWrapped("%s", apkName.c_str());
+        ImGui::TextWrapped("%s", m_pendingApkPath.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        std::vector<DeviceInfo> online;
+        {
+            std::lock_guard<std::mutex> lk(m_deviceMutex);
+            for (const auto& d : m_devices)
+                if (d.state == "device") online.push_back(d);
+        }
+
+        if (online.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1), "No Android device is connected.");
+            ImGui::TextWrapped("Connect a device with USB debugging enabled, then open this APK again.");
+        } else {
+            if (m_pendingApkDeviceIndex < 0 || m_pendingApkDeviceIndex >= (int)online.size())
+                m_pendingApkDeviceIndex = 0;
+            if (online.size() == 1) {
+                std::string name = online[0].model.empty() ? online[0].serial : online[0].model + " (" + online[0].serial + ")";
+                ImGui::Text("Device: %s", name.c_str());
+            } else {
+                ImGui::Text("Install to:");
+                ImGui::SetNextItemWidth(460);
+                std::string preview = online[m_pendingApkDeviceIndex].model.empty()
+                    ? online[m_pendingApkDeviceIndex].serial
+                    : online[m_pendingApkDeviceIndex].model + " (" + online[m_pendingApkDeviceIndex].serial + ")";
+                if (ImGui::BeginCombo("##ApkDevice", preview.c_str())) {
+                    for (int i = 0; i < (int)online.size(); i++) {
+                        std::string label = online[i].model.empty()
+                            ? online[i].serial
+                            : online[i].model + " (" + online[i].serial + ")";
+                        bool selected = i == m_pendingApkDeviceIndex;
+                        if (ImGui::Selectable(label.c_str(), selected))
+                            m_pendingApkDeviceIndex = i;
+                        if (selected) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+
+            ImGui::Spacing();
+            ImGui::Checkbox("Grant runtime permissions after install", &m_apkInstallGrantPermissions);
+            ImGui::Checkbox("Allow version downgrade", &m_apkInstallAllowDowngrade);
+            ImGui::Spacing();
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+            ImGui::TextWrapped("The install command will replace an existing copy of the same app while keeping its data.");
+            ImGui::PopTextWrapPos();
+        }
+
+        ImGui::Spacing();
+        float btnW = 110;
+        float totalW = online.empty() ? btnW : btnW * 2 + ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SetCursorPosX((ImGui::GetWindowSize().x - totalW) * 0.5f);
+        ImGui::BeginDisabled(online.empty() || m_asyncBusy.load());
+        if (modernButton("Install", ImVec2(btnW, 0))) {
+            std::string apk = m_pendingApkPath;
+            DeviceInfo target = online[m_pendingApkDeviceIndex];
+            bool grant = m_apkInstallGrantPermissions;
+            bool downgrade = m_apkInstallAllowDowngrade;
+            ImGui::CloseCurrentPopup();
+            postAsync("Installing APK...", [this, apk, target, grant, downgrade]() {
+                std::string out;
+                bool ok = m_device.installApk(target.serial, apk, out, true, grant, downgrade);
+                std::string apkName = apk;
+                size_t slash = apkName.find_last_of("\\/");
+                if (slash != std::string::npos) apkName = apkName.substr(slash + 1);
+                std::string deviceName = target.model.empty() ? target.serial : target.model + " (" + target.serial + ")";
+                std::string flags = "-r";
+                if (grant) flags += " -g";
+                if (downgrade) flags += " -d";
+                std::string report =
+                    "APK: " + apkName + "\n"
+                    "Device: " + deviceName + "\n"
+                    "Serial: " + target.serial + "\n"
+                    "ADB command: install " + flags + "\n\n";
+                if (ok) {
+                    report += "Result: Installed successfully.\n\n";
+                    report += out.empty() ? "ADB output: Success" : "ADB output:\n" + out;
+                    showNotification("APK Installed", report, false);
+                    m_statusMessage = "APK installed";
+                    m_leftPanel.needsRefresh = true;
+                    m_rightPanel.needsRefresh = true;
+                } else {
+                    report += "Result: Install failed.\n\n";
+                    report += out.empty() ? "ADB did not return an error message." : "ADB output:\n" + out;
+                    report += "\n\nCommon causes include an older app version already installed, a signature mismatch, insufficient storage, device policy restrictions, or an APK built for an unsupported ABI or Android version.";
+                    showNotification("APK Install Failed", report, true);
+                    m_statusMessage = "APK install failed";
+                }
+                m_statusTime = std::chrono::steady_clock::now();
+            });
+        }
+        ImGui::EndDisabled();
+        if (!online.empty()) ImGui::SameLine();
+        if (modernButton("Cancel", ImVec2(btnW, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void App::registerApkAssociation() {
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::string exe = exePath;
+    std::string exeName = exe;
+    size_t slash = exeName.find_last_of("\\/");
+    if (slash != std::string::npos) exeName = exeName.substr(slash + 1);
+
+    const std::string progId = "FastEnough.apk";
+    const std::string appName = "Fast Enough Android File Manager";
+    const std::string command = "\"" + exe + "\" \"%1\"";
+
+    auto setStringValue = [](HKEY root, const std::string& subkey, const char* valueName, const std::string& value) {
+        HKEY key = nullptr;
+        if (RegCreateKeyExA(root, subkey.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+            RegSetValueExA(key, valueName, 0, REG_SZ, (const BYTE*)value.c_str(), (DWORD)value.size() + 1);
+            RegCloseKey(key);
+        }
+    };
+    auto setEmptyValue = [](HKEY root, const std::string& subkey, const std::string& valueName) {
+        HKEY key = nullptr;
+        if (RegCreateKeyExA(root, subkey.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+            RegSetValueExA(key, valueName.c_str(), 0, REG_NONE, nullptr, 0);
+            RegCloseKey(key);
+        }
+    };
+
+    // ProgID used by Open with and, when Windows allows it, as the per-user default.
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\.apk", nullptr, progId);
+    setEmptyValue(HKEY_CURRENT_USER, "Software\\Classes\\.apk\\OpenWithProgids", progId);
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\.apk\\OpenWithList\\" + exeName, nullptr, "");
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\" + progId, nullptr, "Android APK");
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\" + progId, "FriendlyTypeName", "Android APK");
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\" + progId + "\\DefaultIcon", nullptr, exe + ",0");
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\" + progId + "\\shell\\open", nullptr, "Install with Fast Enough");
+    setStringValue(HKEY_CURRENT_USER, "Software\\Classes\\" + progId + "\\shell\\open\\command", nullptr, command);
+
+    // Register as an application so it appears directly in Windows Open with.
+    std::string appKey = "Software\\Classes\\Applications\\" + exeName;
+    setStringValue(HKEY_CURRENT_USER, appKey, "FriendlyAppName", appName);
+    setStringValue(HKEY_CURRENT_USER, appKey + "\\shell\\open\\command", nullptr, command);
+    setStringValue(HKEY_CURRENT_USER, appKey + "\\SupportedTypes", ".apk", "");
+
+    // Register app capabilities for Default Apps UI.
+    std::string capKey = "Software\\FastEnough\\Capabilities";
+    setStringValue(HKEY_CURRENT_USER, capKey, "ApplicationName", appName);
+    setStringValue(HKEY_CURRENT_USER, capKey, "ApplicationDescription", "Install APK files on connected Android devices.");
+    setStringValue(HKEY_CURRENT_USER, capKey + "\\FileAssociations", ".apk", progId);
+    setStringValue(HKEY_CURRENT_USER, "Software\\RegisteredApplications", appName.c_str(), "Software\\FastEnough\\Capabilities");
+
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    showNotification("APK Handler Registered",
+        "Fast Enough was added to Windows Open with for APK files.\n\n"
+        "If APK files already have another default app, right-click an APK, choose Open with, then select Fast Enough Android File Manager and set it as the default.", false);
+    ShellExecuteA(nullptr, "open", "ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void App::renderCloseConfirmDialog() {
+    if (m_showCloseConfirm) {
+        ImGui::OpenPopup("Close Application?");
+        m_showCloseConfirm = false;
+    }
+
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Close Application?", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+        ImGui::Text("Are you sure you want to close the application?");
+        ImGui::Spacing();
+        ImGui::Spacing();
+
+        float buttonWidth = 120.0f;
+        float spacing = ImGui::GetStyle().ItemSpacing.x;
+        float totalWidth = buttonWidth * 2 + spacing;
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - totalWidth) * 0.5f);
+
+        if (modernButton("Yes", ImVec2(buttonWidth, 0))) {
+            g_reallyQuit = true;
+            PostMessage(g_mainHwnd, WM_CLOSE, 0, 0);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (modernButton("No", ImVec2(buttonWidth, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void App::renderPreferencesWindow() {
+    ImGui::SetNextWindowSize(ImVec2(450, 0), ImGuiCond_Appearing);
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+    if (!ImGui::Begin("Preferences", &m_showPreferences, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+
+    bool changed = false;
+
+    // --- ADB ---
+    ImGui::TextColored(ImVec4(0.45f,0.70f,1,1), "ADB");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (ImGui::Checkbox("Restart ADB daemon on app launch", &m_prefs.restartAdbOnLaunch))
+        changed = true;
+    ImGui::TextDisabled("  Kills and restarts ADB when the app starts.");
+    ImGui::TextDisabled("  Useful if ADB is in a bad state, but disrupts");
+    ImGui::TextDisabled("  other ADB clients (Android Studio, scrcpy, etc.).");
+
+    ImGui::Spacing();
+
+    if (ImGui::Checkbox("Kill ADB server when app closes", &m_prefs.killAdbOnClose))
+        changed = true;
+    ImGui::TextDisabled("  Stops the ADB daemon when exiting the app.");
+    ImGui::TextDisabled("  Disable if you want ADB to stay running for");
+    ImGui::TextDisabled("  other tools (Android Studio, scrcpy, etc.).");
+
+    ImGui::Spacing();
+    ImGui::Spacing();
+
+    // --- General ---
+    ImGui::TextColored(ImVec4(0.45f,0.70f,1,1), "General");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (ImGui::Checkbox("Ask for confirmation before closing", &m_prefs.confirmOnClose))
+        changed = true;
+    ImGui::TextDisabled("  Shows a Yes/No dialog when pressing the X button.");
+    ImGui::TextDisabled("  When disabled, closing minimizes to the system tray.");
+
+    ImGui::Spacing();
+    ImGui::Spacing();
+
+    // --- Transfer ---
+    ImGui::TextColored(ImVec4(0.45f,0.70f,1,1), "Transfer");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (ImGui::Checkbox("Verify file integrity (CRC32) after transfer", &m_prefs.enableCrcVerification))
+        changed = true;
+    ImGui::TextDisabled("  Computes CRC32 on both sides after each file");
+    ImGui::TextDisabled("  transfer to ensure data integrity.");
+
+    ImGui::Spacing();
+
+    if (ImGui::Checkbox("Auto-dismiss transfer window on success", &m_prefs.autoDismissTransfer))
+        changed = true;
+    ImGui::TextDisabled("  Automatically closes the transfer progress window");
+    ImGui::TextDisabled("  when all files complete successfully.");
+
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(1,0.85f,0.4f,1), "Transfer Channels");
+    ImGui::Spacing();
+
+    auto drawPipeSelector = [&](const char* label, const char* id, int& value) -> bool {
+        bool changed = false;
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine(120.0f);
+        for (int pipes = 1; pipes <= 4; pipes++) {
+            if (pipes > 1) ImGui::SameLine(0, 6);
+            bool selected = (value == pipes);
+            if (selected) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.45f, 0.25f, 1));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.55f, 0.30f, 1));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.25f, 0.65f, 0.35f, 1));
+            }
+            std::string btn = "x" + std::to_string(pipes) + "##" + id + std::to_string(pipes);
+            if (modernButton(btn.c_str(), ImVec2(44.0f, 0.0f)) && value != pipes) {
+                value = pipes;
+                changed = true;
+            }
+            if (selected) ImGui::PopStyleColor(3);
+        }
+        return changed;
+    };
+
+    {
+        if (drawPipeSelector("Default USB pipes", "usbpref", m_prefs.usbPipeCount))
+            changed = true;
+        ImGui::TextDisabled("  Default for devices without their own saved pipe setting. Range: 1 to 4.");
+        ImGui::TextDisabled("  Best for USB 3.x. Use lower values if a device becomes unstable.");
+    }
+
+    ImGui::Spacing();
+
+    {
+        if (drawPipeSelector("Default WiFi pipes", "wifipref", m_prefs.wifiPipeCount))
+            changed = true;
+        ImGui::TextDisabled("  Default for devices without their own saved pipe setting. Range: 1 to 4.");
+        ImGui::TextDisabled("  Best for fast WiFi (WiFi 6/7). Use lower values if a device becomes unstable.");
+    }
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("  Per-device settings are available from the device bar and apply on next device connect.");
+    ImGui::TextDisabled("  USB + WiFi can use up to 8 parallel channels.");
+
+    ImGui::Spacing();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (changed) {
+        m_prefs.save();
+        m_statusMessage = "Preferences saved";
+        m_statusTime = std::chrono::steady_clock::now();
+    }
+
+    float bw = 120.0f;
+    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - bw) * 0.5f);
+    if (modernButton("Close", ImVec2(bw, 0))) {
+        m_showPreferences = false;
+    }
+
+    ImGui::End();
+}
+
+void App::renderNicConfigWindow() {
+    float minW = 580.0f * (m_systemDpiScale * m_theme.userScale);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(minW, 0), ImVec2(FLT_MAX, FLT_MAX));
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+    if (!ImGui::Begin("Multi-NIC Configuration", &m_showNicConfig,
+                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+
+    bool changed = false;
+
+    ImGui::TextColored(ImVec4(0.45f,0.70f,1,1), "Multi-NIC Parallel Transfers");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (ImGui::Checkbox("Enable multi-NIC parallel transfers", &m_prefs.enableMultiNic))
+        changed = true;
+    ImGui::TextDisabled("  Uses multiple network adapters simultaneously for");
+    ImGui::TextDisabled("  faster file transfers. Requires direct TCP connection.");
+    ImGui::TextDisabled("  Each NIC carries a portion of the data independently.");
+
+    ImGui::Spacing();
+    ImGui::Spacing();
+
+    // Scan button
+    ImGui::TextColored(ImVec4(0.45f,0.70f,1,1), "Network Adapters");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (modernButton("Scan Network Adapters")) {
+        m_detectedNics = enumerateNics();
+        m_nicTestResults.assign(m_detectedNics.size(), false);
+        m_nicTestDone.assign(m_detectedNics.size(), false);
+        m_nicTestReason.assign(m_detectedNics.size(), "");
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%d found)", (int)m_detectedNics.size());
+
+    ImGui::Spacing();
+
+    if (!m_detectedNics.empty()) {
+        if (ImGui::BeginTable("NICs", 5,
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthFixed, 35);
+            ImGui::TableSetupColumn("Adapter", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("IP", ImGuiTableColumnFlags_WidthFixed, 120);
+            ImGui::TableSetupColumn("Speed", ImGuiTableColumnFlags_WidthFixed, 70);
+            ImGui::TableSetupColumn("Test", ImGuiTableColumnFlags_WidthFixed, 60);
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < (int)m_detectedNics.size(); i++) {
+                auto& nic = m_detectedNics[i];
+                ImGui::PushID(i);
+                ImGui::TableNextRow();
+
+                // Checkbox: find or create binding for this NIC
+                ImGui::TableSetColumnIndex(0);
+                bool isEnabled = false;
+                int bindIdx = -1;
+                for (int b = 0; b < (int)m_prefs.multiNicBindings.size(); b++) {
+                    if (m_prefs.multiNicBindings[b].localIp == nic.ipAddress) {
+                        isEnabled = m_prefs.multiNicBindings[b].enabled;
+                        bindIdx = b;
+                        break;
+                    }
+                }
+                if (ImGui::Checkbox("##en", &isEnabled)) {
+                    if (bindIdx >= 0) {
+                        m_prefs.multiNicBindings[bindIdx].enabled = isEnabled;
+                    } else {
+                        NicBinding nb;
+                        nb.adapterName = nic.adapterName;
+                        nb.localIp = nic.ipAddress;
+                        nb.enabled = isEnabled;
+                        m_prefs.multiNicBindings.push_back(std::move(nb));
+                    }
+                    changed = true;
+                }
+
+                // Adapter name
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(nic.adapterName.c_str());
+                if (ImGui::IsItemHovered() && !nic.description.empty())
+                    ImGui::SetTooltip("%s", nic.description.c_str());
+
+                // IP
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(nic.ipAddress.c_str());
+
+                // Speed
+                ImGui::TableSetColumnIndex(3);
+                if (nic.speed >= 1000000000ULL)
+                    ImGui::Text("%.0f Gbps", nic.speed / 1e9);
+                else if (nic.speed >= 1000000ULL)
+                    ImGui::Text("%.0f Mbps", nic.speed / 1e6);
+                else if (nic.speed > 0)
+                    ImGui::Text("%llu bps", nic.speed);
+                else
+                    ImGui::TextDisabled("?");
+
+                // Test button: changes color to show result
+                ImGui::TableSetColumnIndex(4);
+                bool tested = i < (int)m_nicTestDone.size() && m_nicTestDone[i];
+                bool passed = tested && m_nicTestResults[i];
+                if (tested) {
+                    if (passed) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.20f, 1));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.55f, 0.28f, 1));
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.15f, 0.15f, 1));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.65f, 0.20f, 0.20f, 1));
+                    }
+                }
+                const char* btnLabel = tested ? (passed ? " OK " : "Fail") : "Test";
+                if (modernSmallButton(btnLabel)) {
+                    // Try connecting to the current device through this NIC
+                    bool ok = false;
+                    std::string reason;
+                    if (!m_device.isServerRunning()) {
+                        reason = "No device connected";
+                    } else {
+                        // Find the device's WiFi IP from any available source
+                        std::string devIp = m_device.deviceIp();
+                        if (devIp.empty() || !m_device.isDirectConnection()) {
+                            // Try ADB to get wlan0 IP
+                            std::string serial = m_device.connectedSerial();
+                            std::string wlanOut = m_device.runAdbCommand(
+                                "-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+                            auto inetPos = wlanOut.find("inet ");
+                            if (inetPos != std::string::npos) {
+                                auto start = inetPos + 5;
+                                auto slash = wlanOut.find('/', start);
+                                if (slash != std::string::npos)
+                                    devIp = wlanOut.substr(start, slash - start);
+                            }
+                            // Fallback: saved WiFi devices
+                            if (devIp.empty()) {
+                                for (auto& w : m_prefs.savedWifiDevices) {
+                                    if (w.serial == serial && !w.wifiIp.empty()) {
+                                        devIp = w.wifiIp;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (devIp.empty()) {
+                            reason = "Could not determine device WiFi IP";
+                        } else {
+                            DeviceClient testCh;
+                            if (!testCh.connectTcp(devIp, AFM_PORT, nic.ipAddress)) {
+                                reason = "Could not reach " + devIp + " through " + nic.adapterName + " (" + nic.ipAddress + ")";
+                            } else if (!testCh.verifyConnection()) {
+                                reason = "Connected but server did not respond";
+                                testCh.disconnectTcp();
+                            } else {
+                                ok = true;
+                                testCh.disconnectTcp();
+                            }
+                        }
+                    }
+                    if (i < (int)m_nicTestResults.size()) {
+                        m_nicTestResults[i] = ok;
+                        m_nicTestDone[i] = true;
+                        m_nicTestReason[i] = reason;
+                    }
+                }
+                if (tested) ImGui::PopStyleColor(2);
+                if (tested && !passed && ImGui::IsItemHovered()) {
+                    std::string reason = (i < (int)m_nicTestReason.size()) ? m_nicTestReason[i] : "";
+                    if (!reason.empty())
+                        ImGui::SetTooltip("%s", reason.c_str());
+                }
+
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+
+        // Count enabled NICs
+        int enabledCount = 0;
+        for (auto& nb : m_prefs.multiNicBindings)
+            if (nb.enabled) enabledCount++;
+        ImGui::Spacing();
+        if (enabledCount >= 2)
+            ImGui::TextColored(ImVec4(0.3f,0.9f,0.3f,1), "%d adapters selected for parallel transfers", enabledCount);
+        else if (enabledCount == 1)
+            ImGui::TextColored(ImVec4(0.9f,0.7f,0.2f,1), "Select at least 2 adapters for parallel transfers");
+        else
+            ImGui::TextDisabled("No adapters selected");
+    }
+
+    ImGui::Spacing();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (changed) {
+        m_prefs.save();
+        m_statusMessage = "Multi-NIC settings saved";
+        m_statusTime = std::chrono::steady_clock::now();
+    }
+
+    float bw = 120.0f;
+    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - bw) * 0.5f);
+    if (modernButton("Close", ImVec2(bw, 0))) {
+        m_showNicConfig = false;
+    }
+
+    ImGui::End();
+}
+
+void App::applyScale(float newScale) {
+    m_theme.userScale = newScale;
+
+    // Rebuild font at new size
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->Clear();
+
+    float effectiveScale = m_systemDpiScale * newScale;
+    float fontSize = 16.0f * effectiveScale;
+
+    ImFontConfig fontCfg;
+    fontCfg.OversampleH = 3;
+    fontCfg.OversampleV = 3;
+    fontCfg.PixelSnapH = true;
+    fontCfg.RasterizerDensity = 1.0f;
+
+    char winDir[MAX_PATH];
+    GetWindowsDirectoryA(winDir, MAX_PATH);
+    std::string segoeUIPath = std::string(winDir) + "\\Fonts\\segoeui.ttf";
+
+    // Include Latin, Latin Extended, Greek, Cyrillic, and common symbols
+    // so non-ASCII folder/file names display correctly.
+    static const ImWchar glyphRanges[] = {
+        0x0020, 0x00FF, // Basic Latin + Latin Supplement
+        0x0100, 0x024F, // Latin Extended-A + B
+        0x0370, 0x03FF, // Greek and Coptic
+        0x0400, 0x04FF, // Cyrillic
+        0x2000, 0x206F, // General Punctuation
+        0x2100, 0x214F, // Letterlike Symbols
+        0,
+    };
+
+    ImFont* mainFont = nullptr;
+    if (GetFileAttributesA(segoeUIPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        mainFont = io.Fonts->AddFontFromFileTTF(segoeUIPath.c_str(), fontSize, &fontCfg, glyphRanges);
+    }
+    if (!mainFont) {
+        fontCfg.SizePixels = fontSize;
+        mainFont = io.Fonts->AddFontDefault(&fontCfg);
+    }
+
+    io.Fonts->Build();
+
+    // Tell DX11 backend to rebuild font texture
+    extern void ImGui_ImplDX11_InvalidateDeviceObjects();
+    ImGui_ImplDX11_InvalidateDeviceObjects();
+
+    // Save current colors before resetting style
+    ImVec4 savedColors[ImGuiCol_COUNT];
+    if (m_theme.customColors) {
+        for (int i = 0; i < ImGuiCol_COUNT; i++)
+            savedColors[i] = m_theme.colors[i];
+    }
+
+    // Reset style to base sizes, then apply setupStyle (sets both sizes and colors)
+    setupStyle();
+    // Scale all sizes to effective DPI * user scale
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.ScaleAllSizes(effectiveScale);
+    // Clamp WindowMinSize to avoid ImGui assertion at low effective scales
+    if (style.WindowMinSize.x < 1.0f) style.WindowMinSize.x = 1.0f;
+    if (style.WindowMinSize.y < 1.0f) style.WindowMinSize.y = 1.0f;
+
+    // Restore custom colors if active (setupStyle overwrote them)
+    if (m_theme.customColors) {
+        ImVec4* c = ImGui::GetStyle().Colors;
+        for (int i = 0; i < ImGuiCol_COUNT; i++)
+            c[i] = savedColors[i];
+    }
+}
+
+void App::renderThemeWindow() {
+    // After a scale change, force re-center and re-size so the window doesn't end up off-screen
+    ImGuiCond posCond = ImGuiCond_Appearing;
+    ImGuiCond sizeCond = ImGuiCond_FirstUseEver;
+    if (m_themeNeedsReposition) {
+        posCond = ImGuiCond_Always;
+        sizeCond = ImGuiCond_Always;
+        m_themeNeedsReposition = false;
+    }
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImVec2 vpSize = ImGui::GetMainViewport()->Size;
+    float winH = std::min(600.0f, vpSize.y * 0.85f);
+    ImGui::SetNextWindowSize(ImVec2(500, winH), sizeCond);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(400, 300), ImVec2(vpSize.x * 0.9f, vpSize.y * 0.9f));
+    ImGui::SetNextWindowPos(center, posCond, ImVec2(0.5f, 0.5f));
+
+    if (!ImGui::Begin("Appearance", &m_showThemeWindow, ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+
+    bool changed = false;
+
+    ImGui::TextColored(m_theme.gradientPrimary, "Visual Theme");
+    ImGui::Separator();
+    ImGui::Spacing();
+    const char* themeModes[] = { "Follow Windows", "Dark", "Light" };
+    ImGui::SetNextItemWidth(210.0f);
+    if (ImGui::Combo("Theme Mode", &m_theme.mode, themeModes, 3)) {
+        m_theme.customColors = false;
+        m_pendingScale = m_theme.userScale;
+        changed = true;
+    }
+    ImGui::TextDisabled(m_theme.mode == 0
+        ? (m_resolvedLightTheme ? "Following Windows, light mode is active" : "Following Windows, dark mode is active")
+        : (m_theme.mode == 1 ? "Dark mode is always active" : "Light mode is always active"));
+
+    ImGui::SetNextItemWidth(210.0f);
+    if (ImGui::ColorEdit3("Primary Accent", &m_theme.gradientPrimary.x,
+            ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel))
+        changed = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) m_pendingScale = m_theme.userScale;
+    ImGui::SetNextItemWidth(210.0f);
+    if (ImGui::ColorEdit3("Secondary Accent", &m_theme.gradientSecondary.x,
+            ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel))
+        changed = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) m_pendingScale = m_theme.userScale;
+    int gradientPercent = (int)std::round(m_theme.gradientStrength * 100.0f);
+    ImGui::SetNextItemWidth(210.0f);
+    if (ImGui::SliderInt("Gradient Intensity", &gradientPercent, 0, 100, "%d%%")) {
+        m_theme.gradientStrength = gradientPercent / 100.0f;
+        changed = true;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) m_pendingScale = m_theme.userScale;
+    ImGui::SameLine();
+    if (modernButton("Reset Accents")) {
+        m_theme.gradientPrimary = ImVec4(0.20f, 0.58f, 1.00f, 1.00f);
+        m_theme.gradientSecondary = ImVec4(0.48f, 0.26f, 0.92f, 1.00f);
+        m_theme.gradientStrength = 0.72f;
+        m_pendingScale = m_theme.userScale;
+        changed = true;
+    }
+
+    ImGui::BeginChild("##GradientPreview", ImVec2(0, 58.0f), ImGuiChildFlags_Borders);
+    ImVec2 previewMin = ImGui::GetWindowPos();
+    ImVec2 previewMax(previewMin.x + ImGui::GetWindowSize().x, previewMin.y + ImGui::GetWindowSize().y);
+    ImDrawList* previewDraw = ImGui::GetWindowDrawList();
+    ImVec4 previewBase = m_resolvedLightTheme ? ImVec4(0.94f, 0.96f, 0.99f, 1.0f)
+        : ImVec4(0.025f, 0.032f, 0.050f, 1.0f);
+    auto previewTint = [&](const ImVec4& accent) {
+        float amount = (m_resolvedLightTheme ? 0.12f : 0.23f) * m_theme.gradientStrength;
+        return ImVec4(previewBase.x + (accent.x - previewBase.x) * amount,
+            previewBase.y + (accent.y - previewBase.y) * amount,
+            previewBase.z + (accent.z - previewBase.z) * amount, 1.0f);
+    };
+    ImVec4 previewLeft = previewTint(m_theme.gradientPrimary);
+    ImVec4 previewRight = previewTint(m_theme.gradientSecondary);
+    previewDraw->AddRectFilledMultiColor(previewMin, previewMax,
+        ImGui::ColorConvertFloat4ToU32(previewLeft), ImGui::ColorConvertFloat4ToU32(previewRight),
+        ImGui::ColorConvertFloat4ToU32(previewRight), ImGui::ColorConvertFloat4ToU32(previewLeft));
+    previewDraw->AddText(ImVec2(previewMin.x + 14.0f, previewMin.y + 18.0f),
+        ImGui::GetColorU32(ImGuiCol_Text), "Live gradient preview");
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+    ImGui::Spacing();
+
+    // --- UI Scale ---
+    ImGui::TextColored(m_theme.gradientPrimary, "UI Scale");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::TextDisabled("System DPI: %.0f%%", m_systemDpiScale * 100.0f);
+
+    if (m_scalePreview < 0) m_scalePreview = m_theme.userScale;
+
+    // Discrete 5% steps: index 0=50%, 1=55%, ..., 50=300%
+    int step = ((int)(m_scalePreview * 100.0f + 0.5f) - 50) / 5;
+    if (step < 0) step = 0; if (step > 50) step = 50;
+    ImGui::SetNextItemWidth(250);
+    char stepLabel[16]; snprintf(stepLabel, sizeof(stepLabel), "%d%%%%", step * 5 + 50);
+    if (ImGui::SliderInt("App Scale", &step, 0, 50, stepLabel)) {
+        m_scalePreview = (step * 5 + 50) / 100.0f;
+    }
+
+    int scalePct = step * 5 + 50;
+    int currentPct = ((int)(m_theme.userScale * 100.0f + 0.5f) / 5) * 5;
+    bool scaleChanged = (scalePct != currentPct);
+
+    ImGui::SameLine();
+    if (scaleChanged) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
+        if (modernButton("Apply")) {
+            m_pendingScale = m_scalePreview;
+            m_themeNeedsReposition = true;
+            changed = true;
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine();
+    }
+    if (modernButton("Reset##scale")) {
+        m_scalePreview = 1.0f;
+        if (m_theme.userScale != 1.0f) {
+            m_pendingScale = 1.0f;
+            m_themeNeedsReposition = true;
+            changed = true;
+        }
+    }
+    ImGui::TextDisabled("  Current: %.0f%%  %s", m_systemDpiScale * m_theme.userScale * 100.0f,
+                        scaleChanged ? "(unsaved)" : "");
+
+    ImGui::Spacing();
+    ImGui::Spacing();
+
+    // --- Colors ---
+    ImGui::TextColored(m_theme.gradientSecondary, "Colors");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (!m_theme.customColors) {
+        ImGui::TextDisabled("Using the modern adaptive design system.");
+        ImGui::Spacing();
+        if (modernButton("Customize Colors")) {
+            // Copy current colors into theme for editing
+            ImVec4* c = ImGui::GetStyle().Colors;
+            for (int i = 0; i < ImGuiCol_COUNT; i++)
+                m_theme.colors[i] = c[i];
+            m_theme.customColors = true;
+            changed = true;
+        }
+    } else {
+        if (modernButton("Reset to Default Theme")) {
+            m_theme.customColors = false;
+            setupStyle();
+            // Re-apply scale
+            ImGui::GetStyle().ScaleAllSizes(m_systemDpiScale * m_theme.userScale);
+            if (ImGui::GetStyle().WindowMinSize.x < 1.0f) ImGui::GetStyle().WindowMinSize.x = 1.0f;
+            if (ImGui::GetStyle().WindowMinSize.y < 1.0f) ImGui::GetStyle().WindowMinSize.y = 1.0f;
+            changed = true;
+        }
+
+        ImGui::Spacing();
+
+        // Color editor — grouped by category
+        ImVec4* c = ImGui::GetStyle().Colors;
+
+        struct ColorGroup {
+            const char* name;
+            std::vector<std::pair<int, const char*>> entries;
+        };
+
+        ColorGroup groups[] = {
+            {"Backgrounds", {
+                {ImGuiCol_WindowBg, "Window"},
+                {ImGuiCol_ChildBg, "Child"},
+                {ImGuiCol_PopupBg, "Popup"},
+                {ImGuiCol_MenuBarBg, "Menu Bar"},
+            }},
+            {"Text", {
+                {ImGuiCol_Text, "Text"},
+                {ImGuiCol_TextDisabled, "Text Disabled"},
+                {ImGuiCol_TextSelectedBg, "Text Selection"},
+            }},
+            {"Borders", {
+                {ImGuiCol_Border, "Border"},
+                {ImGuiCol_Separator, "Separator"},
+                {ImGuiCol_SeparatorHovered, "Separator Hovered"},
+                {ImGuiCol_SeparatorActive, "Separator Active"},
+            }},
+            {"Buttons", {
+                {ImGuiCol_Button, "Button"},
+                {ImGuiCol_ButtonHovered, "Button Hovered"},
+                {ImGuiCol_ButtonActive, "Button Active"},
+            }},
+            {"Frames (Inputs)", {
+                {ImGuiCol_FrameBg, "Frame"},
+                {ImGuiCol_FrameBgHovered, "Frame Hovered"},
+                {ImGuiCol_FrameBgActive, "Frame Active"},
+            }},
+            {"Headers (Rows)", {
+                {ImGuiCol_Header, "Header"},
+                {ImGuiCol_HeaderHovered, "Header Hovered"},
+                {ImGuiCol_HeaderActive, "Header Active"},
+            }},
+            {"Tabs", {
+                {ImGuiCol_Tab, "Tab"},
+                {ImGuiCol_TabHovered, "Tab Hovered"},
+                {ImGuiCol_TabSelected, "Tab Selected"},
+            }},
+            {"Title Bar", {
+                {ImGuiCol_TitleBg, "Title"},
+                {ImGuiCol_TitleBgActive, "Title Active"},
+            }},
+            {"Scrollbar", {
+                {ImGuiCol_ScrollbarBg, "Background"},
+                {ImGuiCol_ScrollbarGrab, "Grab"},
+                {ImGuiCol_ScrollbarGrabHovered, "Grab Hovered"},
+                {ImGuiCol_ScrollbarGrabActive, "Grab Active"},
+            }},
+            {"Tables", {
+                {ImGuiCol_TableHeaderBg, "Header"},
+                {ImGuiCol_TableBorderStrong, "Border Strong"},
+                {ImGuiCol_TableBorderLight, "Border Light"},
+                {ImGuiCol_TableRowBg, "Row"},
+                {ImGuiCol_TableRowBgAlt, "Row Alt"},
+            }},
+            {"Accents", {
+                {ImGuiCol_CheckMark, "Check Mark"},
+                {ImGuiCol_SliderGrab, "Slider"},
+                {ImGuiCol_SliderGrabActive, "Slider Active"},
+                {ImGuiCol_NavHighlight, "Nav Highlight"},
+                {ImGuiCol_ResizeGrip, "Resize Grip"},
+                {ImGuiCol_ResizeGripHovered, "Resize Grip Hovered"},
+                {ImGuiCol_ResizeGripActive, "Resize Grip Active"},
+            }},
+        };
+
+        ImGui::BeginChild("##ColorEditor", ImVec2(0, -40), ImGuiChildFlags_Border);
+        for (auto& group : groups) {
+            if (ImGui::TreeNode(group.name)) {
+                for (auto& [idx, label] : group.entries) {
+                    if (ImGui::ColorEdit4(label, &c[idx].x,
+                            ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaPreviewHalf)) {
+                        m_theme.colors[idx] = c[idx];
+                        changed = true;
+                    }
+                }
+                ImGui::TreePop();
+            }
+        }
+        ImGui::EndChild();
+    }
+
+    ImGui::Spacing();
+
+    if (changed) {
+        m_theme.save();
+    }
+
+    ImGui::End();
+}
+
+void App::renderDebugWindow() {
+    ImGui::SetNextWindowSize(ImVec2(800, 450), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Debug Log (F12)", &m_showDebugWindow)) { ImGui::End(); return; }
+
+    // Toolbar
+    auto entries = DebugLog::instance().snapshot();
+    auto startTime = entries.empty() ? std::chrono::steady_clock::now() : entries.front().time;
+
+    // Pre-filter into indices
+    std::vector<int> visible;
+    visible.reserve(entries.size());
+    for (int i = 0; i < (int)entries.size(); i++) {
+        auto& e = entries[i];
+        if ((int)e.level < m_debugLevelFilter) continue;
+        if (m_debugTagFilter[0] && e.tag.find(m_debugTagFilter) == std::string::npos) continue;
+        visible.push_back(i);
+    }
+
+    if (modernButton("Copy All")) {
+        std::string text = buildLogText(entries, visible, startTime);
+        ImGui::SetClipboardText(text.c_str());
+    }
+    ImGui::SameLine();
+    if (modernButton("Clear")) DebugLog::instance().clear();
+    ImGui::SameLine();
+    ImGui::Checkbox("Auto-scroll", &m_debugAutoScroll);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(100);
+    const char* levels[] = { "All", "Info+", "Warn+", "Error" };
+    ImGui::Combo("Level", &m_debugLevelFilter, levels, 4);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(150);
+    ImGui::InputTextWithHint("##TagFilter", "Filter tag...", m_debugTagFilter, sizeof(m_debugTagFilter));
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%d / %d entries)", (int)visible.size(), (int)entries.size());
+    ImGui::Separator();
+
+    // Log content area
+    ImGui::BeginChild("##LogScroll", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+
+    ImGuiListClipper clipper;
+    clipper.Begin((int)visible.size());
+    while (clipper.Step()) {
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+            auto& e = entries[visible[row]];
+            double secs = std::chrono::duration<double>(e.time - startTime).count();
+
+            ImVec4 col;
+            const char* lvl;
+            switch (e.level) {
+                case LogLevel::Debug: col = ImVec4(0.5f,0.5f,0.5f,1); lvl = "DBG"; break;
+                case LogLevel::Info:  col = ImVec4(0.7f,0.9f,1.0f,1); lvl = "INF"; break;
+                case LogLevel::Warn:  col = ImVec4(1.0f,0.8f,0.3f,1); lvl = "WRN"; break;
+                case LogLevel::Error: col = ImVec4(1.0f,0.3f,0.3f,1); lvl = "ERR"; break;
+                default:              col = ImVec4(1,1,1,1);           lvl = "???"; break;
+            }
+
+            // Build the line text for selection
+            char timeBuf[32];
+            { auto t = std::chrono::system_clock::to_time_t(e.wallTime);
+              auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(e.wallTime.time_since_epoch()).count() % 1000;
+              struct tm tm; localtime_s(&tm, &t);
+              snprintf(timeBuf, sizeof(timeBuf), "[%02d:%02d:%02d.%03d] [%s] [%-8s] ",
+                       tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms, lvl, e.tag.c_str()); }
+            std::string lineText = std::string(timeBuf) + e.message;
+
+            // Selectable row — right-click to copy individual line
+            ImGui::PushID(row);
+            if (ImGui::Selectable("##line", false, ImGuiSelectableFlags_AllowOverlap)) {
+                ImGui::SetClipboardText(lineText.c_str());
+            }
+            if (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
+                ImGui::SetClipboardText(lineText.c_str());
+            }
+            ImGui::SameLine(0, 0);
+
+            // Colored rendering on top
+            { auto t2 = std::chrono::system_clock::to_time_t(e.wallTime);
+              auto ms2 = std::chrono::duration_cast<std::chrono::milliseconds>(e.wallTime.time_since_epoch()).count() % 1000;
+              struct tm tm2; localtime_s(&tm2, &t2);
+              ImGui::TextDisabled("[%02d:%02d:%02d.%03d]", tm2.tm_hour, tm2.tm_min, tm2.tm_sec, (int)ms2); }
+            ImGui::SameLine();
+            ImGui::TextColored(col, "[%s]", lvl);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.4f,0.7f,1,1), "[%-8s]", e.tag.c_str());
+            ImGui::SameLine();
+            if (e.level == LogLevel::Error)
+                ImGui::TextColored(col, "%s", e.message.c_str());
+            else
+                ImGui::TextUnformatted(e.message.c_str());
+            ImGui::PopID();
+        }
+    }
+    clipper.End();
+
+    if (m_debugAutoScroll && DebugLog::instance().m_scrollToBottom) {
+        ImGui::SetScrollHereY(1.0f);
+        DebugLog::instance().m_scrollToBottom = false;
+    }
+
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+void App::renderStatusBar() {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_ChildBg));
+    float statusBarH = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2.0f;
+    ImGui::BeginChild("##StatusBar", ImVec2(0, statusBarH), ImGuiChildFlags_Borders);
+    float padY = (statusBarH - ImGui::GetFontSize()) * 0.5f;
+    ImGui::SetCursorPos(ImVec2(8, padY));
+
+    ImGui::TextDisabled("Windows: %d items", m_leftPanel.entryCount());
+    ImGui::SameLine(0, 20);
+
+    int ls = (int)m_leftPanel.selectedIndices.size();
+    int rs = (int)m_rightPanel.selectedIndices.size();
+    if (ls > 0) {
+        ImGui::Text("| %d selected, %s (PC)", ls, formatSize(m_leftPanel.selectedFileSize()).c_str());
+        ImGui::SameLine(0, 20);
+    }
+    if (rs > 0) {
+        ImGui::Text("| %d selected, %s (Android)", rs, formatSize(m_rightPanel.selectedFileSize()).c_str());
+        ImGui::SameLine(0, 20);
+    }
+
+    ImGui::TextDisabled("| Android: %d items", m_rightPanel.entryCount());
+    ImGui::SameLine(0, 20);
+
+    // Status message - show device client status if poll is active, otherwise app status
+    {
+        std::string devStatus = m_device.statusText();
+        if (m_primaryReconnectActive.load() && !devStatus.empty()) {
+            // Live status from device client takes priority
+            ImGui::TextColored(ImVec4(0.4f, 0.7f, 1, 1), "| %s", devStatus.c_str());
+            ImGui::SameLine(0, 20);
+        }
+    }
+    auto elapsed = std::chrono::steady_clock::now() - m_statusTime;
+    if (!m_statusMessage.empty() && elapsed < std::chrono::seconds(15)) {
+        ImGui::TextColored(ImVec4(0.3f,0.9f,0.5f,1), "| %s", m_statusMessage.c_str());
+        ImGui::SameLine(0, 20);
+    }
+
+    // Show transfer indicator if overlay is hidden but transfer is active
+    if (!m_overlayVisible) {
+        std::lock_guard<std::mutex> lk(m_batchMutex);
+        for (auto& b : m_batchQueue) {
+            BatchState s = b->state.load();
+            if (s == BatchState::Running || s == BatchState::Paused || s == BatchState::Verifying) {
+                if (s == BatchState::Verifying) {
+                    int ph = b->crcPhase.load();
+                    if (ph == 1)
+                        ImGui::TextColored(ImVec4(0.5f,0.4f,0.9f,1), "| Verifying: Device CRC...");
+                    else {
+                        float crcPct = b->crcProgress.load() * 100.0f;
+                        ImGui::TextColored(ImVec4(0.5f,0.4f,0.9f,1), "| Verifying: Local %.0f%%", crcPct);
+                    }
+                } else {
+                    float pct = b->totalProgress.load() * 100.0f;
+                    ImGui::TextColored(ImVec4(0.4f,0.7f,1,1), "| Transfer: %.0f%%", pct);
+                }
+                ImGui::SameLine();
+                if (modernSmallButton("Show")) m_overlayVisible = true;
+                ImGui::SameLine(0, 20);
+                break;
+            }
+        }
+    }
+
+    // Connection mode indicator - always show when device is selected
+    if (m_selectedDevice >= 0) {
+        std::string mode;
+        if (!m_device.isServerRunning())
+            mode = "[Connecting...]";
+        else if (m_device.isDirectConnection())
+            mode = "[Direct TCP: " + m_device.deviceIp() + "]";
+        else
+            mode = "[ADB Forward]";
+
+        float tw = ImGui::CalcTextSize(mode.c_str()).x;
+        ImGui::SameLine(ImGui::GetWindowWidth() - tw - 16);
+
+        if (!m_device.isServerRunning()) {
+            ImGui::TextColored(ImVec4(1, 0.7f, 0.2f, 1), "%s", mode.c_str());
+        } else if (m_device.isDirectConnection()) {
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1), "%s", mode.c_str());
+        } else {
+            ImGui::TextUnformatted(mode.c_str());
+        }
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+void App::renderContextMenu(FilePanel& panel) {
+    if (ImGui::BeginPopup("##FileContextMenu")) {
+        if (m_contextPanel == &panel && panel.validIndex(m_contextIndex)) {
+            std::string name = panel.entryName(m_contextIndex);
+            ImGui::TextDisabled("%s", name.c_str());
+            ImGui::Separator();
+            if (ImGui::MenuItem("Open / Navigate")) {
+                if (panel.entryIsDir(m_contextIndex)) {
+                    std::string sep = panel.isAndroid ? "/" : "\\";
+                    std::string np = panel.currentPath;
+                    appendPathSeparator(np, sep[0]); np += name;
+                    navigateToDirectory(panel, np);
+                }
+            }
+            if (!panel.isAndroid && !panel.entryIsDir(m_contextIndex)) {
+                if (ImGui::MenuItem("Open with Default App")) {
+                    std::string fp = panel.currentPath;
+                    appendPathSeparator(fp, '\\'); fp += name;
+                    ShellExecuteA(nullptr, "open", fp.c_str(), nullptr, nullptr, SW_SHOW);
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Copy", "Ctrl+C")) {
+                m_clipboardPaths.clear();
+                std::string sep = panel.isAndroid ? "/" : "\\";
+                for (int idx : panel.selectedIndices) {
+                    if (!panel.validIndex(idx)) continue;
+                    std::string p = panel.currentPath;
+                    appendPathSeparator(p, sep[0]);
+                    p += panel.entryName(idx);
+                    m_clipboardPaths.push_back(p);
+                }
+                m_clipboardIsAndroid = panel.isAndroid;
+                m_clipboardDeviceSlot = panel.deviceSlot;
+                m_clipboardCut = false;
+            }
+            if (ImGui::MenuItem("Cut", "Ctrl+X")) {
+                m_clipboardPaths.clear();
+                std::string sep = panel.isAndroid ? "/" : "\\";
+                for (int idx : panel.selectedIndices) {
+                    if (!panel.validIndex(idx)) continue;
+                    std::string p = panel.currentPath;
+                    appendPathSeparator(p, sep[0]);
+                    p += panel.entryName(idx);
+                    m_clipboardPaths.push_back(p);
+                }
+                m_clipboardIsAndroid = panel.isAndroid;
+                m_clipboardDeviceSlot = panel.deviceSlot;
+                m_clipboardCut = true;
+            }
+            if (!m_clipboardPaths.empty()) {
+                const char* pasteLabel = m_clipboardCut ? "Move Here" : "Paste";
+                if (ImGui::MenuItem(pasteLabel, "Ctrl+V")) {
+                    performClipboardPaste(panel);
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Copy to Other Panel")) {
+                if (&panel == &m_leftPanel) startTransfer(false); else startTransfer(true);
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Rename...")) { strcpy_s(m_renameBuf, name.c_str()); m_showRenamePopup = true; }
+            if (ImGui::MenuItem("Delete", "Del")) {
+                m_deletePermanent = ImGui::GetIO().KeyShift;
+                m_showDeleteConfirm = true;
+            }
+            if (ImGui::MenuItem("Delete Permanently", "Shift+Del")) {
+                m_deletePermanent = true;
+                m_showDeleteConfirm = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("New Folder...")) {
+                memset(m_newFolderName, 0, sizeof(m_newFolderName));
+                m_contextPanel = &panel; m_showNewFolderPopup = true;
+            }
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void App::renderNewFolderPopup() {
+    if (m_showNewFolderPopup) { ImGui::OpenPopup("New Folder"); m_showNewFolderPopup = false; m_newFolderNeedsFocus = true; }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f,0.5f));
+    if (ImGui::BeginPopupModal("New Folder", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Enter folder name:"); ImGui::SetNextItemWidth(300);
+        if (m_newFolderNeedsFocus) { ImGui::SetKeyboardFocusHere(); m_newFolderNeedsFocus = false; }
+        bool enter = ImGui::InputText("##NFN", m_newFolderName, sizeof(m_newFolderName), ImGuiInputTextFlags_EnterReturnsTrue);
+        if ((modernButton("Create", ImVec2(120,0)) || enter) && strlen(m_newFolderName) > 0 && m_contextPanel) {
+            if (m_contextPanel->isAndroid) {
+                std::string mkdirPath = m_contextPanel->currentPath + "/" + m_newFolderName;
+                if (m_selectedDevice >= 0) { int slot = m_contextPanel->deviceSlot; postAsync("Creating folder...", [this, mkdirPath, slot]() { deviceForSlot(slot).createDirectory(mkdirPath); }); }
+            } else {
+                std::string p = m_contextPanel->currentPath; appendPathSeparator(p, '\\'); p+=m_newFolderName;
+                std::filesystem::create_directories(p);
+            }
+            m_contextPanel->needsRefresh = true; ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (modernButton("Cancel", ImVec2(120,0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+
+void App::renderRenamePopup() {
+    if (m_showRenamePopup) { ImGui::OpenPopup("Rename"); m_showRenamePopup = false; m_renameNeedsSelect = true; }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f,0.5f));
+    if (ImGui::BeginPopupModal("Rename", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("New name:"); ImGui::SetNextItemWidth(300);
+        if (m_renameNeedsSelect) ImGui::SetKeyboardFocusHere();
+        auto renameCb = [](ImGuiInputTextCallbackData* data) -> int {
+            bool* needsSelect = (bool*)data->UserData;
+            if (*needsSelect) {
+                *needsSelect = false;
+                const char* dot = strrchr(data->Buf, '.');
+                int selectEnd = dot ? (int)(dot - data->Buf) : data->BufTextLen;
+                data->SelectionStart = 0;
+                data->SelectionEnd = selectEnd;
+                data->CursorPos = selectEnd;
+            }
+            return 0;
+        };
+        bool enter = ImGui::InputText("##RN", m_renameBuf, sizeof(m_renameBuf),
+            ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackAlways,
+            renameCb, &m_renameNeedsSelect);
+        if ((modernButton("Rename", ImVec2(120,0)) || enter) && m_contextPanel && m_contextPanel->validIndex(m_contextIndex)) {
+            std::string oldN = m_contextPanel->entryName(m_contextIndex), newN(m_renameBuf);
+            if (!newN.empty() && newN != oldN) {
+                if (m_contextPanel->isAndroid && m_selectedDevice >= 0) {
+                    std::string fromP = m_contextPanel->currentPath+"/"+oldN, toP = m_contextPanel->currentPath+"/"+newN;
+                    int slot = m_contextPanel->deviceSlot; postAsync("Renaming...", [this, fromP, toP, slot]() { deviceForSlot(slot).renameFile(fromP, toP); });
+                } else {
+                    std::string bp = m_contextPanel->currentPath; appendPathSeparator(bp, '\\');
+                    try { std::filesystem::rename(toFsPath(bp+oldN), toFsPath(bp+newN)); } catch (const std::exception& e) {
+                        m_statusMessage = std::string("Rename failed: ") + e.what(); m_statusTime = std::chrono::steady_clock::now();
+                    }
+                }
+                m_contextPanel->needsRefresh = true;
+            }
+            m_contextIndex = -1; m_contextPanel = nullptr; ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (modernButton("Cancel", ImVec2(120,0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+
+void App::renderDeleteConfirmPopup() {
+    if (m_showDeleteConfirm) { ImGui::OpenPopup("Confirm Delete"); m_showDeleteConfirm = false; }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Confirm Delete", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (m_contextPanel && !m_contextPanel->selectedIndices.empty()) {
+            int selCount = (int)m_contextPanel->selectedIndices.size();
+            bool isAndroid = m_contextPanel->isAndroid;
+
+            // Warning header
+            if (m_deletePermanent || isAndroid) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.3f, 0.3f, 1));
+                ImGui::Text("PERMANENTLY DELETE - This cannot be undone!");
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::TextColored(ImVec4(0.5f, 0.7f, 1, 1), "Move to Recycle Bin:");
+            }
+            ImGui::Spacing();
+
+            // Show file names (up to 10, then summarize)
+            int shown = 0;
+            for (int idx : m_contextPanel->selectedIndices) {
+                if (!m_contextPanel->validIndex(idx)) continue;
+                if (shown < 10) {
+                    std::string n = m_contextPanel->entryName(idx);
+                    ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "  %s", n.c_str());
+                }
+                shown++;
+            }
+            if (selCount > 10) {
+                ImGui::TextDisabled("  ... and %d more", selCount - 10);
+            }
+
+            ImGui::Spacing();
+            if (selCount > 1) {
+                ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1), "%d items will be %s",
+                    selCount, (m_deletePermanent || isAndroid) ? "permanently deleted" : "moved to Recycle Bin");
+                ImGui::Spacing();
+            }
+
+            // Hint about Shift
+            if (!isAndroid && !m_deletePermanent) {
+                ImGui::TextDisabled("Tip: Hold Shift for permanent delete");
+                ImGui::Spacing();
+            }
+
+            // Delete button
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.2f, 0.2f, 1));
+            const char* btnLabel = (m_deletePermanent || isAndroid) ? "Delete Permanently" : "Move to Recycle Bin";
+            if (modernButton(btnLabel, ImVec2(180, 0))) {
+                if (isAndroid) {
+                    // Android: always permanent via server, refresh after the queued work finishes.
+                    std::vector<std::string> delPaths;
+                    for (int idx : m_contextPanel->selectedIndices) {
+                        if (!m_contextPanel->validIndex(idx)) continue;
+                        delPaths.push_back(m_contextPanel->currentPath + "/" + m_contextPanel->entryName(idx));
+                    }
+                    if (m_selectedDevice >= 0 && !delPaths.empty()) {
+                        int slot = m_contextPanel->deviceSlot;
+                        bool refreshLeft = (m_contextPanel == &m_leftPanel);
+                        m_contextPanel->selectedIndices.clear();
+                        postAsync("Deleting files...", [this, delPaths, slot, refreshLeft]() {
+                            int failed = 0;
+                            std::string lastError;
+                            for (auto& p : delPaths) {
+                                if (!deviceForSlot(slot).deleteFile(p)) {
+                                    failed++;
+                                    lastError = deviceForSlot(slot).lastError();
+                                }
+                            }
+                            FilePanel& panel = refreshLeft ? m_leftPanel : m_rightPanel;
+                            panel.needsRefresh = true;
+                            if (failed == 0) {
+                                m_statusMessage = "Deleted " + std::to_string(delPaths.size()) + " item(s)";
+                            } else {
+                                m_statusMessage = "Deleted " + std::to_string((int)delPaths.size() - failed) +
+                                    " item(s), " + std::to_string(failed) + " failed";
+                                if (!lastError.empty()) m_statusMessage += ": " + lastError;
+                            }
+                            m_statusTime = std::chrono::steady_clock::now();
+                        });
+                    }
+                } else {
+                    // Windows: use IFileOperation (recycle bin or permanent)
+                    std::vector<std::string> paths;
+                    for (int idx : m_contextPanel->selectedIndices) {
+                        if (!m_contextPanel->validIndex(idx)) continue;
+                        std::string p = m_contextPanel->currentPath;
+                        appendPathSeparator(p, '\\');
+                        p += m_contextPanel->entryName(idx);
+                        paths.push_back(p);
+                    }
+                    std::string error;
+                    if (!deleteWindowsFiles(paths, m_deletePermanent, error)) {
+                        m_statusMessage = "Delete failed: " + error;
+                        m_statusTime = std::chrono::steady_clock::now();
+                    }
+                    m_contextPanel->needsRefresh = true;
+                }
+                m_contextIndex = -1; m_contextPanel = nullptr;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopStyleColor(2);
+            ImGui::SameLine();
+            if (modernButton("Cancel", ImVec2(120, 0))) {
+                m_contextIndex = -1; m_contextPanel = nullptr;
+                ImGui::CloseCurrentPopup();
+            }
+        } else {
+            ImGui::Text("No items selected.");
+            if (modernButton("Close", ImVec2(120, 0))) {
+                m_contextIndex = -1; m_contextPanel = nullptr;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void App::performClipboardPaste(FilePanel& dstPanel) {
+    if (m_clipboardPaths.empty()) return;
+    if (dstPanel.isApps) {
+        m_statusMessage = "App list does not accept file paste. Use APK install instead.";
+        m_statusTime = std::chrono::steady_clock::now();
+        return;
+    }
+
+    bool dstIsAndroid = dstPanel.isAndroid;
+    bool srcIsAndroid = m_clipboardIsAndroid;
+    bool isCut = m_clipboardCut;
+    std::vector<std::string> paths = m_clipboardPaths;
+    std::string dstDir = dstPanel.currentPath;
+    int srcSlot = m_clipboardDeviceSlot;
+    int dstSlot = dstPanel.deviceSlot;
+
+    if (!srcIsAndroid && !dstIsAndroid) {
+        // Windows to Windows — local filesystem copy/move
+        postAsync(isCut ? "Moving files..." : "Copying files...", [this, paths, dstDir, isCut]() {
+            for (auto& src : paths) {
+                try {
+                    auto srcPath = toFsPath(src);
+                    std::string filename = pathToUtf8(srcPath.filename());
+                    std::string dst = dstDir;
+                    appendPathSeparator(dst, '\\');
+                    dst += filename;
+                    auto dstPath = toFsPath(dst);
+                    if (isCut) {
+                        std::filesystem::rename(srcPath, dstPath);
+                    } else {
+                        if (std::filesystem::is_directory(srcPath))
+                            std::filesystem::copy(srcPath, dstPath, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
+                        else
+                            std::filesystem::copy_file(srcPath, dstPath, std::filesystem::copy_options::overwrite_existing);
+                    }
+                } catch (const std::exception& e) {
+                    m_statusMessage = std::string("Paste failed: ") + e.what();
+                    m_statusTime = std::chrono::steady_clock::now();
+                }
+            }
+        });
+        dstPanel.needsRefresh = true;
+        if (isCut) m_clipboardPaths.clear();
+    } else if (srcIsAndroid && dstIsAndroid && srcSlot == dstSlot) {
+        // Same Android device — move via rename, copy via adb shell cp
+        postAsync(isCut ? "Moving files..." : "Copying files...", [this, paths, dstDir, isCut, srcSlot]() {
+            for (auto& src : paths) {
+                std::string filename = src.substr(src.rfind('/') + 1);
+                std::string dst = dstDir;
+                appendPathSeparator(dst, '/');
+                dst += filename;
+                if (isCut) {
+                    deviceForSlot(srcSlot).renameFile(src, dst);
+                } else {
+                    // No server-side copy command; use adb shell cp -r
+                    std::string cmd = "shell cp -r \"" + src + "\" \"" + dst + "\"";
+                    deviceForSlot(srcSlot).runAdbCommand(cmd);
+                }
+            }
+        });
+        dstPanel.needsRefresh = true;
+        if (isCut) m_clipboardPaths.clear();
+    } else {
+        // Cross-platform or cross-device — use the transfer system
+        // Build a temporary selection in a virtual source panel and trigger transfer
+        // For now, show a message directing users to use Copy to Other Panel
+        m_statusMessage = "Cross-platform paste: use Copy to Other Panel or drag-and-drop";
+        m_statusTime = std::chrono::steady_clock::now();
+    }
+}
+
+void App::refreshWindowsPanel(FilePanel& panel) {
+    panel.windowsEntries.clear(); panel.selectedIndices.clear();
+    std::string mountPoint;
+    if (isOwnMountedDevicePath(panel.currentPath, &mountPoint)) {
+        std::string blockedPath = panel.currentPath;
+        panel.currentPath = "C:\\";
+        strcpy_s(panel.pathInput, panel.currentPath.c_str());
+        panel.navHistory.erase(std::remove_if(panel.navHistory.begin(), panel.navHistory.end(),
+            [this](const std::string& value) { return isOwnMountedDevicePath(value); }), panel.navHistory.end());
+        if (panel.navHistory.empty() || panel.navHistory.back() != panel.currentPath)
+            panel.navHistory.push_back(panel.currentPath);
+        panel.navHistoryPos = (int)panel.navHistory.size() - 1;
+        m_statusMessage = "Blocked recursive access to " + mountPoint + ". Use the Android pane instead.";
+        m_statusTime = std::chrono::steady_clock::now();
+        showNotification("Mounted Drive Opened in PC Pane",
+            "Fast Enough cannot browse " + blockedPath +
+            " from its own PC pane because the drive is provided by this application. "
+            "Use the Android pane inside Fast Enough, or browse the mounted drive in Windows Explorer.", false);
+        LOG_WARN("Dokan", "Blocked recursive PC pane access to own mount: " + blockedPath);
+        return;
+    }
+    std::error_code iterEc;
+    std::filesystem::directory_iterator it(toFsPath(panel.currentPath), std::filesystem::directory_options::skip_permission_denied, iterEc);
+    if (iterEc) {
+        m_statusMessage = "Error: " + iterEc.message();
+        m_statusTime = std::chrono::steady_clock::now();
+    } else {
+        for (const auto end = std::filesystem::directory_iterator(); it != end; it.increment(iterEc)) {
+            if (iterEc) { iterEc.clear(); continue; }
+            const auto& entry = *it;
+            WindowsFileEntry fe;
+            fe.name = pathToUtf8(entry.path().filename());
+            std::error_code ec;
+            fe.isDirectory = entry.is_directory(ec);
+            if (ec) fe.isDirectory = false;
+            DWORD attrs = GetFileAttributesW(entry.path().wstring().c_str());
+            fe.isHidden = (attrs != INVALID_FILE_ATTRIBUTES) && (attrs & FILE_ATTRIBUTE_HIDDEN);
+            if (!fe.isDirectory) {
+                ec.clear();
+                fe.size = entry.file_size(ec);
+                if (ec) fe.size = 0;
+            }
+            try {
+                auto ft = entry.last_write_time();
+                auto sc = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                    ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+                auto t = std::chrono::system_clock::to_time_t(sc);
+                struct tm tm; localtime_s(&tm, &t);
+                char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm);
+                fe.dateModified = buf;
+            } catch (...) { fe.dateModified = ""; }
+            panel.windowsEntries.push_back(std::move(fe));
+        }
+    }
+    int col = panel.sortColumn;
+    bool desc = panel.sortDescending;
+    std::sort(panel.windowsEntries.begin(), panel.windowsEntries.end(),
+        [col, desc](const WindowsFileEntry& a, const WindowsFileEntry& b) {
+            if (a.isDirectory != b.isDirectory) return a.isDirectory > b.isDirectory;
+            int cmp;
+            if (col == 1) cmp = (a.size < b.size) ? -1 : (a.size > b.size) ? 1 : 0;
+            else if (col == 2) cmp = a.dateModified.compare(b.dateModified);
+            else cmp = _stricmp(a.name.c_str(), b.name.c_str());
+            return desc ? cmp > 0 : cmp < 0;
+        });
+    strcpy_s(panel.pathInput, panel.currentPath.c_str());
+}
+
+void App::refreshAndroidPanel(FilePanel& panel) {
+    panel.androidEntries.clear(); panel.selectedIndices.clear();
+    DeviceClient& dev = deviceFor(panel);
+    if (!dev.isServerRunning()) return;
+
+    if (panel.insideMcraw) {
+        panel.androidEntries = dev.listMcraw(panel.mcrawFilePath);
+    } else {
+        panel.androidEntries = dev.listDirectory(panel.currentPath);
+    }
+    int col = panel.sortColumn;
+    bool desc = panel.sortDescending;
+    std::sort(panel.androidEntries.begin(), panel.androidEntries.end(),
+        [col, desc](const DeviceFileEntry& a, const DeviceFileEntry& b) {
+            if (a.isDirectory() != b.isDirectory()) return a.isDirectory();
+            int cmp;
+            if (col == 1) cmp = (a.size < b.size) ? -1 : (a.size > b.size) ? 1 : 0;
+            else if (col == 2) cmp = (a.mtime < b.mtime) ? -1 : (a.mtime > b.mtime) ? 1 : 0;
+            else cmp = _stricmp(a.name.c_str(), b.name.c_str());
+            return desc ? cmp > 0 : cmp < 0;
+        });
+    strcpy_s(panel.pathInput, panel.currentPath.c_str());
+}
+
+void App::refreshAppsPanel(FilePanel& panel) {
+    panel.appEntries.clear();
+    panel.selectedIndices.clear();
+    DeviceClient& dev = deviceFor(panel);
+    if (!dev.isServerRunning()) return;
+    std::string serial = m_slotSerial[panel.deviceSlot];
+    panel.appEntries = dev.listInstalledApps(serial, true);
+    int col = panel.sortColumn;
+    bool desc = panel.sortDescending;
+    std::sort(panel.appEntries.begin(), panel.appEntries.end(),
+        [col, desc](const InstalledAppEntry& a, const InstalledAppEntry& b) {
+            int cmp = 0;
+            if (col == 1) cmp = _stricmp(a.packageName.c_str(), b.packageName.c_str());
+            else if (col == 2) cmp = (int)a.isSystem - (int)b.isSystem;
+            else if (col == 3) cmp = _stricmp(a.apkPath.c_str(), b.apkPath.c_str());
+            else {
+                const std::string& aName = a.appName.empty() ? a.packageName : a.appName;
+                const std::string& bName = b.appName.empty() ? b.packageName : b.appName;
+                cmp = _stricmp(aName.c_str(), bName.c_str());
+            }
+            return desc ? cmp > 0 : cmp < 0;
+        });
+    strcpy_s(panel.pathInput, "Installed apps");
+}
+
+void App::navigateToDirectory(FilePanel& panel, const std::string& path) {
+    std::string mountPoint;
+    if (!panel.isAndroid && isOwnMountedDevicePath(path, &mountPoint)) {
+        m_statusMessage = "Blocked recursive access to " + mountPoint + ". Use the Android pane instead.";
+        m_statusTime = std::chrono::steady_clock::now();
+        showNotification("Use the Android Pane",
+            "The " + mountPoint + " drive is provided by Fast Enough. Browsing it from a PC pane would "
+            "route file requests back into the same application. Use the Android pane here, or open the drive "
+            "in Windows Explorer.", false);
+        LOG_WARN("Dokan", "Blocked navigation to own mount from PC pane: " + path);
+        return;
+    }
+    // Push to navigation history (truncate forward history)
+    if (panel.navHistoryPos < 0 || panel.navHistory.empty() || panel.navHistory[panel.navHistoryPos] != path) {
+        if (panel.navHistoryPos >= 0 && panel.navHistoryPos < (int)panel.navHistory.size() - 1)
+            panel.navHistory.erase(panel.navHistory.begin() + panel.navHistoryPos + 1, panel.navHistory.end());
+        panel.navHistory.push_back(path);
+        panel.navHistoryPos = (int)panel.navHistory.size() - 1;
+        if (panel.navHistory.size() > 50) { panel.navHistory.erase(panel.navHistory.begin()); panel.navHistoryPos--; }
+    }
+    panel.currentPath = path; panel.selectedIndices.clear(); panel.focusedIndex = -1;
+    panel.searchFilter[0] = '\0'; panel.needsRefresh = true;
+
+    // Detect MCRAW virtual directory
+    if (endsWithCI(path, ".mcraw")) {
+        panel.insideMcraw = true;
+        panel.mcrawFilePath = path;
+    } else if (panel.insideMcraw) {
+        // Keep insideMcraw if we're still within a ProjFS mount (don't reset on sub-navigation)
+        // Only clear if we navigated to the parent of the .mcraw file (exited the mount)
+        std::filesystem::path mcrawParent = toFsPath(panel.mcrawFilePath).parent_path();
+        std::filesystem::path curPath = toFsPath(path);
+        // If current path IS the mcraw parent or above it, we've exited
+        if (path == pathToUtf8(mcrawParent) || !pathToUtf8(curPath).starts_with(pathToUtf8(mcrawParent))) {
+            // Check if we're still inside the mount point (ProjFS path won't contain the mcraw parent)
+            // Simple heuristic: if path doesn't start with temp dir, we've left the mount
+            char tmpDir[MAX_PATH]; GetTempPathA(MAX_PATH, tmpDir);
+            std::string tempBase(tmpDir);
+            bool inMountPath = (path.find(tempBase) == 0 || path.find("McrawMount") != std::string::npos);
+            if (!inMountPath) {
+                // Unmount the ProjFS mount when leaving the MCRAW
+                McrawMountManager::instance().unmountAll();
+                panel.insideMcraw = false;
+                panel.mcrawFilePath.clear();
+            }
+        }
+    }
+
+    // Trigger fade-in animation
+    if (&panel == &m_leftPanel) m_lastNavTimeLeft = std::chrono::steady_clock::now();
+    else m_lastNavTimeRight = std::chrono::steady_clock::now();
+}
+
+bool App::isOwnMountedDevicePath(const std::string& path, std::string* mountPoint) const {
+    if (path.size() < 2 || path[1] != ':') return false;
+    char pathDrive = (char)std::toupper((unsigned char)path[0]);
+    for (int slot = 0; slot < 2; ++slot) {
+        const auto& manager = DeviceMountManager::instance(slot);
+        if (!manager.isMounted()) continue;
+        const std::string& mounted = manager.mountPoint();
+        if (mounted.size() < 2 || mounted[1] != ':') continue;
+        if (pathDrive != (char)std::toupper((unsigned char)mounted[0])) continue;
+        if (mountPoint) *mountPoint = mounted;
+        return true;
+    }
+    return false;
+}
+
+void App::switchPanelMode(FilePanel& panel, bool toAndroid) {
+    if (!panel.isApps && !panel.isConnections && panel.isAndroid == toAndroid) return;
+    panel.isAndroid = toAndroid;
+    panel.isApps = false;
+    panel.isConnections = false;
+    panel.selectedIndices.clear();
+    panel.focusedIndex = -1;
+    panel.searchFilter[0] = '\0';
+    if (panel.insideMcraw) McrawMountManager::instance().unmountAll();
+    panel.insideMcraw = false;
+    panel.mcrawFilePath.clear();
+    panel.navHistory.clear();
+    panel.navHistoryPos = -1;
+    if (toAndroid) {
+        panel.windowsEntries.clear();
+        panel.appEntries.clear();
+        // If the other panel is already Android on slot 0, use slot 1
+        FilePanel& other = (&panel == &m_leftPanel) ? m_rightPanel : m_leftPanel;
+        if ((other.isAndroid || other.isApps) && other.deviceSlot == 0 && m_slotConnected[1])
+            panel.deviceSlot = 1;
+        else
+            panel.deviceSlot = 0;
+        std::string root = m_slotStorageRoot[panel.deviceSlot];
+        panel.currentPath = root.empty() ? "/" : root;
+        strcpy_s(panel.pathInput, panel.currentPath.c_str());
+        panel.needsRefresh = true;
+    } else {
+        panel.androidEntries.clear();
+        panel.appEntries.clear();
+        panel.currentPath = "C:\\";
+        strcpy_s(panel.pathInput, panel.currentPath.c_str());
+        panel.needsRefresh = true;
+    }
+}
+
+void App::switchPanelToApps(FilePanel& panel) {
+    if (panel.isApps && !panel.isConnections) return;
+    panel.isAndroid = false;
+    panel.isApps = true;
+    panel.isConnections = false;
+    panel.windowsEntries.clear();
+    panel.androidEntries.clear();
+    panel.selectedIndices.clear();
+    panel.focusedIndex = -1;
+    panel.searchFilter[0] = '\0';
+    if (panel.insideMcraw) McrawMountManager::instance().unmountAll();
+    panel.insideMcraw = false;
+    panel.mcrawFilePath.clear();
+    panel.navHistory.clear();
+    panel.navHistoryPos = -1;
+    FilePanel& other = (&panel == &m_leftPanel) ? m_rightPanel : m_leftPanel;
+    if ((other.isAndroid || other.isApps) && other.deviceSlot == 0 && m_slotConnected[1])
+        panel.deviceSlot = 1;
+    else
+        panel.deviceSlot = 0;
+    panel.currentPath = "apps://installed";
+    strcpy_s(panel.pathInput, "Installed apps");
+    panel.needsRefresh = true;
+}
+
+void App::switchPanelToConnections(FilePanel& panel) {
+    if (panel.isConnections) return;
+    panel.isAndroid = false;
+    panel.isApps = false;
+    panel.isConnections = true;
+    panel.selectedIndices.clear();
+    panel.focusedIndex = -1;
+    panel.searchFilter[0] = '\0';
+    if (panel.insideMcraw) McrawMountManager::instance().unmountAll();
+    panel.insideMcraw = false;
+    panel.mcrawFilePath.clear();
+    panel.navHistory.clear();
+    panel.navHistoryPos = -1;
+    panel.needsRefresh = false;
+}
+
+void App::forEachAndroidPanel(std::function<void(FilePanel&)> fn) {
+    if (m_leftPanel.isAndroid) fn(m_leftPanel);
+    if (m_rightPanel.isAndroid) fn(m_rightPanel);
+}
+
+void App::forEachDevicePanel(std::function<void(FilePanel&)> fn) {
+    if (m_leftPanel.isAndroid || m_leftPanel.isApps) fn(m_leftPanel);
+    if (m_rightPanel.isAndroid || m_rightPanel.isApps) fn(m_rightPanel);
+}
+
+void App::navigateUp(FilePanel& panel) {
+    if (panel.insideMcraw) {
+        // Exit MCRAW virtual directory: go to the parent folder containing the .mcraw file
+        std::string parent;
+        if (panel.isAndroid) {
+            auto pos = panel.mcrawFilePath.rfind('/');
+            parent = (pos != std::string::npos && pos > 0) ? panel.mcrawFilePath.substr(0, pos) : "/";
+        } else {
+            auto p = toFsPath(panel.mcrawFilePath);
+            parent = pathToUtf8(p.parent_path());
+        }
+        navigateToDirectory(panel, parent);
+        return;
+    }
+
+    std::string parent;
+    if (panel.isAndroid) {
+        auto pos = panel.currentPath.rfind('/');
+        parent = (pos != std::string::npos && pos > 0) ? panel.currentPath.substr(0, pos) : "/";
+    } else {
+        auto p = toFsPath(panel.currentPath);
+        parent = (p.has_parent_path() && p.parent_path() != p) ? pathToUtf8(p.parent_path()) : panel.currentPath;
+    }
+    if (parent != panel.currentPath)
+        navigateToDirectory(panel, parent);
+}
+
+void App::devicePollLoop() {
+    // Find ADB and clean start on background thread
+    m_pollBusy = true;
+    m_statusMessage = "Finding ADB...";
+    m_statusTime = std::chrono::steady_clock::now();
+
+    m_device.findAdb();
+    // Share ADB path with secondary device client
+    if (!m_device.getAdbPath().empty())
+        m_deviceSlots[1].setAdbPath(m_device.getAdbPath());
+
+    if (!m_device.getAdbPath().empty()) {
+        if (m_prefs.restartAdbOnLaunch) {
+            m_statusMessage = "Restarting ADB daemon...";
+            m_statusTime = std::chrono::steady_clock::now();
+            LOG_INFO("ADB", "Restarting ADB daemon (preference enabled)");
+            m_device.runAdbCommand("kill-server");
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            m_device.runAdbCommand("start-server");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        }
+        m_statusMessage = "ADB ready - waiting for device...";
+        m_statusTime = std::chrono::steady_clock::now();
+    } else {
+        m_statusMessage = "ADB not found. Extract the full ZIP or install Android SDK Platform Tools.";
+        m_statusTime = std::chrono::steady_clock::now();
+    }
+    m_pollBusy = false;
+
+    // Helper to check if any batch is active
+    auto isBatchActive = [&]() -> bool {
+        std::lock_guard<std::mutex> lk(m_batchMutex);
+        for (auto& b : m_batchQueue) {
+            auto s = b->state.load();
+            if (s == BatchState::Running || s == BatchState::Paused || s == BatchState::Queued || s == BatchState::Verifying) return true;
+        }
+        return false;
+    };
+
+    // Helper to process a device list update (from track-devices or getDevices)
+    auto processDeviceUpdate = [&](const std::vector<DeviceInfo>& devices) {
+        m_pollBusy = true;
+        std::string curSerial;
+        bool primaryServerRunning = m_device.isServerRunning();
+        {
+            std::lock_guard<std::mutex> lk(m_deviceMutex);
+            std::string previousSelectedSerial;
+            if (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size())
+                previousSelectedSerial = m_devices[m_selectedDevice].serial;
+            if (previousSelectedSerial.empty())
+                previousSelectedSerial = m_lastDeviceSerial;
+
+            m_devices = devices;
+
+            // Build list of online devices only
+            auto findOnline = [&](bool preferUsb) -> int {
+                // First pass: preferred type
+                for (int i = 0; i < (int)m_devices.size(); i++) {
+                    if (m_devices[i].state != "device") continue;
+                    bool isWifi = isWifiSerial(m_devices[i].serial);
+                    if (preferUsb ? !isWifi : isWifi) return i;
+                }
+                // Second pass: any online device
+                for (int i = 0; i < (int)m_devices.size(); i++)
+                    if (m_devices[i].state == "device") return i;
+                return -1;
+            };
+            auto findSerial = [&](const std::string& serial) -> int {
+                if (serial.empty()) return -1;
+                for (int i = 0; i < (int)m_devices.size(); i++) {
+                    if (m_devices[i].serial == serial && m_devices[i].state == "device")
+                        return i;
+                }
+                return -1;
+            };
+
+            // Keep slot 0 stable while its server is alive. Panel device dropdowns
+            // browse slots, they must not cause slot 1 to be promoted to primary.
+            int primaryIdx = -1;
+            if (primaryServerRunning && m_slotConnected[0]) {
+                primaryIdx = findSerial(m_slotSerial[0]);
+                if (primaryIdx < 0) {
+                    std::string partner;
+                    if (isWifiSerial(m_slotSerial[0]) && m_slotSerial[0] == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
+                        partner = m_wifiToUsbSerial;
+                    else if (!isWifiSerial(m_slotSerial[0]) && m_slotSerial[0] == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
+                        partner = m_usbToWifiSerial;
+                    primaryIdx = findSerial(partner);
+                }
+            }
+
+            // During `adb tcpip`, Android briefly removes the USB serial before
+            // publishing its WiFi serial. Keep the verified direct connection as
+            // primary through that gap instead of promoting the other phone.
+            bool retainingDirectWifiPrimary = false;
+            if (primaryIdx < 0 && primaryServerRunning && m_slotConnected[0] &&
+                m_device.isDirectConnection() && !isWifiSerial(m_slotSerial[0])) {
+                for (const auto& saved : m_prefs.savedWifiDevices) {
+                    if (saved.serial == m_slotSerial[0] && saved.wifiIp == m_device.deviceIp()) {
+                        retainingDirectWifiPrimary = true;
+                        break;
+                    }
+                }
+            }
+
+            if (primaryIdx >= 0) {
+                m_selectedDevice = primaryIdx;
+            } else if (!retainingDirectWifiPrimary) {
+                int preserved = findSerial(previousSelectedSerial);
+                if (preserved >= 0)
+                    m_selectedDevice = preserved;
+            }
+
+            // Check if currently selected device went offline
+            bool selectedOffline = (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size() &&
+                                    m_devices[m_selectedDevice].state != "device");
+            bool selectedGone = (m_selectedDevice >= 0 && m_selectedDevice >= (int)m_devices.size());
+
+            if (m_selectedDevice < 0 || selectedOffline || selectedGone) {
+                // Release keep-awake if device went away (process death auto-releases the wakelock on the device)
+                if ((selectedOffline || selectedGone) && m_keepAwake) {
+                    if (m_wakeLockProcess) {
+                        TerminateProcess(m_wakeLockProcess, 0);
+                        CloseHandle(m_wakeLockProcess);
+                        m_wakeLockProcess = nullptr;
+                    }
+                    m_keepAwake = false;
+                }
+                // Try to find the same physical device via the other serial
+                int found = -1;
+                if (selectedOffline || selectedGone) {
+                    std::string lostSerial = (selectedOffline && m_selectedDevice < (int)m_devices.size())
+                        ? m_devices[m_selectedDevice].serial : m_lastDeviceSerial;
+                    // Check if the partner serial (USB↔WiFi) is online
+                    std::string partnerSerial;
+                    if (isWifiSerial(lostSerial) && lostSerial == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
+                        partnerSerial = m_wifiToUsbSerial;
+                    else if (!isWifiSerial(lostSerial) && lostSerial == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
+                        partnerSerial = m_usbToWifiSerial;
+
+                    if (!partnerSerial.empty()) {
+                        for (int i = 0; i < (int)m_devices.size(); i++) {
+                            if (m_devices[i].serial == partnerSerial && m_devices[i].state == "device") {
+                                found = i;
+                                LOG_INFO("Poll", "Auto-switching to partner serial: " + partnerSerial);
+                                break;
+                            }
+                        }
+                    }
+                }
+                m_selectedDevice = (found >= 0) ? found : findOnline(true);
+            }
+
+            curSerial = retainingDirectWifiPrimary ? m_slotSerial[0] :
+                (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size()
+                                     && m_devices[m_selectedDevice].state == "device")
+                ? m_devices[m_selectedDevice].serial : "";
+
+            // If server is still running and serial just flipped USB↔WiFi, keep it
+            if (!m_lastDeviceSerial.empty() && !curSerial.empty() &&
+                curSerial != m_lastDeviceSerial && m_device.isServerRunning()) {
+                // Check if old serial is still online
+                for (int i = 0; i < (int)m_devices.size(); i++) {
+                    if (m_devices[i].serial == m_lastDeviceSerial && m_devices[i].state == "device") {
+                        m_selectedDevice = i;
+                        curSerial = m_lastDeviceSerial;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Resolve marketing display names for new devices (outside lock, may call adb)
+        for (auto& d : devices) {
+            if (d.state != "device") continue;
+            if (m_deviceDisplayNames.count(d.serial)) continue;
+            // First check saved prefs for a cached name
+            for (auto& w : m_prefs.savedWifiDevices) {
+                if (!w.model.empty() && (w.serial == d.serial ||
+                    (w.wifiIp + ":" + std::to_string(w.port)) == d.serial)) {
+                    m_deviceDisplayNames[d.serial] = w.model;
+                    break;
+                }
+            }
+            if (m_deviceDisplayNames.count(d.serial)) continue;
+            // Query the device for its marketing name
+            std::string name = queryDeviceDisplayName(d.serial);
+            if (!name.empty())
+                m_deviceDisplayNames[d.serial] = name;
+        }
+
+        // Detect the other connection type appearing → upgrade to true dual channel
+        // Case 1: On WiFi, USB cable plugged in → add USB as secondary channel (keep WiFi primary)
+        // Triggers when: no dual channel yet, OR dual channel is WiFi-only (upgrade WiFi+WiFi to WiFi+USB)
+        if (isWifiSerial(curSerial) && m_device.isServerRunning() &&
+            (!m_dualChannelAvailable || m_secondaryChannelType != "USB")) {
+            // Find a USB device in the list that belongs to the same physical device
+            std::string usbSerial;
+            {
+                std::lock_guard<std::mutex> lk2(m_deviceMutex);
+                // First: try known mapping
+                if (!m_wifiToUsbSerial.empty() && curSerial == m_usbToWifiSerial) {
+                    for (auto& d : m_devices) {
+                        if (d.serial == m_wifiToUsbSerial && d.state == "device") {
+                            usbSerial = m_wifiToUsbSerial;
+                            break;
+                        }
+                    }
+                }
+                // Second: find USB device with same model name, but ONLY if there's
+                // exactly one other device (otherwise we can't tell which USB belongs
+                // to this WiFi device and would grab a different device's USB)
+                if (usbSerial.empty()) {
+                    int onlineUsbCount = 0;
+                    for (auto& d : m_devices)
+                        if (d.state == "device" && !isWifiSerial(d.serial)) onlineUsbCount++;
+
+                    if (onlineUsbCount == 1) {
+                        std::string wifiModel;
+                        for (auto& d : m_devices)
+                            if (d.serial == curSerial) { wifiModel = d.model; break; }
+                        if (!wifiModel.empty()) {
+                            for (auto& d : m_devices) {
+                                if (d.state == "device" && !isWifiSerial(d.serial) && d.model == wifiModel) {
+                                    usbSerial = d.serial;
+                                    break;
+                                }
+                            }
+                        }
+                    } else if (onlineUsbCount > 1) {
+                        LOG_INFO("Poll", "Multiple USB devices online, skipping model-based dual channel pairing to avoid grabbing wrong device");
+                    }
+                }
+            }
+            if (!usbSerial.empty()) {
+                LOG_INFO("Poll", "USB cable connected while on WiFi - adding USB secondary channel via " + usbSerial);
+                // Update mapping
+                m_wifiToUsbSerial = usbSerial;
+                m_usbToWifiSerial = curSerial;
+                // Disconnect existing WiFi secondary if upgrading
+                if (m_dualChannelAvailable && m_secondaryChannelType != "USB") {
+                    m_secondaryChannel.disconnectTcp();
+                    m_dualChannelAvailable = false;
+                    LOG_INFO("Poll", "Disconnected WiFi secondary to upgrade to USB");
+                }
+                // Set up ADB forward on the USB serial and connect secondary channel through it
+                std::string fwdResult = m_device.runAdbCommand("-s " + usbSerial + " forward tcp:5741 tcp:5740");
+                if (fwdResult.find("error") == std::string::npos) {
+                    m_secondaryChannel.setAdbPath(m_device.getAdbPath());
+                    if (m_secondaryChannel.connectTcp("127.0.0.1", 5741) && m_secondaryChannel.verifyConnection()) {
+                        m_dualChannelAvailable = true;
+                        m_secondaryChannelType = "USB";
+                        m_statusMessage = "Dual channel active: WiFi + USB";
+                        LOG_INFO("Poll", "Secondary USB channel established via ADB forward");
+                    } else {
+                        // Clean up the forward if connection failed
+                        m_device.runAdbCommand("-s " + usbSerial + " forward --remove tcp:5741");
+                        LOG_WARN("Poll", "USB secondary channel connection failed");
+                        // Re-establish WiFi secondary as fallback
+                        std::string wifiIp;
+                        auto colon = curSerial.rfind(':');
+                        if (colon != std::string::npos) wifiIp = curSerial.substr(0, colon);
+                        if (!wifiIp.empty() && m_secondaryChannel.connectTcp(wifiIp, AFM_PORT) &&
+                            m_secondaryChannel.verifyConnection()) {
+                            m_dualChannelAvailable = true;
+                            m_secondaryChannelType = "WiFi";
+                            LOG_INFO("Poll", "Re-established WiFi secondary as fallback");
+                        }
+                    }
+                } else {
+                    LOG_WARN("Poll", "ADB forward for USB secondary failed: " + fwdResult);
+                }
+            }
+        }
+        // Case 1b: Secondary is USB but USB device disappeared → downgrade to WiFi secondary
+        if (m_dualChannelAvailable && m_secondaryChannelType == "USB" &&
+            isWifiSerial(curSerial) && !isBatchActive()) {
+            bool usbStillOnline = false;
+            {
+                std::lock_guard<std::mutex> lk2(m_deviceMutex);
+                if (!m_wifiToUsbSerial.empty()) {
+                    for (auto& d : m_devices) {
+                        if (d.serial == m_wifiToUsbSerial && d.state == "device") {
+                            usbStillOnline = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!usbStillOnline) {
+                LOG_INFO("Poll", "USB device gone - downgrading secondary from USB to WiFi");
+                m_secondaryChannel.disconnectTcp();
+                // Clean up ADB forward
+                if (!m_wifiToUsbSerial.empty())
+                    m_device.runAdbCommand("-s " + m_wifiToUsbSerial + " forward --remove tcp:5741");
+                // Re-establish via WiFi
+                std::string wifiIp;
+                auto colon = curSerial.rfind(':');
+                if (colon != std::string::npos) wifiIp = curSerial.substr(0, colon);
+                if (!wifiIp.empty() && m_secondaryChannel.connectTcp(wifiIp, AFM_PORT) &&
+                    m_secondaryChannel.verifyConnection()) {
+                    m_secondaryChannelType = "WiFi";
+                    m_statusMessage = "Dual channel: WiFi + WiFi";
+                    m_statusTime = std::chrono::steady_clock::now();
+                    LOG_INFO("Poll", "Re-established WiFi secondary after USB disconnect");
+                } else {
+                    m_dualChannelAvailable = false;
+                    m_secondaryChannelType.clear();
+                    LOG_WARN("Poll", "Failed to re-establish WiFi secondary after USB disconnect");
+                    m_statusMessage = "USB disconnected, dual channel disabled";
+                    m_statusTime = std::chrono::steady_clock::now();
+                }
+            }
+        }
+
+        // Case 2: On USB, WiFi becomes available → add WiFi as secondary channel
+        // Only if the WiFi serial belongs to the SAME device as the current USB serial
+        if (m_prefs.wifiAutoConnect && !isWifiSerial(curSerial) && !curSerial.empty() && m_device.isServerRunning() &&
+            !m_dualChannelAvailable && !m_usbToWifiSerial.empty() && curSerial == m_wifiToUsbSerial) {
+            std::lock_guard<std::mutex> lk2(m_deviceMutex);
+            for (int i = 0; i < (int)m_devices.size(); i++) {
+                if (m_devices[i].serial == m_usbToWifiSerial && m_devices[i].state == "device") {
+                    // WiFi serial appeared — try to establish secondary channel directly
+                    LOG_INFO("Poll", "WiFi appeared while on USB - adding WiFi secondary channel");
+                    std::string wifiIp;
+                    auto colon = m_usbToWifiSerial.rfind(':');
+                    if (colon != std::string::npos) wifiIp = m_usbToWifiSerial.substr(0, colon);
+                    if (!wifiIp.empty()) {
+                        m_secondaryChannel.setAdbPath(m_device.getAdbPath());
+                        if (m_secondaryChannel.connectTcp(wifiIp, AFM_PORT) && m_secondaryChannel.verifyConnection()) {
+                            m_dualChannelAvailable = true;
+                            m_secondaryChannelType = "WiFi";
+                            m_statusMessage = "Dual channel active: USB + WiFi";
+                            LOG_INFO("Poll", "Secondary WiFi channel established: " + wifiIp);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (curSerial != m_lastDeviceSerial) {
+            LOG_INFO("Poll", "Serial changed: '" + m_lastDeviceSerial + "' -> '" + curSerial + "'");
+            bool handledSerialChange = false;
+
+            // A paired transport disappeared. The existing TCP client can still
+            // report as running even when its ADB forward was tied to the removed
+            // USB device, so reconnect it immediately through the surviving path.
+            bool knownPartnerFlip =
+                (isWifiSerial(m_lastDeviceSerial) && curSerial == m_wifiToUsbSerial) ||
+                (!isWifiSerial(m_lastDeviceSerial) && curSerial == m_usbToWifiSerial);
+            if (!curSerial.empty() && !m_lastDeviceSerial.empty() &&
+                isWifiSerial(curSerial) != isWifiSerial(m_lastDeviceSerial) &&
+                knownPartnerFlip && m_device.isServerRunning()) {
+                if (isWifiSerial(curSerial)) {
+                    std::string wifiIp = curSerial.substr(0, curSerial.rfind(':'));
+                    LOG_INFO("Poll", "USB disconnected, failing over primary directly to " + curSerial);
+                    if (m_device.connectDirectForSerial(curSerial, wifiIp)) {
+                        m_slotSerial[0] = curSerial;
+                        m_statusMessage = "USB disconnected, continuing over WiFi";
+                        m_statusTime = std::chrono::steady_clock::now();
+                        m_lastDeviceSerial = curSerial;
+                        handledSerialChange = true;
+                    }
+                }
+                if (!handledSerialChange) {
+                    LOG_INFO("Poll", "USB/WiFi transport changed, reconnecting primary through " + curSerial);
+                    m_device.disconnectTcp();
+                }
+            }
+
+            if (!handledSerialChange && curSerial.empty() && !m_lastDeviceSerial.empty()) {
+                LOG_WARN("Poll", "Device disconnected");
+                m_wifiProbeAttempts = 0; // reset probe backoff for fast reconnect
+                m_device.disconnectTcp(); // immediately kill TCP so reconnect doesn't think server is still up
+                m_statusMessage = "Device disconnected";
+                m_statusTime = std::chrono::steady_clock::now();
+                m_androidStorageRoot.clear();
+                m_androidVolumes.clear();
+                m_slotStorageRoot[0].clear();
+                m_slotVolumes[0].clear();
+                m_slotConnected[0] = false;
+                forEachAndroidPanel([](FilePanel& p) {
+                    if (p.deviceSlot != 0) return;
+                    p.androidEntries.clear();
+                    p.selectedIndices.clear();
+                    p.currentPath = "/";
+                    strcpy_s(p.pathInput, "/");
+                });
+            } else if (!handledSerialChange && !curSerial.empty()) {
+                if (m_device.isServerRunning() && m_device.connectedSerial() == curSerial) {
+                    LOG_INFO("Poll", "Device " + curSerial + " already connected, skipping init");
+                    m_lastDeviceSerial = curSerial;
+                    handledSerialChange = true;
+                }
+                if (!handledSerialChange) {
+                    std::string model;
+                    {
+                        std::lock_guard<std::mutex> lk(m_deviceMutex);
+                        model = (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size())
+                            ? m_devices[m_selectedDevice].model : curSerial;
+                    }
+                    m_statusMessage = "Device detected: " + model + " - initializing...";
+                    m_statusTime = std::chrono::steady_clock::now();
+                    std::this_thread::sleep_for(std::chrono::seconds(1)); // brief settle
+                    if (m_shutdownPoll) return;
+                    // Don't restart server during active transfers - it kills existing connections
+                    if (isBatchActive()) {
+                        LOG_INFO("Poll", "Skipping onDeviceChanged - transfer active");
+                        m_lastDeviceSerial = curSerial;
+                    } else {
+                        LOG_INFO("Poll", "Calling onDeviceChanged()");
+                        onDeviceChanged();
+                    }
+                }
+            }
+            m_lastDeviceSerial = curSerial;
+        }
+
+        // Retry server connection if needed
+        if (!curSerial.empty() && !m_device.isServerRunning() && !isBatchActive() && !m_wifiTransitionActive) {
+            if (!isBatchActive()) {
+                LOG_INFO("Poll", "Device present but server not running - retrying");
+                m_statusMessage = "Retrying server connection...";
+                m_statusTime = std::chrono::steady_clock::now();
+                onDeviceChanged();
+            }
+        }
+
+        // Auto-connect secondary device slot when a new device appears
+        std::set<std::string> primarySerials;
+        if (!curSerial.empty()) {
+            addKnownPrimarySerials(primarySerials, curSerial);
+            if (curSerial == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
+                primarySerials.insert(m_usbToWifiSerial);
+            if (curSerial == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
+                primarySerials.insert(m_wifiToUsbSerial);
+        }
+        if (m_slotConnected[1] && primarySerials.count(m_slotSerial[1])) {
+            LOG_INFO("Poll", "Clearing slot 1 because it is another path to the primary device: " + m_slotSerial[1]);
+            m_deviceSlots[1].disconnectTcp();
+            m_slotConnected[1] = false;
+            m_slotSerial[1].clear();
+            m_slotStorageRoot[1].clear();
+            m_slotVolumes[1].clear();
+            forEachDevicePanel([&](FilePanel& p) {
+                if (p.deviceSlot == 1) {
+                    p.deviceSlot = 0;
+                    if (p.isAndroid) {
+                        p.currentPath = m_slotStorageRoot[0].empty() ? "/" : m_slotStorageRoot[0];
+                        strcpy_s(p.pathInput, p.currentPath.c_str());
+                    } else if (p.isApps) {
+                        p.appEntries.clear();
+                        p.selectedIndices.clear();
+                    }
+                    p.needsRefresh = true;
+                }
+            });
+        }
+        if (!curSerial.empty() && m_device.isServerRunning() && !m_slotConnected[1] && !isBatchActive()) {
+            std::string serial2;
+            {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+                for (int i = 0; i < (int)m_devices.size(); i++) {
+                    if (primarySerials.count(m_devices[i].serial)) continue; // skip primary device (any serial)
+                    if (m_devices[i].state != "device") continue;
+                    serial2 = m_devices[i].serial;
+                    break; // only one secondary
+                }
+            }
+            if (!serial2.empty() && serial2 == m_secondaryRetrySerial &&
+                std::chrono::steady_clock::now() < m_secondaryRetryAfter) {
+                serial2.clear();
+            }
+            if (!serial2.empty()) {
+                LOG_INFO("Poll", "Auto-connecting secondary device slot: " + serial2);
+                auto startSecondary = [&](const std::string& s) {
+                    bool root = m_prefs.rootEnabledForSerial(s);
+                    if (m_deviceSlots[1].startServer(s, true /*ADB forward*/, root)) return true;
+                    if (!root) return false;
+                    LOG_WARN("Poll", "Secondary root start failed, retrying without root: " + m_deviceSlots[1].lastError());
+                    m_prefs.setRootEnabledForSerial(s, false);
+                    m_prefs.save();
+                    return m_deviceSlots[1].startServer(s, true /*ADB forward*/, false);
+                };
+                if (startSecondary(serial2)) {
+                    m_slotSerial[1] = serial2;
+                    m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
+                    m_slotVolumes[1].clear();
+                    m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
+                    m_slotConnected[1] = true;
+                    m_secondaryRetrySerial.clear();
+                    LOG_INFO("Poll", "Secondary slot connected: " + serial2 + " storage: " + m_slotStorageRoot[1]);
+                    // Navigate any slot-1 panels
+                    forEachDevicePanel([&](FilePanel& p) {
+                        if (p.deviceSlot == 1) {
+                            if (p.isAndroid) {
+                                p.currentPath = m_slotStorageRoot[1];
+                                strcpy_s(p.pathInput, p.currentPath.c_str());
+                            } else if (p.isApps) {
+                                p.appEntries.clear();
+                                p.selectedIndices.clear();
+                            }
+                            p.needsRefresh = true;
+                        }
+                    });
+                } else {
+                    LOG_WARN("Poll", "Failed to start server on secondary: " + serial2 + ": " + m_deviceSlots[1].lastError());
+                    m_secondaryRetrySerial = serial2;
+                    m_secondaryRetryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+                }
+            }
+        }
+
+        // Disconnect secondary slot if that device went offline
+        if (m_slotConnected[1]) {
+            bool slot1Online = false;
+            std::string wifiFallbackSerial;
+            {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+                for (auto& d : m_devices) {
+                    if (d.serial == m_slotSerial[1] && d.state == "device") { slot1Online = true; break; }
+                }
+                if (!slot1Online) {
+                    for (const auto& saved : m_prefs.savedWifiDevices) {
+                        std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
+                        if (!saved.wifiIp.empty() && saved.serial == m_slotSerial[1]) {
+                            for (const auto& device : m_devices) {
+                                if (device.serial == wifiSerial && device.state == "device") {
+                                    wifiFallbackSerial = wifiSerial;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!wifiFallbackSerial.empty()) break;
+                    }
+                }
+            }
+            if (!slot1Online) {
+                if (!wifiFallbackSerial.empty()) {
+                    std::string wifiIp = wifiFallbackSerial.substr(0, wifiFallbackSerial.rfind(':'));
+                    LOG_INFO("Poll", "USB disconnected, failing over secondary directly to " + wifiFallbackSerial);
+                    if (m_deviceSlots[1].connectDirectForSerial(wifiFallbackSerial, wifiIp)) {
+                        m_slotSerial[1] = wifiFallbackSerial;
+                        m_statusMessage = "USB disconnected, secondary device continuing over WiFi";
+                        m_statusTime = std::chrono::steady_clock::now();
+                        slot1Online = true;
+                    }
+                }
+                if (!slot1Online) {
+                    LOG_INFO("Poll", "Secondary device disconnected: " + m_slotSerial[1]);
+                    m_slotConnected[1] = false;
+                    m_slotSerial[1].clear();
+                    m_slotStorageRoot[1].clear();
+                    m_slotVolumes[1].clear();
+                    // Move any slot-1 panels back to slot 0
+                    forEachDevicePanel([&](FilePanel& p) {
+                        if (p.deviceSlot == 1) {
+                            p.deviceSlot = 0;
+                            if (p.isAndroid) {
+                                p.currentPath = m_slotStorageRoot[0].empty() ? "/" : m_slotStorageRoot[0];
+                                strcpy_s(p.pathInput, p.currentPath.c_str());
+                            } else if (p.isApps) {
+                                p.appEntries.clear();
+                                p.selectedIndices.clear();
+                            }
+                            p.needsRefresh = true;
+                        }
+                    });
+                }
+            }
+        }
+
+        // Health check
+        if (m_device.isServerRunning() && !curSerial.empty() && !m_tetheringInProgress && !m_wifiTransitionActive) {
+            auto sinceLast = std::chrono::steady_clock::now() - m_lastTransferActivity;
+            bool cooldown = sinceLast < std::chrono::seconds(15);
+            if (!isBatchActive() && !cooldown) {
+                if (!m_device.verifyConnection()) {
+                    LOG_WARN("Poll", "Health check PING failed - server connection lost");
+                    m_statusMessage = "Server connection lost";
+                    m_statusTime = std::chrono::steady_clock::now();
+                    forEachAndroidPanel([](FilePanel& p) {
+                        if (p.deviceSlot != 0) return;
+                        p.androidEntries.clear();
+                        p.selectedIndices.clear();
+                        p.needsRefresh = true;
+                    });
+                } else {
+                    forEachAndroidPanel([](FilePanel& p) {
+                        if (p.deviceSlot == 0 && p.androidEntries.empty()) p.needsRefresh = true;
+                    });
+                }
+            }
+        }
+
+        if (m_slotConnected[1] && !isBatchActive() && !m_tetheringInProgress) {
+            auto sinceLast = std::chrono::steady_clock::now() - m_lastTransferActivity;
+            if (sinceLast >= std::chrono::seconds(15) && !m_deviceSlots[1].verifyConnection()) {
+                std::string secondarySerial = m_slotSerial[1];
+                LOG_WARN("Poll", "Secondary health check failed, reconnecting: " + secondarySerial);
+                m_deviceSlots[1].disconnectTcp();
+                bool secondaryStarted = false;
+                if (!secondarySerial.empty()) {
+                    bool root = m_prefs.rootEnabledForSerial(secondarySerial);
+                    secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, root);
+                    if (!secondaryStarted && root) {
+                        LOG_WARN("Poll", "Secondary root reconnect failed, retrying without root: " + m_deviceSlots[1].lastError());
+                        m_prefs.setRootEnabledForSerial(secondarySerial, false);
+                        m_prefs.save();
+                        secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, false);
+                    }
+                }
+                if (secondaryStarted) {
+                    m_slotSerial[1] = secondarySerial;
+                    m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
+                    m_slotVolumes[1].clear();
+                    m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
+                    m_slotConnected[1] = true;
+                    forEachAndroidPanel([&](FilePanel& p) {
+                        if (p.deviceSlot == 1) p.needsRefresh = true;
+                    });
+                    LOG_INFO("Poll", "Secondary slot reconnected: " + secondarySerial);
+                } else {
+                    m_secondaryRetrySerial = secondarySerial;
+                    m_secondaryRetryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+                    m_slotConnected[1] = false;
+                    m_slotSerial[1].clear();
+                    m_slotStorageRoot[1].clear();
+                    m_slotVolumes[1].clear();
+                    forEachAndroidPanel([&](FilePanel& p) {
+                        if (p.deviceSlot == 1) {
+                            p.androidEntries.clear();
+                            p.selectedIndices.clear();
+                            p.needsRefresh = true;
+                        }
+                    });
+                }
+            }
+        }
+
+        // Try to reconnect saved WiFi devices
+        if (!isBatchActive() && m_prefs.wifiAutoConnect) {
+            bool hasUsbDevice = !curSerial.empty() && !isWifiSerial(curSerial);
+            bool noDeviceAtAll = !m_device.isServerRunning();
+
+            for (auto& w : m_prefs.savedWifiDevices) {
+                if (!w.autoConnect || w.wifiIp.empty()) continue;
+                if (hasUsbDevice && w.serial != curSerial) continue;
+                if (!noDeviceAtAll && !hasUsbDevice) continue;
+                std::string connectAddr = w.wifiIp + ":" + std::to_string(w.port);
+
+                // Check if this WiFi device is online or offline
+                bool isOnline = false;
+                bool isOffline = false;
+                {
+                    std::lock_guard<std::mutex> lk(m_deviceMutex);
+                    for (auto& d : m_devices) {
+                        if (d.serial == connectAddr) {
+                            if (d.state == "device") isOnline = true;
+                            else isOffline = true; // "offline", "unauthorized", etc.
+                            break;
+                        }
+                    }
+                }
+
+                // If offline or not in list at all, try to reconnect
+                // Quick TCP probe first (1s timeout) to avoid 21s adb connect timeout
+                if (!isOnline) {
+                    SOCKET probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                    if (probe != INVALID_SOCKET) {
+                        unsigned long nonBlock = 1;
+                        ioctlsocket(probe, FIONBIO, &nonBlock);
+                        sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(w.port);
+                        inet_pton(AF_INET, w.wifiIp.c_str(), &addr.sin_addr);
+                        connect(probe, (sockaddr*)&addr, sizeof(addr));
+                        fd_set wset; FD_ZERO(&wset); FD_SET(probe, &wset);
+                        timeval tv = {1, 0}; // 1 second timeout
+                        int sel = select((int)probe + 1, nullptr, &wset, nullptr, &tv);
+                        closesocket(probe);
+                        if (sel <= 0) continue; // not reachable, skip adb connect
+                    }
+
+                    LOG_DEBUG("Poll", "WiFi device reachable, trying adb connect: " + connectAddr);
+                    std::string result = m_device.runAdbCommand("connect " + connectAddr);
+                    if (result.find("connected") != std::string::npos &&
+                        result.find("failed") == std::string::npos) {
+                        LOG_INFO("Poll", "WiFi device reconnected: " + connectAddr);
+                        m_statusMessage = "WiFi reconnected: " + w.wifiIp;
+                        m_statusTime = std::chrono::steady_clock::now();
+
+                        // Re-establish secondary channel if it was lost
+                        if (!m_dualChannelAvailable && m_device.isServerRunning()) {
+                            m_secondaryChannel.setAdbPath(m_device.getAdbPath());
+                            if (m_secondaryChannel.connectTcp(w.wifiIp, AFM_PORT) &&
+                                m_secondaryChannel.verifyConnection()) {
+                                m_dualChannelAvailable = true;
+                                m_secondaryChannelType = "WiFi";
+                                LOG_INFO("Poll", "Secondary WiFi channel re-established");
+                                m_statusMessage = "Dual channel restored: USB + WiFi";
+                                m_statusTime = std::chrono::steady_clock::now();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        m_pollBusy = false;
+    };
+
+    // Main loop: use track-devices for instant notifications, fallback to polling
+    while (!m_shutdownPoll) {
+        if (m_device.getAdbPath().empty()) {
+            if (m_device.findAdb()) {
+                m_deviceSlots[1].setAdbPath(m_device.getAdbPath());
+                m_statusMessage = "ADB ready - waiting for device...";
+                m_statusTime = std::chrono::steady_clock::now();
+                continue;
+            }
+            m_statusMessage = "ADB not found. Extract the full ZIP or install Android SDK Platform Tools.";
+            m_statusTime = std::chrono::steady_clock::now();
+            for (int i = 0; i < 50 && !m_shutdownPoll; i++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        // Try to open track-devices for instant device notifications
+        uintptr_t trackSock = m_device.openTrackDevices();
+
+        if (trackSock != (uintptr_t)(~(uintptr_t)0)) {
+            // track-devices connected — receive instant updates
+            LOG_INFO("Poll", "Using ADB track-devices (instant notifications)");
+
+            // Set a timeout on the tracking socket so we can periodically check for shutdown
+            // and run health checks
+            DWORD trackTimeout = 10000; // 10s — wake up periodically for health checks
+            setsockopt((SOCKET)trackSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&trackTimeout, sizeof(trackTimeout));
+
+            while (!m_shutdownPoll) {
+                auto devices = m_device.readTrackDevicesUpdate(trackSock);
+                int err = WSAGetLastError();
+                if (devices.empty() && (err == WSAETIMEDOUT || err == 0)) {
+                    // Timeout or empty device list — run health checks with current state
+                    std::string curSerial;
+                    {
+                        std::lock_guard<std::mutex> lk(m_deviceMutex);
+                        curSerial = (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size()
+                            && m_devices[m_selectedDevice].state == "device")
+                            ? m_devices[m_selectedDevice].serial : "";
+                    }
+                    // If err == 0, this was a real "all devices disconnected" event
+                    if (err == 0 && !m_lastDeviceSerial.empty()) {
+                        processDeviceUpdate({}); // process as empty device list
+                    }
+                    if (m_device.isServerRunning() && !curSerial.empty() && !m_tetheringInProgress && !m_wifiTransitionActive) {
+                        auto sinceLast = std::chrono::steady_clock::now() - m_lastTransferActivity;
+                        if (!isBatchActive() && sinceLast >= std::chrono::seconds(15)) {
+                            if (!m_device.verifyConnection()) {
+                                LOG_WARN("Poll", "Health check failed");
+                                m_statusMessage = "Server connection lost";
+                                m_statusTime = std::chrono::steady_clock::now();
+                                forEachAndroidPanel([](FilePanel& p) {
+                                    if (p.deviceSlot != 0) return;
+                                    p.androidEntries.clear();
+                                    p.selectedIndices.clear();
+                                    p.needsRefresh = true;
+                                });
+                            } else {
+                                forEachAndroidPanel([](FilePanel& p) {
+                                    if (p.deviceSlot == 0 && p.androidEntries.empty()) p.needsRefresh = true;
+                                });
+                            }
+                        }
+                    }
+                    if (m_slotConnected[1] && !isBatchActive() && !m_tetheringInProgress) {
+                        auto sinceLast = std::chrono::steady_clock::now() - m_lastTransferActivity;
+                        auto retryNow = std::chrono::steady_clock::now();
+                        bool secondaryBackoff = m_slotSerial[1] == m_secondaryRetrySerial &&
+                            retryNow < m_secondaryRetryAfter;
+                        if (!secondaryBackoff && sinceLast >= std::chrono::seconds(15) &&
+                            !m_deviceSlots[1].verifyConnection()) {
+                            std::string secondarySerial = m_slotSerial[1];
+                            LOG_WARN("Poll", "Secondary health check failed, reconnecting: " + secondarySerial);
+                            m_deviceSlots[1].disconnectTcp();
+                            bool secondaryStarted = false;
+                            if (!secondarySerial.empty()) {
+                                bool root = m_prefs.rootEnabledForSerial(secondarySerial);
+                                secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, root);
+                                if (!secondaryStarted && root) {
+                                    LOG_WARN("Poll", "Secondary root reconnect failed, retrying without root: " + m_deviceSlots[1].lastError());
+                                    m_prefs.setRootEnabledForSerial(secondarySerial, false);
+                                    m_prefs.save();
+                                    secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, false);
+                                }
+                            }
+                            if (secondaryStarted) {
+                                m_secondaryRetrySerial.clear();
+                                m_secondaryRetryAfter = {};
+                                m_slotSerial[1] = secondarySerial;
+                                m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
+                                m_slotVolumes[1].clear();
+                                m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
+                                m_slotConnected[1] = true;
+                                forEachAndroidPanel([&](FilePanel& p) {
+                                    if (p.deviceSlot == 1) p.needsRefresh = true;
+                                });
+                                LOG_INFO("Poll", "Secondary slot reconnected: " + secondarySerial);
+                            } else {
+                                m_secondaryRetrySerial = secondarySerial;
+                                m_secondaryRetryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+                                m_slotConnected[1] = false;
+                                m_slotSerial[1].clear();
+                                m_slotStorageRoot[1].clear();
+                                m_slotVolumes[1].clear();
+                                forEachAndroidPanel([&](FilePanel& p) {
+                                    if (p.deviceSlot == 1) {
+                                        p.androidEntries.clear();
+                                        p.selectedIndices.clear();
+                                        p.needsRefresh = true;
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    if (!curSerial.empty() && !m_device.isServerRunning() && !isBatchActive() && !m_wifiTransitionActive) {
+                        if (!isBatchActive()) {
+                            LOG_INFO("Poll", "Device present but server not running - retrying");
+                            m_statusMessage = "Retrying server connection...";
+                            m_statusTime = std::chrono::steady_clock::now();
+                            onDeviceChanged();
+                        }
+                    }
+
+                    // Probe saved WiFi devices on a backoff schedule
+                    // Schedule: every 5s for first 10 attempts, every 30s for next 20, every 5min after that
+                    if (!m_device.isServerRunning() && !isBatchActive()) {
+                        auto now = std::chrono::steady_clock::now();
+
+                        int intervalSec;
+                        if (m_wifiProbeAttempts < 10) intervalSec = 5;
+                        else if (m_wifiProbeAttempts < 30) intervalSec = 30;
+                        else intervalSec = 300;
+
+                        if (now - m_lastWifiProbeTime >= std::chrono::seconds(intervalSec)) {
+                            m_lastWifiProbeTime = now;
+                            bool anyAutoConnect = false;
+                            for (auto& w : m_prefs.savedWifiDevices) {
+                                if (!w.autoConnect || w.wifiIp.empty()) continue;
+                                anyAutoConnect = true;
+                                std::string connectAddr = w.wifiIp + ":" + std::to_string(w.port);
+
+                                // Quick TCP probe (1s timeout)
+                                bool reachable = false;
+                                SOCKET probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                                if (probe != INVALID_SOCKET) {
+                                    unsigned long nonBlock = 1;
+                                    ioctlsocket(probe, FIONBIO, &nonBlock);
+                                    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(w.port);
+                                    inet_pton(AF_INET, w.wifiIp.c_str(), &addr.sin_addr);
+                                    connect(probe, (sockaddr*)&addr, sizeof(addr));
+                                    fd_set wset; FD_ZERO(&wset); FD_SET(probe, &wset);
+                                    timeval tv = {1, 0};
+                                    int sel = select((int)probe + 1, nullptr, &wset, nullptr, &tv);
+                                    closesocket(probe);
+                                    reachable = (sel > 0);
+                                }
+
+                                if (reachable) {
+                                    LOG_INFO("Poll", "WiFi probe: " + connectAddr + " reachable, connecting...");
+                                    std::string result = m_device.runAdbCommand("connect " + connectAddr);
+                                    if (result.find("connected") != std::string::npos &&
+                                        result.find("failed") == std::string::npos) {
+                                        LOG_INFO("Poll", "WiFi auto-connect on launch: " + connectAddr);
+                                        m_statusMessage = "WiFi connected: " + (w.model.empty() ? connectAddr : w.model);
+                                        m_statusTime = std::chrono::steady_clock::now();
+                                        m_wifiProbeAttempts = 0; // reset on success
+                                        break; // connected, stop probing
+                                    }
+                                }
+                            }
+                            if (anyAutoConnect) {
+                                m_wifiProbeAttempts++;
+                                if (m_wifiProbeAttempts == 1)
+                                    LOG_INFO("Poll", "WiFi auto-connect: probing saved devices...");
+                                else if (m_wifiProbeAttempts == 10)
+                                    LOG_INFO("Poll", "WiFi auto-connect: slowing to 30s interval");
+                                else if (m_wifiProbeAttempts == 30)
+                                    LOG_INFO("Poll", "WiFi auto-connect: slowing to 5min interval");
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if (devices.empty()) {
+                    // Real connection error — fall out to reconnect
+                    LOG_WARN("Poll", "track-devices connection lost (WSA " + std::to_string(err) + ")");
+                    break;
+                }
+
+                // Got a real device update — debounce by checking if the device set actually changed
+                {
+                    // Build a sorted set of "device"-state serials to detect actual changes
+                    std::vector<std::string> onlineSerials;
+                    for (auto& d : devices)
+                        if (d.state == "device") onlineSerials.push_back(d.serial);
+                    std::sort(onlineSerials.begin(), onlineSerials.end());
+
+                    static std::vector<std::string> lastOnlineSerials;
+                    if (onlineSerials == lastOnlineSerials) {
+                        // Same set of devices — skip redundant processing
+                        continue;
+                    }
+                    lastOnlineSerials = onlineSerials;
+
+                    std::string firstSerial = onlineSerials.empty() ? "" : onlineSerials[0];
+                    LOG_INFO("Poll", "track-devices: " + std::to_string(devices.size()) + " device(s), active serial: '" + firstSerial + "'");
+                }
+                processDeviceUpdate(devices);
+            }
+
+            m_device.closeTrackDevices(trackSock);
+
+            if (m_shutdownPoll) return;
+            // Brief pause before reconnecting
+            for (int i = 0; i < 20 && !m_shutdownPoll; i++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        } else {
+            // track-devices failed — fallback to polling with getDevices()
+            LOG_WARN("Poll", "track-devices unavailable — falling back to polling");
+
+            for (int cycle = 0; cycle < 3 && !m_shutdownPoll; cycle++) {
+                for (int i = 0; i < 30 && !m_shutdownPoll; i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (m_shutdownPoll) return;
+
+                auto devices = m_device.getDevices();
+                processDeviceUpdate(devices);
+            }
+            // After a few poll cycles, try track-devices again
+        }
+    }
+}
+
+void App::onDeviceChanged() {
+    std::string serial;
+    {
+        std::lock_guard<std::mutex> lk(m_deviceMutex);
+        if (m_selectedDevice < 0 || m_selectedDevice >= (int)m_devices.size()) return;
+        serial = m_devices[m_selectedDevice].serial;
+    }
+    m_primaryReconnectActive = true;
+    struct ReconnectFlagReset {
+        std::atomic<bool>& flag;
+        ~ReconnectFlagReset() { flag = false; }
+    } reconnectFlagReset{m_primaryReconnectActive};
+    bool reconnectingSamePrimary = m_slotConnected[0] && m_slotSerial[0] == serial;
+
+    bool useRootForDevice = m_prefs.rootEnabledForSerial(serial);
+    // Start the TCP server on the device (status updates come from m_device.statusText())
+    if (!m_device.startServer(serial, m_preferAdbForward, useRootForDevice)) {
+        LOG_ERROR("Poll", "startServer failed: " + m_device.lastError());
+        if (useRootForDevice) {
+            std::string rootError = m_device.lastError();
+            m_prefs.setRootEnabledForSerial(serial, false);
+            m_prefs.save();
+            LOG_WARN("Poll", "Root start failed, retrying without root: " + rootError);
+            if (!m_device.startServer(serial, m_preferAdbForward, false)) {
+                std::string msg = "Root access failed for this device, and the normal connection also failed.\n\n"
+                    "Check that the device is rooted, grant ADB root access in Magisk, KernelSU, or your root manager, then reconnect the device.\n\n"
+                    "Root details: " + rootError + "\n\n"
+                    "Reconnect details: " + m_device.lastError();
+                showNotification("Root Connection Failed", msg, true);
+                m_statusMessage = "Root failed and normal reconnect failed. Check root access for this device. " + m_device.lastError();
+                m_statusTime = std::chrono::steady_clock::now();
+                return;
+            }
+            std::string msg = "Root access was not available or was denied for this device.\n\n"
+                "Fast Enough connected without root and turned off Root for this device only. Check your root manager and grant ADB root access before enabling Root again.\n\n"
+                "Details: " + rootError;
+            showNotification("Connected Without Root", msg, true);
+            m_statusMessage = "Root not available or not granted. Connected without root.";
+        } else {
+            m_statusMessage = "Server failed: " + m_device.lastError();
+            m_statusTime = std::chrono::steady_clock::now();
+            return;
+        }
+    }
+    LOG_INFO("Poll", "startServer succeeded");
+
+    std::string connMode = m_device.isDirectConnection()
+        ? ("Direct TCP @ " + m_device.deviceIp()) : "ADB Forward";
+    if (m_statusMessage.empty() || m_statusMessage.find("Root not available") == std::string::npos)
+        m_statusMessage = "Connected via " + connMode + " - detecting storage...";
+    m_statusTime = std::chrono::steady_clock::now();
+
+    // Detect storage root via TCP server
+    m_slotStorageRoot[0] = m_device.detectStoragePath();
+    m_androidStorageRoot = m_slotStorageRoot[0];
+    m_slotVolumes[0].clear();
+    m_slotVolumes[0].push_back(m_slotStorageRoot[0]);
+    m_androidVolumes = m_slotVolumes[0];
+
+    // Track slot 0 — if the new primary was previously in slot 1, clear slot 1
+    std::string oldSlot1Serial;
+    if (m_slotConnected[1] && m_slotSerial[1] == serial) {
+        LOG_INFO("Poll", "New primary was in slot 1, clearing slot 1");
+        m_slotConnected[1] = false;
+        oldSlot1Serial.clear(); // it's now the primary, no need to reassign
+        m_slotSerial[1].clear();
+        m_slotStorageRoot[1].clear();
+        m_slotVolumes[1].clear();
+    }
+    // Remember old slot 0 serial so we can move it to slot 1
+    std::string oldSlot0Serial;
+    if (m_slotConnected[0] && m_slotSerial[0] != serial)
+        oldSlot0Serial = m_slotSerial[0];
+
+    m_slotSerial[0] = serial;
+    m_slotConnected[0] = true;
+
+    // Preserve panel navigation when reconnecting the same primary device.
+    // A transport retry must not throw healthy panels back to the storage root.
+    forEachDevicePanel([&](FilePanel& p) {
+        if ((p.deviceSlot < 0 || p.deviceSlot >= 2 || !m_slotConnected[p.deviceSlot]) && m_slotConnected[0]) {
+            p.deviceSlot = 0;
+            p.navHistory.clear();
+            p.navHistoryPos = -1;
+        }
+        if (p.deviceSlot == 0) {
+            if (!reconnectingSamePrimary) {
+                if (p.isAndroid) {
+                    p.currentPath = m_androidStorageRoot;
+                    strcpy_s(p.pathInput, p.currentPath.c_str());
+                } else if (p.isApps) {
+                    p.appEntries.clear();
+                    p.selectedIndices.clear();
+                }
+            }
+            p.needsRefresh = true;
+        }
+    });
+
+    // Try to connect a second device if available. Keep ADB/server work outside
+    // m_deviceMutex so the UI can keep drawing device selectors while detection runs.
+    std::set<std::string> primarySerials;
+    addKnownPrimarySerials(primarySerials, serial);
+    if (serial == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
+        primarySerials.insert(m_usbToWifiSerial);
+    if (serial == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
+        primarySerials.insert(m_wifiToUsbSerial);
+
+    if (m_slotConnected[1] && primarySerials.count(m_slotSerial[1])) {
+        LOG_INFO("Poll", "Clearing slot 1 because it is another path to the new primary device: " + m_slotSerial[1]);
+        m_deviceSlots[1].disconnectTcp();
+        m_slotConnected[1] = false;
+        m_slotSerial[1].clear();
+        m_slotStorageRoot[1].clear();
+        m_slotVolumes[1].clear();
+    }
+
+    std::string candidateSerial;
+    {
+        std::lock_guard<std::mutex> lk(m_deviceMutex);
+        // Prefer reassigning the old primary to slot 1 if it's still online
+        if (!oldSlot0Serial.empty() && !primarySerials.count(oldSlot0Serial)) {
+            for (auto& d : m_devices) {
+                if (d.serial == oldSlot0Serial && d.state == "device") {
+                    candidateSerial = oldSlot0Serial;
+                    break;
+                }
+            }
+        }
+        // Otherwise find any other online device
+        if (candidateSerial.empty()) {
+            for (int di = 0; di < (int)m_devices.size(); di++) {
+                if (primarySerials.count(m_devices[di].serial)) continue;
+                if (m_devices[di].state != "device") continue;
+                candidateSerial = m_devices[di].serial;
+                break;
+            }
+        }
+    }
+
+    auto candidateRetryNow = std::chrono::steady_clock::now();
+    bool candidateBackoff = candidateSerial == m_secondaryRetrySerial &&
+        candidateRetryNow < m_secondaryRetryAfter;
+    if (!candidateSerial.empty() && !candidateBackoff &&
+        (!m_slotConnected[1] || m_slotSerial[1] != candidateSerial)) {
+        LOG_INFO("Poll", "Starting server on second device: " + candidateSerial);
+        bool candidateStarted = false;
+        bool candidateRoot = m_prefs.rootEnabledForSerial(candidateSerial);
+        candidateStarted = m_deviceSlots[1].startServer(candidateSerial, true /*ADB forward*/, candidateRoot);
+        if (!candidateStarted && candidateRoot) {
+            LOG_WARN("Poll", "Second device root start failed, retrying without root: " + m_deviceSlots[1].lastError());
+            m_prefs.setRootEnabledForSerial(candidateSerial, false);
+            m_prefs.save();
+            candidateStarted = m_deviceSlots[1].startServer(candidateSerial, true /*ADB forward*/, false);
+        }
+        if (candidateStarted) {
+            m_secondaryRetrySerial.clear();
+            m_secondaryRetryAfter = {};
+            m_slotSerial[1] = candidateSerial;
+            m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
+            m_slotVolumes[1].clear();
+            m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
+            m_slotConnected[1] = true;
+            LOG_INFO("Poll", "Second device connected: " + candidateSerial + " storage: " + m_slotStorageRoot[1]);
+
+            // Navigate slot-1 Android panels
+            forEachDevicePanel([&](FilePanel& p) {
+                if (p.deviceSlot == 1) {
+                    if (p.isAndroid) {
+                        p.currentPath = m_slotStorageRoot[1];
+                        strcpy_s(p.pathInput, p.currentPath.c_str());
+                    } else if (p.isApps) {
+                        p.appEntries.clear();
+                        p.selectedIndices.clear();
+                    }
+                    p.needsRefresh = true;
+                }
+            });
+        } else {
+            m_secondaryRetrySerial = candidateSerial;
+            m_secondaryRetryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+            LOG_WARN("Poll", "Failed to start server on " + candidateSerial + ": " + m_deviceSlots[1].lastError());
+        }
+    }
+
+    // Reset the previous channel state before WiFi auto-connect begins. The
+    // asynchronous connection must not be cleared after it succeeds.
+    m_dualChannelAvailable = false;
+    m_secondaryChannelType.clear();
+    m_extraChannels.clear();
+    m_activeChannelCount = 1; // primary always exists
+
+    // Auto-connect WiFi for saved devices (enables dual-channel automatically)
+    tryAutoWifiConnect(serial);
+
+    // Establish parallel transfer channels based on pipe count settings
+
+    // Detect WiFi IP — from wlan0 query, or from WiFi serial
+    std::string wifiIp;
+    bool primaryIsWifi = isWifiSerial(serial);
+    if (primaryIsWifi) {
+        // Extract IP from WiFi serial (192.168.x.x:5555 → 192.168.x.x)
+        auto colon = serial.rfind(':');
+        if (colon != std::string::npos) wifiIp = serial.substr(0, colon);
+    } else {
+        // USB connected — try to detect WiFi IP for dual-link
+        std::string wlanOut = m_device.runAdbCommand("-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+        auto inetPos = wlanOut.find("inet ");
+        if (inetPos != std::string::npos) {
+            auto start = inetPos + 5;
+            auto slash = wlanOut.find('/', start);
+            if (slash != std::string::npos) wifiIp = wlanOut.substr(start, slash - start);
+        }
+    }
+
+    // Helpers for creating channels
+    int nextPort = AFM_PORT + 2; // 5742, 5743, ...
+    auto makeAdbPipe = [&](DeviceClient& ch) -> bool {
+        ch.setAdbPath(m_device.getAdbPath());
+        ch.setLocalPort(nextPort);
+        std::string fwd = m_device.runAdbCommand("-s " + serial + " forward tcp:" +
+            std::to_string(nextPort) + " tcp:" + std::to_string(AFM_PORT));
+        if (fwd.find("error") != std::string::npos) return false;
+        bool ok = ch.connectTcp("127.0.0.1", nextPort) && ch.verifyConnection();
+        nextPort++;
+        return ok;
+    };
+    auto makeWifiDirectPipe = [&](DeviceClient& ch) -> bool {
+        if (wifiIp.empty()) return false;
+        ch.setAdbPath(m_device.getAdbPath());
+        return ch.connectTcp(wifiIp, AFM_PORT) && ch.verifyConnection();
+    };
+
+    // Determine what pipes to create based on connection type and settings
+    // USB primary: USB dual-pipe uses ADB forward, WiFi pipes use direct TCP
+    // WiFi primary: WiFi dual-pipe uses direct TCP, USB pipes only if USB serial exists
+    auto devicePipes = m_prefs.pipePreferencesFor(serial);
+    if (primaryIsWifi) {
+        // WiFi-connected device: create WiFi direct pipes for dual
+        int wifiPipes = devicePipes.wifiPipeCount;
+        if (wifiPipes >= 2) {
+            m_secondaryChannel.disconnectTcp();
+            if (makeWifiDirectPipe(m_secondaryChannel)) {
+                m_dualChannelAvailable = true;
+                m_secondaryChannelType = "WiFi";
+                m_activeChannelCount = 2;
+                LOG_INFO("Poll", "Channel 2: WiFi (Direct) — dual WiFi pipe");
+            }
+        }
+    } else {
+        // USB-connected device: prefer WiFi for secondary (true dual-link), else USB dual-pipe
+        bool hasWifi = !wifiIp.empty();
+        if (hasWifi && devicePipes.wifiPipeCount >= 1) {
+            m_secondaryChannel.disconnectTcp();
+            if (makeWifiDirectPipe(m_secondaryChannel)) {
+                m_dualChannelAvailable = true;
+                m_secondaryChannelType = "WiFi";
+                m_activeChannelCount = 2;
+                LOG_INFO("Poll", "Channel 2: WiFi (Direct)");
+            }
+        }
+        if (!m_dualChannelAvailable && devicePipes.usbPipeCount >= 2) {
+            m_secondaryChannel.disconnectTcp();
+            if (makeAdbPipe(m_secondaryChannel)) {
+                m_dualChannelAvailable = true;
+                m_secondaryChannelType = "USB";
+                m_activeChannelCount = 2;
+                LOG_INFO("Poll", "Channel 2: USB (ADB forward port " + std::to_string(nextPort - 1) + ")");
+            }
+        }
+    }
+
+    // Extra channels (3rd, 4th) for dual-pipe combinations
+    if (m_dualChannelAvailable) {
+        // Extra USB ADB pipe (only useful for USB-connected devices)
+        if (!primaryIsWifi && devicePipes.usbPipeCount >= 2 && m_secondaryChannelType == "WiFi") {
+            auto ch = std::make_unique<DeviceClient>();
+            if (makeAdbPipe(*ch)) {
+                LOG_INFO("Poll", "Channel " + std::to_string(m_activeChannelCount + 1) + ": USB (ADB forward)");
+                m_extraChannels.push_back({std::move(ch), true});
+                m_activeChannelCount++;
+            }
+        }
+        // Extra WiFi direct pipe (when wifiPipeCount=2 and secondary is already WiFi)
+        if (!wifiIp.empty() && devicePipes.wifiPipeCount >= 2) {
+            auto ch = std::make_unique<DeviceClient>();
+            if (makeWifiDirectPipe(*ch)) {
+                LOG_INFO("Poll", "Channel " + std::to_string(m_activeChannelCount + 1) + ": WiFi (Direct)");
+                m_extraChannels.push_back({std::move(ch), false});
+                m_activeChannelCount++;
+            }
+        }
+    }
+
+    if (m_activeChannelCount > 1) {
+        std::string desc;
+        if (m_secondaryChannelType == "USB" && m_extraChannels.empty())
+            desc = "USB (dual)";
+        else if (wifiIp.empty())
+            desc = "USB (" + std::to_string(m_activeChannelCount) + " pipes)";
+        else
+            desc = std::to_string(m_activeChannelCount) + " channels (USB + WiFi)";
+        LOG_INFO("Poll", "Multi-channel ready: " + desc);
+    }
+
+    std::string channelInfo;
+    if (m_activeChannelCount >= 4)
+        channelInfo = " | " + std::to_string(m_activeChannelCount) + " channels";
+    else if (m_activeChannelCount >= 2)
+        channelInfo = m_dualChannelAvailable ? (" + " + m_secondaryChannelType) : "";
+    m_statusMessage = "Ready | " + connMode + channelInfo + " | Storage: " + m_androidStorageRoot;
+    m_statusTime = std::chrono::steady_clock::now();
+}
+
+// Recursively add directory contents for pull (Android → Windows)
+static void addPullDirRecursive(DeviceClient& dev, const std::string& srcDir, const std::string& dstDir,
+                                 std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
+    auto entries = dev.listDirectory(srcDir);
+    for (auto& e : entries) {
+        BatchFileItem sub;
+        sub.displayName = e.name;
+        sub.isDirectory = e.isDirectory();
+        sub.fileSize = e.size;
+        sub.sourcePath = srcDir + "/" + e.name;
+        sub.destPath = dstDir + "\\" + e.name;
+        totalBytes += sub.fileSize;
+        items.push_back(sub);
+        if (sub.isDirectory)
+            addPullDirRecursive(dev, sub.sourcePath, sub.destPath, items, totalBytes);
+    }
+}
+
+// Recursively add directory contents for push (Windows → Android)
+static void addPushDirRecursive(const std::string& srcDir, const std::string& dstDir,
+                                 std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
+    std::error_code iterEc;
+    std::filesystem::directory_iterator it(toFsPath(srcDir), std::filesystem::directory_options::skip_permission_denied, iterEc);
+    if (iterEc) return;
+    for (const auto end = std::filesystem::directory_iterator(); it != end; it.increment(iterEc)) {
+        if (iterEc) { iterEc.clear(); continue; }
+        auto& entry = *it;
+        BatchFileItem sub;
+        sub.displayName = pathToUtf8(entry.path().filename());
+        std::error_code ec;
+        sub.isDirectory = entry.is_directory(ec);
+        if (ec) sub.isDirectory = false;
+        sub.sourcePath = pathToUtf8(entry.path());
+        sub.destPath = dstDir + "/" + sub.displayName;
+        if (!sub.isDirectory) {
+            sub.fileSize = (uint64_t)entry.file_size(ec);
+            if (ec) sub.fileSize = 0;
+        }
+        totalBytes += sub.fileSize;
+        items.push_back(sub);
+        if (sub.isDirectory)
+            addPushDirRecursive(sub.sourcePath, sub.destPath, items, totalBytes);
+    }
+}
+
+static void buildBatchItems(FilePanel& srcPanel, FilePanel& dstPanel, bool isPull,
+                            std::vector<BatchFileItem>& items, uint64_t& totalBytes,
+                            DeviceClient* dev = nullptr) {
+    for (int idx : srcPanel.selectedIndices) {
+        if (!srcPanel.validIndex(idx)) continue;
+        BatchFileItem item;
+        item.displayName = srcPanel.entryName(idx);
+        item.isDirectory = srcPanel.entryIsDir(idx);
+        item.fileSize = srcPanel.entrySize(idx);
+
+        // MCRAW virtual item
+        if (srcPanel.insideMcraw) {
+            item.isMcrawVirtual = true;
+            item.mcrawPath = srcPanel.mcrawFilePath;
+            item.virtualName = item.displayName;
+            item.isDirectory = false;
+            if (isPull) {
+                item.sourcePath = srcPanel.mcrawFilePath;
+                std::string lp = dstPanel.currentPath;
+                appendPathSeparator(lp, '\\'); lp += item.displayName;
+                item.destPath = lp;
+            } else {
+                item.sourcePath = srcPanel.mcrawFilePath;
+                std::string rp = dstPanel.currentPath;
+                appendPathSeparator(rp, '/'); rp += item.displayName;
+                item.destPath = rp;
+            }
+            totalBytes += item.fileSize;
+            items.push_back(std::move(item));
+            continue;
+        }
+
+        if (isPull) {
+            std::string rp = srcPanel.currentPath;
+            appendPathSeparator(rp, '/'); rp += item.displayName;
+            item.sourcePath = rp;
+            std::string lp = dstPanel.currentPath;
+            appendPathSeparator(lp, '\\'); lp += item.displayName;
+            item.destPath = lp;
+        } else {
+            std::string lp = srcPanel.currentPath;
+            appendPathSeparator(lp, '\\'); lp += item.displayName;
+            item.sourcePath = lp;
+            std::string rp = dstPanel.currentPath;
+            appendPathSeparator(rp, '/'); rp += item.displayName;
+            item.destPath = rp;
+            if (!item.isDirectory) {
+                try { uint64_t ls = (uint64_t)std::filesystem::file_size(toFsPath(lp)); if (ls > 0) item.fileSize = ls; } catch (...) {}
+            }
+        }
+        totalBytes += item.fileSize;
+        items.push_back(item);
+
+        // Recursively add directory contents
+        if (item.isDirectory && dev) {
+            if (isPull)
+                addPullDirRecursive(*dev, item.sourcePath, item.destPath, items, totalBytes);
+            else
+                addPushDirRecursive(item.sourcePath, item.destPath, items, totalBytes);
+        }
+    }
+}
+
+// Build batch items for cross-device Android-to-Android transfer
+static void addCrossDeviceDirRecursive(DeviceClient& srcDev, const std::string& srcDir, const std::string& dstDir,
+                                        std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
+    auto entries = srcDev.listDirectory(srcDir);
+    for (auto& e : entries) {
+        BatchFileItem sub;
+        sub.displayName = e.name;
+        sub.isDirectory = e.isDirectory();
+        sub.fileSize = e.size;
+        sub.sourcePath = srcDir + "/" + e.name;
+        sub.destPath = dstDir + "/" + e.name;
+        totalBytes += sub.fileSize;
+        items.push_back(sub);
+        if (sub.isDirectory)
+            addCrossDeviceDirRecursive(srcDev, sub.sourcePath, sub.destPath, items, totalBytes);
+    }
+}
+
+static void buildCrossDeviceBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
+                                        std::vector<BatchFileItem>& items, uint64_t& totalBytes,
+                                        DeviceClient* srcDev = nullptr) {
+    for (int idx : srcPanel.selectedIndices) {
+        if (!srcPanel.validIndex(idx)) continue;
+        BatchFileItem item;
+        item.displayName = srcPanel.entryName(idx);
+        item.isDirectory = srcPanel.entryIsDir(idx);
+        item.fileSize = srcPanel.entrySize(idx);
+
+        // Both source and dest are Android — use forward slashes
+        std::string sp = srcPanel.currentPath;
+        appendPathSeparator(sp, '/'); sp += item.displayName;
+        item.sourcePath = sp;
+
+        std::string dp = dstPanel.currentPath;
+        appendPathSeparator(dp, '/'); dp += item.displayName;
+        item.destPath = dp;
+
+        totalBytes += item.fileSize;
+        items.push_back(item);
+
+        if (item.isDirectory && srcDev)
+            addCrossDeviceDirRecursive(*srcDev, item.sourcePath, item.destPath, items, totalBytes);
+    }
+}
+
+// Recursively add local directory contents
+static void addLocalDirRecursive(const std::string& srcDir, const std::string& dstDir,
+                                  std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
+    std::error_code iterEc;
+    std::filesystem::directory_iterator it(toFsPath(srcDir), std::filesystem::directory_options::skip_permission_denied, iterEc);
+    if (iterEc) return;
+    for (const auto end = std::filesystem::directory_iterator(); it != end; it.increment(iterEc)) {
+        if (iterEc) { iterEc.clear(); continue; }
+        auto& entry = *it;
+        BatchFileItem sub;
+        sub.displayName = pathToUtf8(entry.path().filename());
+        std::error_code ec;
+        sub.isDirectory = entry.is_directory(ec);
+        if (ec) sub.isDirectory = false;
+        sub.sourcePath = pathToUtf8(entry.path());
+        sub.destPath = dstDir + "\\" + sub.displayName;
+        if (!sub.isDirectory) {
+            sub.fileSize = (uint64_t)entry.file_size(ec);
+            if (ec) sub.fileSize = 0;
+        }
+        totalBytes += sub.fileSize;
+        items.push_back(sub);
+        if (sub.isDirectory)
+            addLocalDirRecursive(sub.sourcePath, sub.destPath, items, totalBytes);
+    }
+}
+
+static void buildLocalBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
+                                  std::vector<BatchFileItem>& items, uint64_t& totalBytes) {
+    for (int idx : srcPanel.selectedIndices) {
+        if (!srcPanel.validIndex(idx)) continue;
+        BatchFileItem item;
+        item.displayName = srcPanel.entryName(idx);
+        item.isDirectory = srcPanel.entryIsDir(idx);
+        item.fileSize = srcPanel.entrySize(idx);
+
+        std::string sp = srcPanel.currentPath;
+        appendPathSeparator(sp, '\\'); sp += item.displayName;
+        item.sourcePath = sp;
+
+        std::string dp = dstPanel.currentPath;
+        appendPathSeparator(dp, '\\'); dp += item.displayName;
+        item.destPath = dp;
+
+        if (!item.isDirectory) {
+            try { uint64_t s = (uint64_t)std::filesystem::file_size(toFsPath(sp)); if (s > 0) item.fileSize = s; } catch (...) {}
+        }
+        totalBytes += item.fileSize;
+        items.push_back(item);
+
+        if (item.isDirectory)
+            addLocalDirRecursive(item.sourcePath, item.destPath, items, totalBytes);
+    }
+}
+
+void App::startTransfer(bool pullFromAndroid) {
+    if (m_leftPanel.isConnections || m_rightPanel.isConnections) {
+        m_statusMessage = "Choose a file view in both panes before starting a transfer";
+        m_statusTime = std::chrono::steady_clock::now();
+        return;
+    }
+    if (m_leftPanel.isApps || m_rightPanel.isApps) {
+        m_statusMessage = "App panels are for install and uninstall only";
+        m_statusTime = std::chrono::steady_clock::now();
+        return;
+    }
+
+    // Determine source and destination panels based on their modes
+    FilePanel* srcPtr = nullptr;
+    FilePanel* dstPtr = nullptr;
+    bool localCopy = false;
+
+    bool bothWindows = !m_leftPanel.isAndroid && !m_rightPanel.isAndroid;
+    bool bothAndroid = m_leftPanel.isAndroid && m_rightPanel.isAndroid;
+
+    if (bothWindows) {
+        // Windows-to-Windows: use focused panel as source, other as destination
+        srcPtr = (m_lastFocusedPanel == &m_rightPanel) ? &m_rightPanel : &m_leftPanel;
+        dstPtr = (srcPtr == &m_leftPanel) ? &m_rightPanel : &m_leftPanel;
+        localCopy = true;
+    } else if (bothAndroid) {
+        // Android-to-Android: need two different devices
+        if (m_leftPanel.deviceSlot == m_rightPanel.deviceSlot) {
+            m_statusMessage = "Both panels are on the same device — use different devices";
+            m_statusTime = std::chrono::steady_clock::now();
+            return;
+        }
+        srcPtr = (m_lastFocusedPanel == &m_rightPanel) ? &m_rightPanel : &m_leftPanel;
+        dstPtr = (srcPtr == &m_leftPanel) ? &m_rightPanel : &m_leftPanel;
+    } else {
+        // Mixed: need device
+        {
+            std::lock_guard<std::mutex> lk(m_deviceMutex);
+            if (m_selectedDevice < 0 || m_devices.empty()) return;
+        }
+        if (pullFromAndroid) {
+            srcPtr = m_leftPanel.isAndroid ? &m_leftPanel : &m_rightPanel;
+            dstPtr = !m_leftPanel.isAndroid ? &m_leftPanel : &m_rightPanel;
+        } else {
+            srcPtr = !m_leftPanel.isAndroid ? &m_leftPanel : &m_rightPanel;
+            dstPtr = m_leftPanel.isAndroid ? &m_leftPanel : &m_rightPanel;
+        }
+    }
+
+    FilePanel& src = *srcPtr;
+    FilePanel& dst = *dstPtr;
+    if (src.selectedIndices.empty()) {
+        m_statusMessage = "No files selected for transfer";
+        m_statusTime = std::chrono::steady_clock::now();
+        return;
+    }
+
+    auto batch = std::make_shared<TransferBatch>();
+    batch->isLocalCopy = localCopy;
+    batch->srcDeviceSlot = src.deviceSlot;
+    batch->dstDeviceSlot = dst.deviceSlot;
+
+    // Cross-device Android-to-Android
+    if (bothAndroid && src.deviceSlot != dst.deviceSlot) {
+        batch->isCrossDevice = true;
+        batch->isPull = false;
+    } else {
+        batch->isPull = !localCopy && pullFromAndroid;
+    }
+    const FilePanel& transferDevicePanel = src.isAndroid ? src : dst;
+    auto transferPipes = m_prefs.pipePreferencesFor(m_slotSerial[transferDevicePanel.deviceSlot & 1]);
+    batch->useParallelChannels = !localCopy &&
+        (transferPipes.usbPipeCount > 1 || transferPipes.wifiPipeCount > 1);
+
+    uint64_t total = 0;
+    if (localCopy)
+        buildLocalBatchItems(src, dst, batch->files, total);
+    else if (batch->isCrossDevice)
+        buildCrossDeviceBatchItems(src, dst, batch->files, total, &deviceFor(src));
+    else
+        buildBatchItems(src, dst, batch->isPull, batch->files, total, &deviceFor(src));
+    batch->totalBytes = total;
+
+    if (batch->files.empty()) return;
+
+    if (batch->isLocalCopy) {
+        // Same drive → auto-move (instant rename), cross-drive → ask copy/move
+        bool sameDrive = false;
+        if (!batch->files.empty()) {
+            auto& s = batch->files[0].sourcePath;
+            auto& d = batch->files[0].destPath;
+            if (s.size() >= 2 && d.size() >= 2)
+                sameDrive = (toupper(s[0]) == toupper(d[0]) && s[1] == ':' && d[1] == ':');
+        }
+        if (sameDrive) {
+            batch->isMove = true;
+            std::lock_guard<std::mutex> lk(m_batchMutex);
+            m_batchQueue.push_back(batch);
+            m_batchCV.notify_one();
+            m_overlayWasOpen = false;
+        } else {
+            m_pendingBatch = batch;
+            m_showCopyMoveDialog = true;
+        }
+    } else if (batch->isCrossDevice) {
+        m_pendingBatch = batch;
+        m_showCrossDeviceDialog = true;
+    } else {
+        std::lock_guard<std::mutex> lk(m_batchMutex);
+        m_batchQueue.push_back(batch);
+        m_batchCV.notify_one();
+        m_overlayWasOpen = false;
+    }
+}
+
+void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mouseX, int mouseY) {
+    if (paths.empty()) return;
+
+    // Determine which panel the drop landed on
+    float mx = (float)mouseX, my = (float)mouseY;
+    FilePanel* target = nullptr;
+    if (mx >= m_leftPanelMin.x && mx <= m_leftPanelMax.x &&
+        my >= m_leftPanelMin.y && my <= m_leftPanelMax.y) {
+        target = &m_leftPanel;
+    } else if (mx >= m_rightPanelMin.x && mx <= m_rightPanelMax.x &&
+               my >= m_rightPanelMin.y && my <= m_rightPanelMax.y) {
+        target = &m_rightPanel;
+    }
+
+    if (!target) {
+        m_statusMessage = "Drop outside panel area";
+        m_statusTime = std::chrono::steady_clock::now();
+        return;
+    }
+
+    // Build batch items from dropped paths
+    auto batch = std::make_shared<TransferBatch>();
+    uint64_t total = 0;
+    if (target->isAndroid) {
+        batch->dstDeviceSlot = target->deviceSlot;
+        auto transferPipes = m_prefs.pipePreferencesFor(m_slotSerial[target->deviceSlot & 1]);
+        batch->useParallelChannels = transferPipes.usbPipeCount > 1 || transferPipes.wifiPipeCount > 1;
+    }
+
+    for (auto& srcPath : paths) {
+        BatchFileItem item;
+        auto p = toFsPath(srcPath);
+        item.displayName = pathToUtf8(p.filename());
+        item.sourcePath = srcPath;
+        std::error_code ec;
+        item.isDirectory = std::filesystem::is_directory(p, ec);
+        if (ec) item.isDirectory = false;
+
+        if (target->isAndroid) {
+            // Explorer → Android: push
+            std::string rp = target->currentPath;
+            appendPathSeparator(rp, '/');
+            rp += item.displayName;
+            item.destPath = rp;
+            batch->isPull = false;
+        } else {
+            // Explorer → Windows panel: local copy
+            std::string dp = target->currentPath;
+            appendPathSeparator(dp, '\\');
+            dp += item.displayName;
+            item.destPath = dp;
+            batch->isLocalCopy = true;
+        }
+
+        if (!item.isDirectory) {
+            item.fileSize = (uint64_t)std::filesystem::file_size(p, ec);
+            if (ec) item.fileSize = 0;
+        }
+        total += item.fileSize;
+        bool isDir = item.isDirectory;
+        std::string dirSource = item.sourcePath;
+        std::string dirDest = item.destPath;
+        batch->files.push_back(std::move(item));
+        if (isDir) {
+            if (target->isAndroid)
+                addPushDirRecursive(dirSource, dirDest, batch->files, total);
+            else
+                addLocalDirRecursive(dirSource, dirDest, batch->files, total);
+        }
+    }
+
+    batch->totalBytes = total;
+    if (batch->files.empty()) return;
+
+    if (!batch->isLocalCopy) {
+        std::lock_guard<std::mutex> lk(m_deviceMutex);
+        if (m_selectedDevice < 0 || m_devices.empty()) {
+            m_statusMessage = "No device connected for transfer";
+            m_statusTime = std::chrono::steady_clock::now();
+            return;
+        }
+    }
+
+    if (batch->isLocalCopy) {
+        bool sameDrive = false;
+        if (!batch->files.empty()) {
+            auto& s = batch->files[0].sourcePath;
+            auto& d = batch->files[0].destPath;
+            if (s.size() >= 2 && d.size() >= 2)
+                sameDrive = (toupper(s[0]) == toupper(d[0]) && s[1] == ':' && d[1] == ':');
+        }
+        if (sameDrive) {
+            batch->isMove = true;
+            std::lock_guard<std::mutex> lk(m_batchMutex);
+            m_batchQueue.push_back(batch);
+            m_batchCV.notify_one();
+            m_overlayWasOpen = false;
+        } else {
+            m_pendingBatch = batch;
+            m_showCopyMoveDialog = true;
+        }
+    } else {
+        std::lock_guard<std::mutex> lk(m_batchMutex);
+        m_batchQueue.push_back(batch);
+        m_batchCV.notify_one();
+        m_overlayWasOpen = false;
+    }
+}
+
+void App::startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel) {
+    if (srcPanel.selectedIndices.empty()) return;
+    if (srcPanel.isConnections || dstPanel.isConnections) return;
+    if (srcPanel.isApps || dstPanel.isApps) {
+        m_statusMessage = "App panels are for install and uninstall only";
+        m_statusTime = std::chrono::steady_clock::now();
+        return;
+    }
+
+    bool localCopy = !srcPanel.isAndroid && !dstPanel.isAndroid;
+    bool isPull = srcPanel.isAndroid;
+
+    if (!localCopy) {
+        std::lock_guard<std::mutex> lk(m_deviceMutex);
+        if (m_selectedDevice < 0 || m_devices.empty()) return;
+    }
+
+    auto batch = std::make_shared<TransferBatch>();
+    batch->isLocalCopy = localCopy;
+    batch->srcDeviceSlot = srcPanel.deviceSlot;
+    batch->dstDeviceSlot = dstPanel.deviceSlot;
+
+    // Cross-device Android-to-Android via drag
+    bool crossDevice = srcPanel.isAndroid && dstPanel.isAndroid && srcPanel.deviceSlot != dstPanel.deviceSlot;
+    if (crossDevice) {
+        batch->isCrossDevice = true;
+        batch->isPull = false;
+    } else {
+        batch->isPull = !localCopy && isPull;
+    }
+    const FilePanel& transferDevicePanel = srcPanel.isAndroid ? srcPanel : dstPanel;
+    auto transferPipes = m_prefs.pipePreferencesFor(m_slotSerial[transferDevicePanel.deviceSlot & 1]);
+    batch->useParallelChannels = !localCopy &&
+        (transferPipes.usbPipeCount > 1 || transferPipes.wifiPipeCount > 1);
+
+    uint64_t total = 0;
+    if (localCopy)
+        buildLocalBatchItems(srcPanel, dstPanel, batch->files, total);
+    else if (crossDevice)
+        buildCrossDeviceBatchItems(srcPanel, dstPanel, batch->files, total, &deviceFor(srcPanel));
+    else
+        buildBatchItems(srcPanel, dstPanel, isPull, batch->files, total, &deviceFor(srcPanel));
+    batch->totalBytes = total;
+
+    if (batch->files.empty()) return;
+
+    if (batch->isLocalCopy) {
+        bool sameDrive = false;
+        if (!batch->files.empty()) {
+            auto& s = batch->files[0].sourcePath;
+            auto& d = batch->files[0].destPath;
+            if (s.size() >= 2 && d.size() >= 2)
+                sameDrive = (toupper(s[0]) == toupper(d[0]) && s[1] == ':' && d[1] == ':');
+        }
+        if (sameDrive) {
+            batch->isMove = true;
+            std::lock_guard<std::mutex> lk(m_batchMutex);
+            m_batchQueue.push_back(batch);
+            m_batchCV.notify_one();
+            m_overlayWasOpen = false;
+        } else {
+            m_pendingBatch = batch;
+            m_showCopyMoveDialog = true;
+        }
+    } else if (batch->isCrossDevice) {
+        m_pendingBatch = batch;
+        m_showCrossDeviceDialog = true;
+    } else {
+        std::lock_guard<std::mutex> lk(m_batchMutex);
+        m_batchQueue.push_back(batch);
+        m_batchCV.notify_one();
+        m_overlayWasOpen = false;
+    }
+}
+
+void App::processBatchQueue() {
+    // Lower thread priority so transfers don't starve UI and other apps
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    // Set low I/O priority so disk reads don't evict other apps' cache
+    THREAD_POWER_THROTTLING_STATE throttle{};
+    throttle.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    throttle.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    throttle.StateMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttle, sizeof(throttle));
+
+    while (!m_shutdownTransfer) {
+        std::shared_ptr<TransferBatch> batch;
+        {
+            std::unique_lock<std::mutex> lk(m_batchMutex);
+            m_batchCV.wait(lk, [&]() {
+                if (m_shutdownTransfer) return true;
+                for (auto& b : m_batchQueue)
+                    if (b->state.load() == BatchState::Queued) return true;
+                return false;
+            });
+            if (m_shutdownTransfer) return;
+            for (auto& b : m_batchQueue) {
+                if (b->state.load() == BatchState::Queued) { batch = b; break; }
+            }
+            while (m_batchQueue.size() > 10) {
+                BatchState s = m_batchQueue.front()->state.load();
+                if (s == BatchState::Completed || s == BatchState::Failed || s == BatchState::Stopped)
+                    m_batchQueue.pop_front();
+                else break;
+            }
+        }
+        if (!batch) continue;
+
+        // Single-device transfers use whichever panel is Android:
+        // pulls read from the Android source slot, pushes write to the Android destination slot.
+        int batchDeviceSlot = batch->isPull ? batch->srcDeviceSlot : batch->dstDeviceSlot;
+        DeviceClient& batchDev = m_deviceSlots[batchDeviceSlot & 1];
+
+        if (!batch->isLocalCopy && !batch->isCrossDevice && !batchDev.isServerRunning()) {
+            batch->state = BatchState::Failed;
+            batch->errorMessage = "Server not connected";
+            continue;
+        }
+
+        // Remember the original device serial for reconnection safety
+        std::string originalSerial = batch->isLocalCopy ? "" : batchDev.connectedSerial();
+
+        batch->state = BatchState::Running;
+        batch->startTime = std::chrono::steady_clock::now();
+
+        auto logBatchPerformance = [&](const std::string& mode, double seconds, double avgSpeed) {
+            if (seconds < 0.1) seconds = 0.1;
+            std::string direction;
+            if (batch->isLocalCopy)
+                direction = "PC to PC";
+            else if (batch->isCrossDevice)
+                direction = "Android to Android";
+            else if (batch->isPull)
+                direction = "Android to PC";
+            else
+                direction = "PC to Android";
+
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(2);
+            oss << "Transfer complete: direction=" << direction
+                << ", mode=" << mode
+                << ", files=" << batch->totalFiles()
+                << ", bytes=" << batch->totalTransferred.load()
+                << " (" << formatSize(batch->totalTransferred.load()) << ")"
+                << ", duration=" << seconds << "s"
+                << ", avg=" << formatSpeed(avgSpeed)
+                << ", channels=" << batch->numChannels;
+            if (batch->skippedFiles > 0)
+                oss << ", skipped=" << batch->skippedFiles;
+            LOG_INFO("Perf", oss.str());
+
+            if (batch->numChannels > 1) {
+                int nCh = std::min(batch->numChannels, (int)TransferBatch::MAX_CHANNELS);
+                for (int ch = 0; ch < nCh; ch++) {
+                    auto& cp = batch->channels[ch];
+                    uint64_t bytes = cp.bytesTransferred.load();
+                    if (bytes == 0 && cp.filesCompleted.load() == 0) continue;
+                    double chSec = cp.elapsedSec.load();
+                    if (chSec < 0.1) chSec = seconds;
+                    if (chSec < 0.1) chSec = 0.1;
+                    LOG_INFO("Perf", "  channel " + std::to_string(ch + 1) + "/" + std::to_string(nCh) +
+                        " " + cp.channelName + ": blocks=" + std::to_string(cp.filesCompleted.load()) +
+                        ", bytes=" + std::to_string(bytes) + " (" + formatSize(bytes) + ")" +
+                        ", duration=" + std::to_string(chSec) + "s" +
+                        ", avg=" + formatSpeed((double)bytes / chSec) +
+                        (cp.relayReadSec.load() > 0 || cp.relaySendSec.load() > 0
+                            ? ", srcRecv=" + std::to_string(cp.relayReadSec.load()) + "s" +
+                              ", dstSend=" + std::to_string(cp.relaySendSec.load()) + "s"
+                            : ""));
+                }
+            }
+        };
+
+        // --- Multi-NIC channel setup ---
+        bool useMultiNic = false;
+        std::vector<DeviceClient*> multiNicDevPtrs;
+        std::vector<std::string> multiNicBindIps;
+        std::vector<std::string> multiNicNames;
+        std::string multiNicDeviceIp;
+
+        if (m_prefs.enableMultiNic && !batch->isLocalCopy && !batch->isCrossDevice) {
+            std::vector<NicBinding> activeNics;
+            for (auto& nb : m_prefs.multiNicBindings)
+                if (nb.enabled) activeNics.push_back(nb);
+
+            if (activeNics.size() >= 2) {
+                // Find the device's WiFi IP from any available source
+                multiNicDeviceIp = batchDev.isDirectConnection() ? batchDev.deviceIp() : "";
+                if (multiNicDeviceIp.empty()) {
+                    // Try ADB to get wlan0 IP
+                    std::string serial = batchDev.connectedSerial();
+                    std::string wlanOut = m_device.runAdbCommand(
+                        "-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+                    auto inetPos = wlanOut.find("inet ");
+                    if (inetPos != std::string::npos) {
+                        auto start = inetPos + 5;
+                        auto slash = wlanOut.find('/', start);
+                        if (slash != std::string::npos)
+                            multiNicDeviceIp = wlanOut.substr(start, slash - start);
+                    }
+                    // Fallback: saved WiFi devices
+                    if (multiNicDeviceIp.empty()) {
+                        for (auto& w : m_prefs.savedWifiDevices) {
+                            if (w.serial == serial && !w.wifiIp.empty()) {
+                                multiNicDeviceIp = w.wifiIp;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!multiNicDeviceIp.empty()) {
+                    // Detect USB tethering IP to label USB channels correctly
+                    std::string usbTetheringIp;
+                    {
+                        std::string serial = batchDev.connectedSerial();
+                        usbTetheringIp = batchDev.detectDeviceIp(serial);
+                    }
+
+                    m_nicChannels.clear();
+                    m_nicLocalIps.clear();
+                    for (int i = 0; i < (int)activeNics.size(); i++) {
+                        auto ch = std::make_unique<DeviceClient>();
+                        if (ch->connectTcp(multiNicDeviceIp, AFM_PORT, activeNics[i].localIp) &&
+                            ch->verifyConnection()) {
+                            multiNicDevPtrs.push_back(ch.get());
+                            multiNicBindIps.push_back(activeNics[i].localIp);
+                            // Label USB tethering adapters as "USB" (same /24 subnet as tethering IP)
+                            std::string name = activeNics[i].adapterName;
+                            if (!usbTetheringIp.empty()) {
+                                auto lastDot1 = usbTetheringIp.rfind('.');
+                                auto lastDot2 = activeNics[i].localIp.rfind('.');
+                                if (lastDot1 != std::string::npos && lastDot2 != std::string::npos &&
+                                    usbTetheringIp.substr(0, lastDot1) == activeNics[i].localIp.substr(0, lastDot2))
+                                    name = "USB";
+                            }
+                            multiNicNames.push_back(name);
+                            m_nicChannels.push_back(std::move(ch));
+                            LOG_INFO("MultiNIC", "Channel " + std::to_string(i) + " via " +
+                                     name + " (" + activeNics[i].localIp + ")");
+                        } else {
+                            LOG_WARN("MultiNIC", "Channel failed via " + activeNics[i].adapterName +
+                                     " (" + activeNics[i].localIp + "): " + ch->lastError());
+                        }
+                    }
+                    if ((int)multiNicDevPtrs.size() >= 2) {
+                        useMultiNic = true;
+                        batch->useMultiNic = true;
+                        batch->numChannels = (int)multiNicDevPtrs.size();
+                        LOG_INFO("MultiNIC", std::to_string(multiNicDevPtrs.size()) + " channels ready");
+                    } else {
+                        for (auto& ch : m_nicChannels) ch->disconnectTcp();
+                        m_nicChannels.clear();
+                        m_nicLocalIps.clear();
+                        LOG_WARN("MultiNIC", "Not enough channels connected, falling back");
+                    }
+                }
+            }
+        }
+
+        // --- Parallel transfer (dual-channel or multi-NIC) ---
+        struct RuntimeChannel {
+            DeviceClient* dev = nullptr;
+            std::unique_ptr<DeviceClient> owned;
+            std::string name;
+            std::string reconnectIp;
+            bool preferUsb = false;
+        };
+        std::vector<RuntimeChannel> runtimeChannels;
+        std::string batchWifiIp;
+        std::string batchUsbSerial;
+        std::string batchHwSerial;
+
+        if (batch->useParallelChannels && !batch->isLocalCopy && !batch->isCrossDevice && !useMultiNic) {
+            std::string batchSerial = batchDev.connectedSerial();
+            bool primaryIsUsb = !batchSerial.empty() && !isWifiSerial(batchSerial);
+            if (primaryIsUsb) batchUsbSerial = batchSerial;
+            if (isWifiSerial(batchSerial)) {
+                auto colon = batchSerial.rfind(':');
+                if (colon != std::string::npos) batchWifiIp = batchSerial.substr(0, colon);
+            }
+
+            if (!batchSerial.empty()) {
+                std::string hwOut = batchDev.runAdbCommand("-s " + batchSerial + " shell getprop ro.serialno");
+                while (lastCharOr(hwOut) == '\n' || lastCharOr(hwOut) == '\r' || lastCharOr(hwOut) == ' ')
+                    hwOut.pop_back();
+                batchHwSerial = hwOut;
+            }
+            auto transferPipes = m_prefs.pipePreferencesFor(batchSerial);
+
+            if (batchWifiIp.empty() && !batchSerial.empty()) {
+                std::string wlanOut = batchDev.runAdbCommand("-s " + batchSerial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+                auto inetPos = wlanOut.find("inet ");
+                if (inetPos != std::string::npos) {
+                    auto start = inetPos + 5;
+                    auto slash = wlanOut.find('/', start);
+                    if (slash != std::string::npos)
+                        batchWifiIp = wlanOut.substr(start, slash - start);
+                }
+            }
+            if (batchWifiIp.empty()) {
+                for (auto& w : m_prefs.savedWifiDevices) {
+                    std::string wifiSerial = w.wifiIp + ":" + std::to_string(w.port);
+                    if (!w.wifiIp.empty() && (w.serial == batchSerial || wifiSerial == batchSerial)) {
+                        batchWifiIp = w.wifiIp;
+                        break;
+                    }
+                }
+            }
+
+            if (batchUsbSerial.empty() && !batchHwSerial.empty()) {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+                for (auto& d : m_devices) {
+                    if (d.state != "device" || isWifiSerial(d.serial)) continue;
+                    std::string hw = batchDev.runAdbCommand("-s " + d.serial + " shell getprop ro.serialno");
+                    while (lastCharOr(hw) == '\n' || lastCharOr(hw) == '\r' || lastCharOr(hw) == ' ')
+                        hw.pop_back();
+                    if (hw == batchHwSerial) {
+                        batchUsbSerial = d.serial;
+                        break;
+                    }
+                }
+            }
+
+            RuntimeChannel primary;
+            primary.dev = &batchDev;
+            primary.name = primaryIsUsb ? "USB (ADB)" : (batchDev.isDirectConnection() ? "WiFi (Direct)" : "WiFi (ADB)");
+            primary.reconnectIp = batchWifiIp;
+            primary.preferUsb = primaryIsUsb;
+            runtimeChannels.push_back(std::move(primary));
+
+            int usbChannels = primaryIsUsb ? 1 : 0;
+            int wifiChannels = primaryIsUsb ? 0 : 1;
+            int nextPort = 5840 + (batchDeviceSlot & 1) * 20;
+
+            auto addUsbChannel = [&]() -> bool {
+                if (batchUsbSerial.empty()) return false;
+                for (int attempt = 0; attempt < 32; attempt++) {
+                    auto ch = std::make_unique<DeviceClient>();
+                    ch->setAdbPath(batchDev.getAdbPath());
+                    ch->setLocalPort(nextPort++);
+                    int localPort = ch->localPort();
+                    std::string fwd = batchDev.runAdbCommand("-s " + batchUsbSerial + " forward tcp:" +
+                        std::to_string(localPort) + " tcp:" + std::to_string(AFM_PORT));
+                    if (fwd.find("offline") != std::string::npos)
+                        return false;
+                    if (fwd.find("error") != std::string::npos) {
+                        LOG_WARN("Transfer", "USB forward port " + std::to_string(localPort) +
+                            " failed, trying next port");
+                        continue;
+                    }
+                    if (!ch->connectTcp("127.0.0.1", localPort) || !ch->verifyConnection()) {
+                        LOG_WARN("Transfer", "USB forward port " + std::to_string(localPort) +
+                            " connected but did not verify, trying next port");
+                        continue;
+                    }
+                    RuntimeChannel rc;
+                    rc.dev = ch.get();
+                    rc.owned = std::move(ch);
+                    rc.name = "USB (ADB)";
+                    rc.reconnectIp = batchWifiIp;
+                    rc.preferUsb = true;
+                    runtimeChannels.push_back(std::move(rc));
+                    usbChannels++;
+                    return true;
+                }
+                return false;
+            };
+
+            auto addWifiChannel = [&]() -> bool {
+                if (batchWifiIp.empty()) return false;
+                auto ch = std::make_unique<DeviceClient>();
+                ch->setAdbPath(batchDev.getAdbPath());
+                ch->setLocalPort(nextPort++);
+                if (!ch->connectTcp(batchWifiIp, AFM_PORT) || !ch->verifyConnection())
+                    return false;
+                RuntimeChannel rc;
+                rc.dev = ch.get();
+                rc.owned = std::move(ch);
+                rc.name = "WiFi (Direct)";
+                rc.reconnectIp = batchWifiIp;
+                rc.preferUsb = false;
+                runtimeChannels.push_back(std::move(rc));
+                wifiChannels++;
+                return true;
+            };
+
+            while (usbChannels < transferPipes.usbPipeCount && runtimeChannels.size() < TransferBatch::MAX_CHANNELS)
+                if (!addUsbChannel()) break;
+            while (wifiChannels < transferPipes.wifiPipeCount && runtimeChannels.size() < TransferBatch::MAX_CHANNELS)
+                if (!addWifiChannel()) break;
+
+            if (runtimeChannels.size() > 1) {
+                batch->numChannels = (int)runtimeChannels.size();
+                LOG_INFO("Transfer", "Prepared " + std::to_string(runtimeChannels.size()) +
+                    " channels for slot " + std::to_string(batchDeviceSlot));
+            }
+        }
+
+        bool doDualChannel = batch->useParallelChannels && runtimeChannels.size() > 1 && !useMultiNic;
+        if (!doDualChannel && !useMultiNic)
+            batch->useParallelChannels = false;
+        if ((doDualChannel || useMultiNic) && !batch->isLocalCopy &&
+            !batch->isCrossDevice && batch->totalFiles() >= 1) {
+            LOG_INFO("Transfer", useMultiNic ?
+                "Starting multi-NIC parallel transfer (" + std::to_string(batch->numChannels) +
+                " channels, " + std::to_string(batch->totalFiles()) + " files)" :
+                "Starting parallel dual-channel transfer (" +
+                std::to_string(batch->totalFiles()) + " files)");
+
+            auto parallelStart = std::chrono::steady_clock::now();
+
+            // Setup per-channel names
+            if (useMultiNic) {
+                for (int i = 0; i < (int)multiNicDevPtrs.size(); i++)
+                    batch->channels[i].channelName = multiNicNames[i];
+            } else {
+                for (int i = 0; i < (int)runtimeChannels.size(); i++)
+                    batch->channels[i].channelName = runtimeChannels[i].name;
+            }
+
+            // === Work-stealing block queue for file distribution ===
+            // Small files (<200MB): go into a shared whole-file queue
+            // Large files (>=200MB): split into 200MB blocks, go into a shared block queue
+            // Both channels pull from the queue — faster channel naturally gets more work
+
+            // Queue large logical ranges to keep scheduling overhead low. Workers
+            // split those ranges at assignment time using their observed speed, so
+            // fast links receive larger slices and slow links do not own huge ranges.
+            static const uint64_t MB = 1024ULL * 1024;
+            auto largeBlockSizeFor = [](uint64_t fileSize) -> uint64_t {
+                const uint64_t MB = 1024ULL * 1024;
+                const uint64_t GB = 1024ULL * MB;
+                if (fileSize >= 10 * GB) return 2 * GB;
+                if (fileSize >= 2 * GB)  return 1 * GB;
+                if (fileSize >= 500 * MB) return 500 * MB;
+                return 200 * MB;
+            };
+            auto tailBlockSizeFor = [](uint64_t fileSize) -> uint64_t {
+                const uint64_t MB = 1024ULL * 1024;
+                const uint64_t GB = 1024ULL * MB;
+                if (fileSize >= 2 * GB) return 256 * MB;
+                return 200 * MB;
+            };
+            auto blockSizeFor = [&](uint64_t fileSize, uint64_t remaining, int channels) -> uint64_t {
+                uint64_t largeBlock = largeBlockSizeFor(fileSize);
+                uint64_t tailBlock = tailBlockSizeFor(fileSize);
+                uint64_t tailWindow = largeBlock * (uint64_t)std::max(2, channels * 2);
+                return remaining > tailWindow ? largeBlock : tailBlock;
+            };
+            auto assignmentSliceFor = [&](uint64_t fileSize, uint64_t available, double channelSpeed) -> uint64_t {
+                const uint64_t MB = 1024ULL * 1024;
+                const uint64_t minSlice = 64 * MB;
+                const uint64_t probeSlice = 128 * MB;
+                const uint64_t align = 16 * MB;
+                uint64_t maxSlice = largeBlockSizeFor(fileSize);
+                double targetSec = 2.0;
+                uint64_t desired = probeSlice;
+                if (channelSpeed > 4.0 * (double)MB)
+                    desired = (uint64_t)(channelSpeed * targetSec);
+                desired = std::max(minSlice, std::min(desired, maxSlice));
+                desired = (desired / align) * align;
+                if (desired < minSlice) desired = minSlice;
+                return std::min(available, desired);
+            };
+
+            struct WorkBlock {
+                int fileIndex;
+                uint64_t offset;    // byte offset within file (0 for whole files)
+                uint64_t length;    // bytes to transfer (fileSize for whole files)
+                bool isWholeFile;   // true = use pullFile, false = use readRangeStreaming
+                int blockId;        // sequential ID for CRC ordering
+                int retries = 0;    // how many times this block has been requeued after failure
+            };
+
+            // --- File conflict check for parallel transfers ---
+            for (int fi = 0; fi < batch->totalFiles() && !m_shutdownTransfer; fi++) {
+                if (batch->stopRequested.load()) break;
+                auto& item = batch->files[fi];
+                if (item.isDirectory) continue;
+
+                bool destExists = false;
+                if (batch->isPull) {
+                    destExists = std::filesystem::exists(toFsPath(item.destPath));
+                } else {
+                    DeviceClient& destDev = batchDev;
+                    uint64_t remoteSize = destDev.getFileSize(item.destPath);
+                    destExists = (remoteSize > 0);
+                }
+
+                if (destExists) {
+                    ConflictAction action = batch->conflictAllDecision;
+                    if (action == ConflictAction::None) {
+                        batch->conflictFileName = item.displayName;
+                        batch->waitingConflict = true;
+                        batch->conflictResponse = ConflictAction::None;
+                        batch->state = BatchState::WaitingConflict;
+                        {
+                            std::unique_lock<std::mutex> lk(m_batchMutex);
+                            m_batchCV.wait(lk, [&]() {
+                                return m_shutdownTransfer || batch->stopRequested.load() ||
+                                       batch->conflictResponse.load() != ConflictAction::None;
+                            });
+                        }
+                        batch->waitingConflict = false;
+                        action = batch->conflictResponse.load();
+                        batch->conflictResponse = ConflictAction::None;
+                        batch->state = BatchState::Running;
+
+                        if (action == ConflictAction::OverwriteAll) {
+                            batch->conflictAllDecision = ConflictAction::OverwriteAll;
+                            action = ConflictAction::Overwrite;
+                        } else if (action == ConflictAction::SkipAll) {
+                            batch->conflictAllDecision = ConflictAction::SkipAll;
+                            action = ConflictAction::Skip;
+                        }
+                    } else {
+                        if (action == ConflictAction::OverwriteAll) action = ConflictAction::Overwrite;
+                        else if (action == ConflictAction::SkipAll) action = ConflictAction::Skip;
+                    }
+
+                    if (batch->stopRequested.load() || m_shutdownTransfer) break;
+
+                    if (action == ConflictAction::Skip) {
+                        batch->skippedFiles++;
+                        // Remove this file from the batch so it's not queued
+                        item.fileSize = 0;
+                        item.isDirectory = true; // mark as dir so workers skip it
+                        continue;
+                    }
+                }
+            }
+            if (batch->stopRequested.load()) { batch->state = BatchState::Stopped; continue; }
+
+            // Recalculate total after skips
+            { uint64_t newTotal = 0; for (auto& f : batch->files) newTotal += f.fileSize; batch->totalBytes = newTotal; }
+
+            // Build the work queue
+            std::deque<WorkBlock> workQueue;
+            std::mutex workMutex;
+            int blockIdCounter = 0;
+
+            // Track per-file block completion for partial cleanup on cancel
+            std::vector<int> totalBlocksPerFile(batch->totalFiles(), 0);
+            std::vector<int> completedBlocksPerFile(batch->totalFiles(), 0);
+            std::vector<uint64_t> completedBytesPerFile(batch->totalFiles(), 0);
+            std::set<int> completedFileIndices;
+
+            // Pre-create output files for split files (both channels write via OVERLAPPED)
+            struct SplitFileHandle {
+                int fileIndex;
+                HANDLE handle;
+                uint64_t fileSize;
+            };
+            std::vector<SplitFileHandle> splitHandles;
+
+            // Track CRC per block for combining later
+            struct BlockCrc {
+                int blockId;
+                uint64_t offset;
+                uint32_t crc;
+                uint64_t length;
+                int fileIndex;
+            };
+            std::vector<BlockCrc> allBlockCrcs;
+            std::mutex crcMutex;
+
+            // Store inline CRCs for whole-file pulls (each pullFile overwrites the previous,
+            // so we capture them per-file for use during verification)
+            std::unordered_map<std::string, uint32_t> wholeFileCrcs;  // destPath -> CRC
+
+            int schedulingChannels = useMultiNic ? batch->numChannels : (int)runtimeChannels.size();
+            schedulingChannels = std::max(1, schedulingChannels);
+            for (int i = 0; i < batch->totalFiles(); i++) {
+                auto& item = batch->files[i];
+                if (item.isDirectory) {
+                    // Directories: just create, no transfer
+                    workQueue.push_back({i, 0, 0, true, blockIdCounter++});
+                    totalBlocksPerFile[i] = 1;
+                } else if (item.fileSize < 200 * MB) {
+                    // Small files: transfer as whole file (pushFile/pullFile streaming)
+                    workQueue.push_back({i, 0, item.fileSize, true, blockIdCounter++});
+                    totalBlocksPerFile[i] = 1;
+                } else {
+                    // Large file: split into blocks (size scales with file size)
+                    uint64_t remaining = item.fileSize;
+                    uint64_t offset = 0;
+                    int blockCount = 0;
+                    while (remaining > 0) {
+                        uint64_t blkSize = blockSizeFor(item.fileSize, remaining, schedulingChannels);
+                        uint64_t blockLen = std::min(remaining, blkSize);
+                        workQueue.push_back({i, offset, blockLen, false, blockIdCounter++});
+                        offset += blockLen;
+                        remaining -= blockLen;
+                        blockCount++;
+                    }
+                    totalBlocksPerFile[i] = blockCount;
+                    if (batch->isPull) {
+                        // Ensure parent directory exists before creating the split file
+                        // (directory batch items haven't been processed by workers yet)
+                        try { std::filesystem::create_directories(std::filesystem::path(toFsPath(item.destPath)).parent_path()); } catch (...) {}
+                        // Pre-create local output file
+                        HANDLE h = CreateFileW(toWide(item.destPath).c_str(), GENERIC_WRITE, FILE_SHARE_WRITE, nullptr,
+                                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                        if (h != INVALID_HANDLE_VALUE) {
+                            LARGE_INTEGER li; li.QuadPart = (LONGLONG)item.fileSize;
+                            SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
+                            SetEndOfFile(h);
+                            splitHandles.push_back({i, h, item.fileSize});
+                        }
+                    } else {
+                        // Pre-create remote file on device with pre-allocation
+                        batchDev.createFile(item.destPath, item.fileSize);
+                        splitHandles.push_back({i, INVALID_HANDLE_VALUE, item.fileSize});
+                    }
+                    LOG_INFO("Transfer", "Splitting " + item.displayName + " (" + formatSize(item.fileSize) +
+                             ") into " + std::to_string(blockCount) + " adaptive blocks");
+                }
+            }
+
+            bool hasDirectoryItems = false;
+            for (auto& item : batch->files) {
+                if (item.isDirectory) {
+                    hasDirectoryItems = true;
+                    break;
+                }
+            }
+            if (!hasDirectoryItems && batch->totalFiles() > 1 && workQueue.size() > 1) {
+                std::vector<std::deque<WorkBlock>> byFile(batch->totalFiles());
+                for (auto& block : workQueue) {
+                    if (block.fileIndex >= 0 && block.fileIndex < (int)byFile.size())
+                        byFile[block.fileIndex].push_back(block);
+                }
+
+                std::deque<WorkBlock> interleaved;
+                bool added = true;
+                while (added) {
+                    added = false;
+                    for (auto& blocks : byFile) {
+                        if (blocks.empty()) continue;
+                        interleaved.push_back(blocks.front());
+                        blocks.pop_front();
+                        added = true;
+                    }
+                }
+                if (interleaved.size() == workQueue.size()) {
+                    workQueue.swap(interleaved);
+                    LOG_INFO("Transfer", "Interleaved " + std::to_string(batch->totalFiles()) +
+                        " files across " + std::to_string(workQueue.size()) + " work blocks");
+                }
+            }
+
+            int totalBlocks = (int)workQueue.size();
+            int numCh = useMultiNic ? batch->numChannels : (int)runtimeChannels.size();
+            uint64_t perChBytes = batch->totalBytes.load() / numCh;
+            for (int c = 0; c < numCh; c++) {
+                batch->channels[c].totalBytes = perChBytes;
+                batch->channels[c].filesAssigned = (c == 0) ? totalBlocks : 0;
+            }
+
+            // Worker: pull blocks from shared queue (work-stealing)
+            // Store WiFi IP for reconnection (secondary channel has no serial set)
+            // Use the IP that was actually used for the secondary channel, not a saved one
+            std::string secondaryWifiIp;
+            {
+                secondaryWifiIp = batchWifiIp;
+                // Extract IP from the actual secondary connection
+                // The secondary channel was established to the WiFi IP of the current device
+                std::string serial = batchDev.connectedSerial();
+                // Try to get WiFi IP from the current device
+                if (secondaryWifiIp.empty() && !serial.empty()) {
+                    std::string wlanOut = m_device.runAdbCommand("-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+                    auto inetPos = wlanOut.find("inet ");
+                    if (inetPos != std::string::npos) {
+                        auto start = inetPos + 5;
+                        auto slash = wlanOut.find('/', start);
+                        if (slash != std::string::npos)
+                            secondaryWifiIp = wlanOut.substr(start, slash - start);
+                    }
+                }
+                // Fallback: extract from the saved device matching this serial
+                if (secondaryWifiIp.empty()) {
+                    for (auto& w : m_prefs.savedWifiDevices) {
+                        std::string wifiSerial = w.wifiIp + ":" + std::to_string(w.port);
+                        if (!w.wifiIp.empty() && (w.serial == serial || wifiSerial == serial)) {
+                            secondaryWifiIp = w.wifiIp;
+                            break;
+                        }
+                    }
+                }
+                if (!secondaryWifiIp.empty())
+                    LOG_INFO("Transfer", "Secondary WiFi reconnect IP: " + secondaryWifiIp);
+            }
+
+            // Capture the device's hardware serial (ro.serialno) so reconnect can verify
+            // it's the same device, not a different one that also has a server running
+            std::string deviceHwSerial;
+            {
+                std::string serial = batchDev.connectedSerial();
+                if (serial.empty()) {
+                    // Try any available serial for the query
+                    std::string devList = m_device.runAdbCommand("devices");
+                    std::istringstream diss(devList);
+                    std::string dline;
+                    while (std::getline(diss, dline))
+                        if (dline.find("\tdevice") != std::string::npos) {
+                            auto tab = dline.find('\t');
+                            if (tab != std::string::npos) { serial = dline.substr(0, tab); break; }
+                        }
+                }
+                if (!serial.empty()) {
+                    std::string hwOut = m_device.runAdbCommand("-s " + serial + " shell getprop ro.serialno");
+                    // Trim whitespace
+                    while (lastCharOr(hwOut) == '\n' || lastCharOr(hwOut) == '\r' || lastCharOr(hwOut) == ' ')
+                        hwOut.pop_back();
+                    deviceHwSerial = hwOut;
+                    LOG_INFO("Transfer", "Device hardware serial: " + deviceHwSerial);
+                }
+            }
+
+            // (usbChannelCount removed — each channel independently restores its preferred transport)
+
+            std::mutex aggregateProgressMutex;
+            uint64_t aggregateLastBytes = 0;
+            auto aggregateLastTime = parallelStart;
+
+            auto worker = [&, deviceHwSerial](DeviceClient& dev, TransferBatch::ChannelProgress& ch,
+                              const std::string& reconnectIp, const std::string& bindLocalIp,
+                              bool preferUsb) {
+                auto chStart = std::chrono::steady_clock::now();
+                uint64_t chBytesCompleted = 0;
+                uint64_t lastSpeedBytes = 0;
+                auto lastSpeedTime = chStart;
+                // Capture original serial and whether this channel uses ADB forward at start,
+                // so reconnect logic uses the correct transport even if serial auto-switches
+                std::string origSerial = dev.connectedSerial();
+                bool origIsAdbForward = !dev.isDirectConnection();
+                // Channel 0 (primary) prefers USB, channel 1 (secondary) prefers WiFi
+                bool origIsUsb = preferUsb;
+                // Determine ACTUAL current physical link from the connection state
+                bool currentIsUsb = !origSerial.empty() && !isWifiSerial(origSerial);
+                if (!currentIsUsb && origIsAdbForward) {
+                    // ADB forward through WiFi serial = WiFi link, through USB serial = USB link
+                    currentIsUsb = !origSerial.empty() && !isWifiSerial(origSerial);
+                }
+                auto lastUpgradeCheck = std::chrono::steady_clock::now();
+
+                while (!m_shutdownTransfer && !batch->stopRequested.load() &&
+                       batch->state.load() != BatchState::Failed) {
+                    // Every 5s, check if we can restore the original transport for true dual-channel.
+                    // This catches: USB dropped → both on WiFi → USB comes back → upgrade one channel.
+                    // Also: WiFi dropped → both on USB → WiFi comes back → upgrade one channel.
+                    {
+                        auto now = std::chrono::steady_clock::now();
+                        if (std::chrono::duration<double>(now - lastUpgradeCheck).count() >= 5.0) {
+                            lastUpgradeCheck = now;
+                            // Only upgrade if we're NOT on our original physical link
+                            // AND both channels are on the same link (otherwise already dual-channel)
+                            if (currentIsUsb != origIsUsb) {
+                                bool upgraded = false;
+                                if (origIsUsb) {
+                                    // Originally USB, now on WiFi. Try to get back to USB.
+                                    // Find USB serial for this device
+                                    std::string devList = dev.runAdbCommand("devices");
+                                    std::istringstream iss(devList);
+                                    std::string line;
+                                    while (std::getline(iss, line)) {
+                                        if (line.find("\tdevice") == std::string::npos) continue;
+                                        auto tab = line.find('\t');
+                                        if (tab == std::string::npos) continue;
+                                        std::string s = line.substr(0, tab);
+                                        if (s.empty() || isWifiSerial(s)) continue;
+                                        // Verify it's our device
+                                        if (!deviceHwSerial.empty()) {
+                                            std::string hw = dev.runAdbCommand("-s " + s + " shell getprop ro.serialno");
+                                            while (lastCharOr(hw) == '\n' || lastCharOr(hw) == '\r' || lastCharOr(hw) == ' ') hw.pop_back();
+                                            if (hw != deviceHwSerial) continue;
+                                        }
+                                        std::string fwd = dev.runAdbCommand("-s " + s + " forward tcp:" +
+                                            std::to_string(dev.localPort()) + " tcp:" + std::to_string(AFM_PORT));
+                                        if (fwd.find("error") == std::string::npos && fwd.find("offline") == std::string::npos) {
+                                            dev.disconnectTcp();
+                                            if (dev.connectTcp("127.0.0.1", dev.localPort()) && dev.verifyConnection()) {
+                                                ch.channelName = "USB (ADB)";
+                                                LOG_INFO("Transfer", ch.channelName + " upgraded back to USB");
+                                                upgraded = true;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                } else {
+                                    // Originally WiFi, now on USB. Try to get back to WiFi.
+                                    // IMPORTANT: probe with a throwaway socket first so we don't
+                                    // kill the working USB connection if WiFi is still down.
+                                    std::string ip = reconnectIp;
+                                    if (ip.empty() && !origSerial.empty()) {
+                                        auto colon = origSerial.rfind(':');
+                                        if (colon != std::string::npos) ip = origSerial.substr(0, colon);
+                                    }
+                                    if (!ip.empty()) {
+                                        // Quick TCP probe without disrupting current connection
+                                        SOCKET probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                                        if (probe != INVALID_SOCKET) {
+                                            u_long nonBlock = 1;
+                                            ioctlsocket(probe, FIONBIO, &nonBlock);
+                                            struct sockaddr_in addr = {};
+                                            addr.sin_family = AF_INET;
+                                            addr.sin_port = htons(AFM_PORT);
+                                            inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+                                            connect(probe, (struct sockaddr*)&addr, sizeof(addr));
+                                            fd_set wset;
+                                            FD_ZERO(&wset);
+                                            FD_SET(probe, &wset);
+                                            struct timeval tv = {1, 0}; // 1 second timeout
+                                            bool reachable = (select((int)probe + 1, nullptr, &wset, nullptr, &tv) > 0);
+                                            closesocket(probe);
+                                            if (reachable) {
+                                                // WiFi is reachable, now switch for real
+                                                dev.disconnectTcp();
+                                                if (dev.connectTcp(ip, AFM_PORT) && dev.verifyConnection()) {
+                                                    ch.channelName = "WiFi (Direct)";
+                                                    LOG_INFO("Transfer", ch.channelName + " upgraded back to WiFi");
+                                                    upgraded = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if (upgraded) {
+                                    bool wasUsb = currentIsUsb;
+                                    currentIsUsb = origIsUsb;
+                                    ch.speed = 0;
+                                    lastSpeedBytes = ch.bytesTransferred.load();
+                                    lastSpeedTime = std::chrono::steady_clock::now();
+                                }
+                            }
+                        }
+                    }
+
+                    // Grab a logical range, then split off only the slice this
+                    // channel should own based on its current measured speed.
+                    WorkBlock block;
+                    {
+                        std::lock_guard<std::mutex> lk(workMutex);
+                        if (workQueue.empty()) break;
+                        block = workQueue.front();
+                        workQueue.pop_front();
+                        if (!block.isWholeFile && block.length > 0) {
+                            auto& queuedItem = batch->files[block.fileIndex];
+                            uint64_t assignLen = assignmentSliceFor(
+                                queuedItem.fileSize, block.length, ch.speed.load());
+                            if (assignLen < block.length) {
+                                WorkBlock remainder = block;
+                                remainder.offset += assignLen;
+                                remainder.length -= assignLen;
+                                workQueue.push_front(remainder);
+                                block.length = assignLen;
+                            }
+                        }
+                    }
+
+                    auto& item = batch->files[block.fileIndex];
+                    if (item.isDirectory) {
+                        if (batch->isPull)
+                            try { std::filesystem::create_directories(item.destPath); } catch (...) {}
+                        else
+                            dev.createDirectory(item.destPath);
+                        ch.filesCompleted++;
+                        continue;
+                    }
+
+                    ch.curBlockSize = block.length;
+                    ch.curBlockTransferred = 0;
+                    if (block.isWholeFile)
+                        ch.currentFile = item.displayName;
+                    else
+                        ch.currentFile = item.displayName + " [block " + formatSize(block.offset) + "]";
+
+                    // Progress callback (shared by whole-file and block transfers)
+                    auto updateProgress = [&](uint64_t blockTransferred) {
+                        ch.bytesTransferred = chBytesCompleted + blockTransferred;
+                        ch.curBlockTransferred = blockTransferred;
+                        // Speed
+                        auto now = std::chrono::steady_clock::now();
+                        double dt = std::chrono::duration<double>(now - lastSpeedTime).count();
+                        if (dt >= 0.5) {
+                            double delta = (double)(ch.bytesTransferred.load() - lastSpeedBytes);
+                            double instant = delta / dt;
+                            // Cap instant speed to 10 GB/s to avoid overflow spikes during recovery
+                            if (instant > 10e9) instant = 0;
+                            if (instant < 0) instant = 0;
+                            ch.speed = (ch.speed.load() > 0) ? ch.speed.load() * 0.8 + instant * 0.2 : instant;
+                            lastSpeedBytes = ch.bytesTransferred.load();
+                            lastSpeedTime = now;
+                        }
+                        // Effective batch progress and speed across all channels.
+                        std::lock_guard<std::mutex> progressLk(aggregateProgressMutex);
+                        uint64_t combined = 0;
+                        for (int c = 0; c < numCh; c++)
+                            combined += batch->channels[c].bytesTransferred.load();
+                        uint64_t tb = batch->totalBytes.load();
+                        if (tb > 0 && combined > tb)
+                            combined = tb;
+                        uint64_t currentTotal = batch->totalTransferred.load();
+                        if (combined < currentTotal) combined = currentTotal;
+                        batch->totalTransferred = combined;
+                        if (tb > 0) batch->totalProgress = (float)((double)combined / (double)tb);
+
+                        auto totalNow = std::chrono::steady_clock::now();
+                        double totalDt = std::chrono::duration<double>(totalNow - aggregateLastTime).count();
+                        if (totalDt >= 0.5) {
+                            double instant = (double)(combined - aggregateLastBytes) / totalDt;
+                            if (instant < 0 || instant > 10e9) instant = 0;
+                            double prev = batch->speedBytesPerSec.load();
+                            double effectiveSpeed = prev > 0 ? prev * 0.8 + instant * 0.2 : instant;
+                            batch->speedBytesPerSec = effectiveSpeed;
+                            batch->etaSeconds = (effectiveSpeed > 0 && tb > combined)
+                                ? (double)(tb - combined) / effectiveSpeed : -1.0;
+                            aggregateLastBytes = combined;
+                            aggregateLastTime = totalNow;
+                        }
+                    };
+
+                    auto progressCb = [&](uint64_t transferred, uint64_t total) -> bool {
+                        if (m_shutdownTransfer || batch->stopRequested.load()) return false;
+                        while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
+                            batch->state = BatchState::Paused;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        if (m_shutdownTransfer || batch->stopRequested.load()) return false;
+                        batch->state = BatchState::Running;
+                        updateProgress(transferred);
+                        return true;
+                    };
+
+                    bool ok = false;
+
+                    if (block.isWholeFile) {
+                        // Whole file transfer
+                        uint64_t outSize = 0;
+                        if (batch->isPull) {
+                            ok = dev.pullFile(item.sourcePath, item.destPath, outSize, progressCb);
+                            // Capture inline CRC before next pullFile overwrites it
+                            if (ok && !batch->stopRequested.load()) {
+                                std::lock_guard<std::mutex> lk(crcMutex);
+                                wholeFileCrcs[item.destPath] = dev.getInlineCrc();
+                            }
+                        } else {
+                            ok = dev.pushFile(item.sourcePath, item.destPath, item.fileSize, progressCb);
+                            // Capture inline CRC (computed from local source file during push)
+                            if (ok && !batch->stopRequested.load()) {
+                                std::lock_guard<std::mutex> lk(crcMutex);
+                                wholeFileCrcs[item.sourcePath] = dev.getInlineCrc();
+                            }
+                        }
+                    } else if (batch->isPull) {
+                        // Pull block: read range from device, write to local file
+                        uint32_t blockCrc = ~(uint32_t)0;
+                        HANDLE fh = INVALID_HANDLE_VALUE;
+                        for (auto& sh : splitHandles)
+                            if (sh.fileIndex == block.fileIndex) { fh = sh.handle; break; }
+
+                        uint64_t blockReceived = 0;
+                        auto rangeCb = [&](const void* data, uint32_t len, uint64_t offset) -> bool {
+                            if (m_shutdownTransfer || batch->stopRequested.load()) return false;
+                            while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
+                                batch->state = BatchState::Paused;
+                                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            }
+                            if (m_shutdownTransfer || batch->stopRequested.load()) return false;
+                            batch->state = BatchState::Running;
+                            crc32Update(blockCrc, data, len);
+                            if (fh != INVALID_HANDLE_VALUE) {
+                                OVERLAPPED ov = {};
+                                ov.Offset = (DWORD)(offset & 0xFFFFFFFF);
+                                ov.OffsetHigh = (DWORD)(offset >> 32);
+                                DWORD written;
+                                WriteFile(fh, data, len, &written, &ov);
+                            }
+                            blockReceived += len;
+                            updateProgress(blockReceived);
+                            return true;
+                        };
+
+                        uint64_t got = dev.readRangeStreaming(item.sourcePath, block.offset, block.length, rangeCb);
+                        ok = (got >= block.length) || batch->stopRequested.load();
+                        if (ok && !batch->stopRequested.load()) {
+                            std::lock_guard<std::mutex> lk(crcMutex);
+                            allBlockCrcs.push_back({block.blockId, block.offset, ~blockCrc, block.length, block.fileIndex});
+                        }
+                    } else {
+                        // Push block: stream local file range to device via single writeRangeStreaming call
+                        uint64_t written = dev.writeRangeStreaming(
+                            item.destPath, block.offset,
+                            item.sourcePath, block.offset, block.length,
+                            progressCb);
+                        ok = (written >= block.length) || batch->stopRequested.load();
+                        // Compute block CRC from local file for verification (avoids re-reading later)
+                        if (ok && !batch->stopRequested.load()) {
+                            uint32_t blockCrc = ~(uint32_t)0;
+                            HANDLE hCrc = CreateFileW(toWide(item.sourcePath).c_str(), GENERIC_READ,
+                                FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                            if (hCrc != INVALID_HANDLE_VALUE) {
+                                LARGE_INTEGER seekPos; seekPos.QuadPart = (LONGLONG)block.offset;
+                                SetFilePointerEx(hCrc, seekPos, nullptr, FILE_BEGIN);
+                                char crcBuf[256 * 1024];
+                                uint64_t remaining = block.length;
+                                while (remaining > 0) {
+                                    DWORD toRead = (DWORD)std::min(remaining, (uint64_t)sizeof(crcBuf));
+                                    DWORD bytesRead = 0;
+                                    if (!ReadFile(hCrc, crcBuf, toRead, &bytesRead, nullptr) || bytesRead == 0) break;
+                                    crc32Update(blockCrc, crcBuf, bytesRead);
+                                    remaining -= bytesRead;
+                                }
+                                CloseHandle(hCrc);
+                                std::lock_guard<std::mutex> lk(crcMutex);
+                                allBlockCrcs.push_back({block.blockId, block.offset, ~blockCrc, block.length, block.fileIndex});
+                            }
+                        }
+                    }
+
+                    if (!ok && !batch->stopRequested.load()) {
+                        std::string errMsg = dev.lastError();
+
+                        bool isLocalWriteError = batch->isPull &&
+                            (errMsg.find("Failed to create local file") != std::string::npos ||
+                             errMsg.find("Failed to open local file") != std::string::npos ||
+                             errMsg.find("Cannot open") != std::string::npos ||
+                             errMsg.find("Access is denied") != std::string::npos);
+
+                        if (isLocalWriteError) {
+                            LOG_WARN("Transfer", ch.channelName + " local destination failed: " +
+                                     item.displayName + " - " + errMsg);
+                            batch->state = BatchState::Failed;
+                            batch->errorMessage = errMsg +
+                                "\n\nThe destination may require administrator rights or be read-only.";
+                            {
+                                std::lock_guard<std::mutex> lk(workMutex);
+                                workQueue.clear();
+                            }
+                            break;
+                        }
+
+                        // Check if this is a file-level error (server responded properly)
+                        // vs an actual connection failure. File errors like "No such file or
+                        // directory" or "Permission denied" mean the connection is still alive,
+                        // we just need to skip this file and move on.
+                        bool isFileError = (errMsg.find("No such file") != std::string::npos ||
+                                            errMsg.find("Permission denied") != std::string::npos ||
+                                            errMsg.find("Is a directory") != std::string::npos ||
+                                            errMsg.find("Not a directory") != std::string::npos);
+
+                        if (isFileError) {
+                            LOG_WARN("Transfer", ch.channelName + " skipping: " + item.displayName +
+                                     " - " + errMsg);
+                            batch->errorSkippedFiles++;
+                            {
+                                std::lock_guard<std::mutex> lk(batch->errorSkippedMutex);
+                                // Avoid duplicate entries (split files may skip multiple blocks)
+                                auto& names = batch->errorSkippedNames;
+                                if (names.empty() || names.back() != item.displayName)
+                                    names.push_back(item.displayName);
+                            }
+                            // Mark the block as completed so the file doesn't stall the transfer
+                            chBytesCompleted += block.length;
+                            ch.bytesTransferred = chBytesCompleted;
+                            ch.filesCompleted++;
+                            {
+                                std::lock_guard<std::mutex> lk(workMutex);
+                                completedBlocksPerFile[block.fileIndex]++;
+                                completedBytesPerFile[block.fileIndex] += block.length;
+                                if (block.isWholeFile || item.isDirectory) {
+                                    if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
+                                        completedFileIndices.insert(block.fileIndex);
+                                } else if (completedBytesPerFile[block.fileIndex] >= item.fileSize) {
+                                    completedFileIndices.insert(block.fileIndex);
+                                }
+                            }
+                            continue; // grab next block from queue
+                        }
+
+                        block.retries++;
+                        if (block.retries >= 3) {
+                            // Too many retries for this block, skip it
+                            LOG_WARN("Transfer", ch.channelName + " giving up after " +
+                                     std::to_string(block.retries) + " retries: " + item.displayName);
+                            batch->errorSkippedFiles++;
+                            {
+                                std::lock_guard<std::mutex> lk(batch->errorSkippedMutex);
+                                auto& names = batch->errorSkippedNames;
+                                if (std::find(names.begin(), names.end(), item.displayName) == names.end())
+                                    names.push_back(item.displayName);
+                            }
+                            chBytesCompleted += block.length;
+                            ch.bytesTransferred = chBytesCompleted;
+                            ch.filesCompleted++;
+                            {
+                                std::lock_guard<std::mutex> lk(workMutex);
+                                completedBlocksPerFile[block.fileIndex]++;
+                                completedBytesPerFile[block.fileIndex] += block.length;
+                                if (block.isWholeFile || item.isDirectory) {
+                                    if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
+                                        completedFileIndices.insert(block.fileIndex);
+                                } else if (completedBytesPerFile[block.fileIndex] >= item.fileSize) {
+                                    completedFileIndices.insert(block.fileIndex);
+                                }
+                            }
+                            continue;
+                        }
+
+                        LOG_WARN("Transfer", ch.channelName + " channel lost: " + item.displayName +
+                                 " - " + errMsg);
+                        ch.speed = 0;
+                        ch.currentFile = "(reconnecting...)";
+
+                        // Return failed block to queue so other channel can grab it meanwhile
+                        {
+                            std::lock_guard<std::mutex> lk(workMutex);
+                            workQueue.push_back(block);
+                        }
+
+                        // Try to reconnect just the TCP socket (NOT restart the server)
+                        // Keep trying until transfer ends or stop is requested
+                        bool recovered = false;
+                        // Use the serial captured at worker start to reconnect to the same transport
+                        std::string serial = origSerial;
+                        for (int retry = 1; !batch->stopRequested.load(); retry++) {
+                            // Check if there are still blocks left to process
+                            {
+                                std::lock_guard<std::mutex> lk(workMutex);
+                                if (workQueue.empty()) break; // no work left, no point reconnecting
+                            }
+                            ch.currentFile = "(reconnecting #" + std::to_string(retry) + ")";
+                            LOG_INFO("Transfer", ch.channelName + " reconnect attempt " + std::to_string(retry));
+                            std::this_thread::sleep_for(std::chrono::seconds(3));
+
+                            // Disconnect old socket
+                            dev.disconnectTcp();
+
+                            bool connected = false;
+                            std::string actualTransport = ch.channelName; // default to current name
+                            if (!bindLocalIp.empty()) {
+                                // Multi-NIC channel: reconnect with same NIC binding
+                                connected = dev.connectTcp(reconnectIp, AFM_PORT, bindLocalIp) && dev.verifyConnection();
+                            } else {
+                                // Universal reconnect: try all available transports
+                                // 1. Try original transport first
+                                if (origIsAdbForward) {
+                                    // Try ADB forward first (original transport)
+                                    // ... then fall back to WiFi direct
+                                } else {
+                                    // Try WiFi direct first (original transport)
+                                    std::string ip;
+                                    if (!serial.empty()) {
+                                        auto colon = serial.rfind(':');
+                                        ip = (colon != std::string::npos) ? serial.substr(0, colon) : serial;
+                                    } else if (!reconnectIp.empty()) {
+                                        ip = reconnectIp;
+                                    }
+                                    if (!ip.empty()) {
+                                        connected = dev.connectTcp(ip, AFM_PORT) && dev.verifyConnection();
+                                        if (connected) actualTransport = "WiFi (Direct)";
+                                    }
+                                }
+
+                                // 2. Try ADB forward (works for both channel types as fallback)
+                                if (!connected) {
+                                    std::vector<std::string> candidates;
+                                    if (!serial.empty()) candidates.push_back(serial);
+                                    {
+                                        std::string devList = dev.runAdbCommand("devices");
+                                        std::istringstream iss(devList);
+                                        std::string line;
+                                        while (std::getline(iss, line)) {
+                                            if (line.find("\tdevice") != std::string::npos) {
+                                                auto tab = line.find('\t');
+                                                if (tab != std::string::npos) {
+                                                    std::string s = line.substr(0, tab);
+                                                    if (!s.empty() && s != serial) candidates.push_back(s);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    for (auto& cand : candidates) {
+                                        if (!deviceHwSerial.empty()) {
+                                            std::string hwCheck = dev.runAdbCommand("-s " + cand + " shell getprop ro.serialno");
+                                            while (lastCharOr(hwCheck) == '\n' || lastCharOr(hwCheck) == '\r' || lastCharOr(hwCheck) == ' ')
+                                                hwCheck.pop_back();
+                                            if (hwCheck != deviceHwSerial) continue;
+                                        }
+                                        std::string fwdResult = dev.runAdbCommand("-s " + cand + " forward tcp:" +
+                                            std::to_string(dev.localPort()) + " tcp:" + std::to_string(AFM_PORT));
+                                        if (fwdResult.find("error") == std::string::npos &&
+                                            fwdResult.find("offline") == std::string::npos) {
+                                            connected = dev.connectTcp("127.0.0.1", dev.localPort()) && dev.verifyConnection();
+                                            if (connected) {
+                                                actualTransport = isWifiSerial(cand) ? "WiFi (ADB)" : "USB (ADB)";
+                                                LOG_INFO("Transfer", "Reconnected via ADB forward to serial: " + cand);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 3. If ADB-forward channel, also try WiFi direct as last resort
+                                if (!connected && origIsAdbForward && !reconnectIp.empty()) {
+                                    connected = dev.connectTcp(reconnectIp, AFM_PORT) && dev.verifyConnection();
+                                    if (connected) actualTransport = "WiFi (Direct)";
+                                }
+                            }
+
+                            if (connected) {
+                                // Update channel name to reflect actual transport used
+                                if (!bindLocalIp.empty()) {
+                                    // Multi-NIC: keep original name
+                                } else {
+                                    ch.channelName = actualTransport;
+                                }
+                                // Track which physical link we're on for upgrade checks
+                                currentIsUsb = (actualTransport == "USB (ADB)");
+                                LOG_INFO("Transfer", ch.channelName + " reconnected - resuming");
+                                recovered = true;
+                                ch.speed = 0;
+                                lastSpeedBytes = ch.bytesTransferred.load();
+                                lastSpeedTime = std::chrono::steady_clock::now();
+                                break;
+                            }
+                        }
+
+                        if (!recovered) {
+                            ch.currentFile = "(disconnected)";
+                            LOG_INFO("Transfer", ch.channelName + " no more blocks - stopping reconnect");
+                            break;
+                        }
+                        continue; // grab next block from queue
+                    }
+
+                    chBytesCompleted += block.length;
+                    ch.bytesTransferred = chBytesCompleted;
+                    ch.filesCompleted++;
+
+                    // Track per-file completion for partial cleanup on cancel
+                    {
+                        std::lock_guard<std::mutex> lk(workMutex);
+                        completedBlocksPerFile[block.fileIndex]++;
+                        completedBytesPerFile[block.fileIndex] += block.length;
+                        if (block.isWholeFile || item.isDirectory) {
+                            if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
+                                completedFileIndices.insert(block.fileIndex);
+                        } else if (completedBytesPerFile[block.fileIndex] >= item.fileSize) {
+                            completedFileIndices.insert(block.fileIndex);
+                        }
+                    }
+
+                    if (block.isWholeFile)
+                        LOG_INFO("Transfer", ch.channelName + " done: " + item.displayName);
+                    else
+                        LOG_INFO("Transfer", ch.channelName + " block done: " + item.displayName +
+                                 " [" + formatSize(block.offset) + "+" + formatSize(block.length) + "]");
+                }
+
+                ch.speed = 0; // zero speed when channel exits (so combined speed is accurate)
+                ch.elapsedSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - chStart).count();
+            };
+
+            if (useMultiNic) {
+                std::vector<std::thread> threads;
+                for (int i = 0; i < (int)multiNicDevPtrs.size(); i++) {
+                    threads.emplace_back(worker, std::ref(*multiNicDevPtrs[i]),
+                                         std::ref(batch->channels[i]),
+                                         multiNicDeviceIp, multiNicBindIps[i], true);
+                }
+                for (auto& t : threads) t.join();
+            } else {
+                // Launch all available channels as worker threads
+                std::vector<std::thread> threads;
+                batch->numChannels = std::min((int)runtimeChannels.size(), (int)TransferBatch::MAX_CHANNELS);
+                numCh = batch->numChannels;
+                for (int i = 0; i < batch->numChannels; i++) {
+                    batch->channels[i].channelName = runtimeChannels[i].name;
+                    threads.emplace_back(worker, std::ref(*runtimeChannels[i].dev), std::ref(batch->channels[i]),
+                                         runtimeChannels[i].reconnectIp, std::string(""), runtimeChannels[i].preferUsb);
+                }
+                for (auto& t : threads) t.join();
+            }
+
+            // Close all split file handles
+            for (auto& sh : splitHandles) {
+                if (sh.handle != INVALID_HANDLE_VALUE) CloseHandle(sh.handle);
+            }
+
+            // --- CRC verification for parallel transfers ---
+            if (batch->state.load() != BatchState::Failed && !batch->stopRequested.load() &&
+                m_prefs.enableCrcVerification) {
+                batch->state = BatchState::Verifying;
+
+                // Combine block CRCs for split files in file-offset order.
+                if (!allBlockCrcs.empty()) {
+                    std::sort(allBlockCrcs.begin(), allBlockCrcs.end(),
+                              [](const BlockCrc& a, const BlockCrc& b) {
+                                  if (a.fileIndex != b.fileIndex) return a.fileIndex < b.fileIndex;
+                                  return a.offset < b.offset;
+                              });
+
+                    // Group by file and combine
+                    std::unordered_map<int, std::vector<BlockCrc*>> fileBlocks;
+                    for (auto& bc : allBlockCrcs) fileBlocks[bc.fileIndex].push_back(&bc);
+
+                    for (auto& [fi, blocks] : fileBlocks) {
+                        if (blocks.size() <= 1) continue;
+                        // Chain combine: crc = combine(crc, next_block_crc, next_block_len)
+                        uint32_t combined = blocks[0]->crc;
+                        for (size_t i = 1; i < blocks.size(); i++)
+                            combined = crc32Combine(combined, blocks[i]->crc, blocks[i]->length);
+                        auto& item = batch->files[fi];
+                        std::string crcLocalPath = batch->isPull ? item.destPath : item.sourcePath;
+                        wholeFileCrcs[crcLocalPath] = combined;
+                        LOG_INFO("Transfer", "Block CRC combined (" + std::to_string(blocks.size()) +
+                                 " blocks): " + item.displayName + " crc=" + std::to_string(combined));
+                    }
+                }
+
+                for (int fi = 0; fi < batch->totalFiles(); fi++) {
+                    if (batch->stopRequested.load()) break;
+                    auto& item = batch->files[fi];
+                    if (item.isDirectory) continue;
+
+                    // For pulls: sourcePath=Android, destPath=Windows
+                    // For pushes: sourcePath=Windows, destPath=Android
+                    std::string remotePath = batch->isPull ? item.sourcePath : item.destPath;
+                    std::string localPath = batch->isPull ? item.destPath : item.sourcePath;
+
+                    batch->crcFileName = item.displayName;
+                    batch->crcProgress = 0.0f;
+                    batch->crcPhase = 0;
+                    batch->errorMessage = "Verifying: " + item.displayName;
+
+                    std::string crcDetail;
+                    double crcRemoteMs = 0, crcLocalMs = 0;
+
+                    // Set inline CRC from per-file map (whole files from any channel)
+                    // or from block combination (split files, set above)
+                    auto wfIt = wholeFileCrcs.find(localPath);
+                    if (wfIt != wholeFileCrcs.end())
+                        batchDev.setInlineCrc(wfIt->second, localPath);
+
+                    bool crcOk = batchDev.verifyFileCrc(remotePath, localPath, crcDetail,
+                                                        &batch->crcProgress, &batch->crcPhase,
+                                                        &crcRemoteMs, &crcLocalMs);
+
+                    TransferBatch::CrcResult crcRes;
+                    crcRes.fileName = item.displayName;
+                    crcRes.passed = crcOk;
+                    crcRes.detail = crcDetail;
+                    crcRes.remoteMs = crcRemoteMs;
+                    crcRes.localMs = crcLocalMs;
+                    crcRes.totalMs = crcRemoteMs + crcLocalMs;
+                    crcRes.fileSize = item.fileSize;
+                    crcRes.sourcePath = item.sourcePath;  // original batch paths (not CRC-rearranged)
+                    crcRes.destPath = item.destPath;
+                    batch->crcResults.push_back(std::move(crcRes));
+
+                    if (!crcOk) {
+                        LOG_ERROR("Transfer", "CRC FAILED (parallel): " + item.displayName + " - " + crcDetail);
+                        batch->errorMessage = "CRC FAILED: " + item.displayName;
+                        // Check if this was a block-split file
+                        bool wasSplit = false;
+                        for (auto& bc : allBlockCrcs) if (bc.fileIndex == fi) { wasSplit = true; break; }
+                        if (wasSplit)
+                            batch->errorMessage += " (block-split — file likely corrupted)";
+                    } else {
+                        LOG_INFO("Transfer", "CRC OK (parallel): " + item.displayName);
+                        batch->errorMessage.clear();
+                    }
+                }
+
+                batch->crcFileName.clear();
+                batch->crcProgress = 0.0f;
+                batch->crcPhase = 0;
+            }
+
+            // Finalize
+            if (batch->state.load() != BatchState::Failed && !batch->stopRequested.load()) {
+                // Check if any CRC failed
+                bool anyCrcFail = false;
+                for (auto& r : batch->crcResults) if (!r.passed) anyCrcFail = true;
+
+                batch->totalProgress = 1.0f;
+                batch->totalTransferred = batch->totalBytes.load();
+                auto totalTime = std::chrono::steady_clock::now() - parallelStart;
+                double wallSec = std::chrono::duration<double>(totalTime).count();
+                if (wallSec < 0.1) wallSec = 0.1;
+                double avgSpeed = (double)batch->totalTransferred.load() / wallSec;
+                batch->finalAvgSpeed = avgSpeed;
+                batch->finalTimeSec = wallSec;
+                batch->speedBytesPerSec = 0;
+                batch->etaSeconds = -1;
+
+                if (anyCrcFail) {
+                    batch->state = BatchState::Failed;
+                    batch->errorMessage = "CRC verification failed — file(s) may be corrupted";
+                } else {
+                    batch->state = BatchState::Completed;
+                    logBatchPerformance(useMultiNic ? "multi-NIC parallel" : "multi-channel parallel",
+                                        wallSec, avgSpeed);
+                }
+
+                m_statusMessage = "Parallel done: " + std::to_string(batch->totalFiles()) + " files, " +
+                    formatSize(batch->totalTransferred.load()) + " @ " + formatSpeed(avgSpeed) +
+                    (useMultiNic ? " (" + std::to_string(numCh) + " NICs)" :
+                        " (" + std::to_string(numCh) + " channels)");
+                m_statusTime = std::chrono::steady_clock::now();
+
+                m_leftPanel.needsRefresh = true;
+                m_rightPanel.needsRefresh = true;
+            } else if (batch->stopRequested.load()) {
+                batch->state = BatchState::Stopped;
+            }
+
+            // Clean up only incomplete files on stop/cancel/error
+            // Files whose blocks all finished are kept; only partially-transferred files are deleted
+            if (batch->state.load() == BatchState::Stopped || batch->state.load() == BatchState::Failed) {
+                for (int fi = 0; fi < batch->totalFiles(); fi++) {
+                    auto& item = batch->files[fi];
+                    if (item.isDirectory) continue;
+                    if (completedFileIndices.count(fi)) continue; // fully transferred, keep it
+                    if (batch->isPull) {
+                        try {
+                            if (std::filesystem::exists(toFsPath(item.destPath))) {
+                                std::filesystem::remove(toFsPath(item.destPath));
+                                LOG_INFO("Transfer", "Deleted incomplete file: " + item.destPath);
+                            }
+                        } catch (...) {}
+                    } else {
+                        batchDev.deleteFile(item.destPath);
+                        LOG_INFO("Transfer", "Deleted incomplete remote file: " + item.destPath);
+                    }
+                }
+                if (useMultiNic) {
+                    for (auto* dev : multiNicDevPtrs) {
+                        dev->flushStaleData();
+                        dev->restoreTimeouts();
+                    }
+                } else {
+                    for (auto& rc : runtimeChannels) {
+                        if (!rc.dev) continue;
+                        rc.dev->flushStaleData();
+                        rc.dev->restoreTimeouts();
+                    }
+                }
+            }
+            // Clean up multi-NIC channels after transfer completes
+            if (useMultiNic) {
+                for (auto& ch : m_nicChannels) ch->disconnectTcp();
+                m_nicChannels.clear();
+                m_nicLocalIps.clear();
+            }
+            for (auto& rc : runtimeChannels) {
+                if (rc.owned) rc.owned->disconnectTcp();
+            }
+            continue;
+        }
+
+        uint64_t bytesCompletedBefore = 0;
+        auto batchStart = std::chrono::steady_clock::now();
+        uint64_t lastSpeedBytes = 0;
+        auto lastSpeedTime = batchStart;
+
+        std::vector<RuntimeChannel> crossSrcChannels;
+        std::vector<RuntimeChannel> crossDstChannels;
+
+        auto buildCrossDeviceChannels = [&](DeviceClient& baseDev, int slot, int portBase,
+                                            std::vector<RuntimeChannel>& out) {
+            out.clear();
+            if (!baseDev.isServerRunning()) return;
+
+            std::string serial = baseDev.connectedSerial();
+            std::string wifiIp;
+            std::string usbSerial;
+            std::string hwSerial;
+            bool primaryIsUsb = !serial.empty() && !isWifiSerial(serial);
+            if (primaryIsUsb) usbSerial = serial;
+            if (isWifiSerial(serial)) {
+                auto colon = serial.rfind(':');
+                if (colon != std::string::npos) wifiIp = serial.substr(0, colon);
+            }
+
+            if (!serial.empty()) {
+                std::string hwOut = baseDev.runAdbCommand("-s " + serial + " shell getprop ro.serialno");
+                while (lastCharOr(hwOut) == '\n' || lastCharOr(hwOut) == '\r' || lastCharOr(hwOut) == ' ')
+                    hwOut.pop_back();
+                hwSerial = hwOut;
+            }
+            auto transferPipes = m_prefs.pipePreferencesFor(serial);
+
+            if (wifiIp.empty() && !serial.empty()) {
+                std::string wlanOut = baseDev.runAdbCommand("-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+                auto inetPos = wlanOut.find("inet ");
+                if (inetPos != std::string::npos) {
+                    auto start = inetPos + 5;
+                    auto slash = wlanOut.find('/', start);
+                    if (slash != std::string::npos)
+                        wifiIp = wlanOut.substr(start, slash - start);
+                }
+            }
+            if (wifiIp.empty()) {
+                for (auto& w : m_prefs.savedWifiDevices) {
+                    std::string wifiSerial = w.wifiIp + ":" + std::to_string(w.port);
+                    if (!w.wifiIp.empty() && (w.serial == serial || wifiSerial == serial)) {
+                        wifiIp = w.wifiIp;
+                        break;
+                    }
+                }
+            }
+
+            if (usbSerial.empty() && !hwSerial.empty()) {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+                for (auto& d : m_devices) {
+                    if (d.state != "device" || isWifiSerial(d.serial)) continue;
+                    std::string hw = baseDev.runAdbCommand("-s " + d.serial + " shell getprop ro.serialno");
+                    while (lastCharOr(hw) == '\n' || lastCharOr(hw) == '\r' || lastCharOr(hw) == ' ')
+                        hw.pop_back();
+                    if (hw == hwSerial) {
+                        usbSerial = d.serial;
+                        break;
+                    }
+                }
+            }
+
+            RuntimeChannel primary;
+            primary.dev = &baseDev;
+            primary.name = primaryIsUsb ? "USB (ADB)" : (baseDev.isDirectConnection() ? "WiFi (Direct)" : "WiFi (ADB)");
+            primary.reconnectIp = wifiIp;
+            primary.preferUsb = primaryIsUsb;
+            out.push_back(std::move(primary));
+
+            int usbChannels = primaryIsUsb ? 1 : 0;
+            int wifiChannels = primaryIsUsb ? 0 : 1;
+            int nextPort = portBase + (slot & 1) * 32;
+
+            auto addUsbChannel = [&]() -> bool {
+                if (usbSerial.empty()) return false;
+                for (int attempt = 0; attempt < 32; attempt++) {
+                    auto ch = std::make_unique<DeviceClient>();
+                    ch->setAdbPath(baseDev.getAdbPath());
+                    ch->setLocalPort(nextPort++);
+                    int localPort = ch->localPort();
+                    std::string fwd = baseDev.runAdbCommand("-s " + usbSerial + " forward tcp:" +
+                        std::to_string(localPort) + " tcp:" + std::to_string(AFM_PORT));
+                    if (fwd.find("offline") != std::string::npos)
+                        return false;
+                    if (fwd.find("error") != std::string::npos) {
+                        LOG_WARN("Transfer", "USB forward port " + std::to_string(localPort) +
+                            " failed, trying next port");
+                        continue;
+                    }
+                    if (!ch->connectTcp("127.0.0.1", localPort) || !ch->verifyConnection()) {
+                        LOG_WARN("Transfer", "USB forward port " + std::to_string(localPort) +
+                            " connected but did not verify, trying next port");
+                        continue;
+                    }
+                    RuntimeChannel rc;
+                    rc.dev = ch.get();
+                    rc.owned = std::move(ch);
+                    rc.name = "USB (ADB)";
+                    rc.reconnectIp = wifiIp;
+                    rc.preferUsb = true;
+                    out.push_back(std::move(rc));
+                    usbChannels++;
+                    return true;
+                }
+                return false;
+            };
+
+            auto addWifiChannel = [&]() -> bool {
+                if (wifiIp.empty()) return false;
+                auto ch = std::make_unique<DeviceClient>();
+                ch->setAdbPath(baseDev.getAdbPath());
+                ch->setLocalPort(nextPort++);
+                if (!ch->connectTcp(wifiIp, AFM_PORT) || !ch->verifyConnection())
+                    return false;
+                RuntimeChannel rc;
+                rc.dev = ch.get();
+                rc.owned = std::move(ch);
+                rc.name = "WiFi (Direct)";
+                rc.reconnectIp = wifiIp;
+                rc.preferUsb = false;
+                out.push_back(std::move(rc));
+                wifiChannels++;
+                return true;
+            };
+
+            while (usbChannels < transferPipes.usbPipeCount && out.size() < TransferBatch::MAX_CHANNELS)
+                if (!addUsbChannel()) break;
+            while (wifiChannels < transferPipes.wifiPipeCount && out.size() < TransferBatch::MAX_CHANNELS)
+                if (!addWifiChannel()) break;
+        };
+
+        if (batch->isCrossDevice && !batch->useDokanRelay) {
+            DeviceClient& srcDev = m_deviceSlots[batch->srcDeviceSlot & 1];
+            DeviceClient& dstDev = m_deviceSlots[batch->dstDeviceSlot & 1];
+            buildCrossDeviceChannels(srcDev, batch->srcDeviceSlot, 5920, crossSrcChannels);
+            buildCrossDeviceChannels(dstDev, batch->dstDeviceSlot, 5984, crossDstChannels);
+
+            int pairCount = std::min((int)crossSrcChannels.size(), (int)crossDstChannels.size());
+            pairCount = std::min(pairCount, (int)TransferBatch::MAX_CHANNELS);
+            if (pairCount > 0) {
+                batch->numChannels = pairCount;
+                batch->useParallelChannels = pairCount > 1;
+                for (int i = 0; i < pairCount; i++) {
+                    batch->channels[i].channelName = crossSrcChannels[i].name + " > " + crossDstChannels[i].name;
+                    batch->channels[i].totalBytes = batch->totalBytes.load() / pairCount;
+                    batch->channels[i].filesAssigned = 0;
+                }
+                LOG_INFO("Transfer", "Cross-device fast relay ready with " + std::to_string(pairCount) + " channel pair(s)");
+            }
+        }
+
+        if (batch->isCrossDevice && !batch->useDokanRelay &&
+            !crossSrcChannels.empty() && !crossDstChannels.empty()) {
+            DeviceClient& srcDev = m_deviceSlots[batch->srcDeviceSlot & 1];
+            DeviceClient& dstDev = m_deviceSlots[batch->dstDeviceSlot & 1];
+            int pairCount = std::min((int)crossSrcChannels.size(), (int)crossDstChannels.size());
+            pairCount = std::min(pairCount, (int)TransferBatch::MAX_CHANNELS);
+
+            if (!srcDev.isServerRunning() || !dstDev.isServerRunning()) {
+                batch->state = BatchState::Failed;
+                batch->errorMessage = "Both devices must be connected for cross-device transfer";
+                continue;
+            }
+
+            struct RelayWork {
+                int fileIndex;
+                uint64_t offset;
+                uint64_t length;
+            };
+            struct RelayRangeCrc {
+                uint64_t offset;
+                uint64_t length;
+                uint32_t srcCrc;
+                uint32_t dstCrc;
+            };
+
+            static const uint64_t MB = 1024ULL * 1024;
+            static const uint64_t GB = 1024ULL * MB;
+            auto relayReadRangeSizeFor = [](uint64_t fileSize, int channels) -> uint64_t {
+                if (channels <= 1) return fileSize;
+                const uint64_t MB = 1024ULL * 1024;
+                // Paired streaming relays each range immediately. Keep ranges large
+                // enough to avoid overhead, but not so large that one slow pair owns
+                // the tail of a multi-file batch.
+                if (fileSize >= 1024 * MB) return 128 * MB;
+                if (fileSize >= 500 * MB) return 96 * MB;
+                return 64 * MB;
+            };
+            std::vector<bool> skipped(batch->totalFiles(), false);
+            uint64_t newTotal = 0;
+
+            for (int fi = 0; fi < batch->totalFiles() && !m_shutdownTransfer; fi++) {
+                if (batch->stopRequested.load()) break;
+                auto& item = batch->files[fi];
+
+                if (item.isDirectory) {
+                    if (!dstDev.createDirectory(item.destPath)) {
+                        batch->state = BatchState::Failed;
+                        batch->errorMessage = item.displayName + ": create directory failed";
+                        break;
+                    }
+                    continue;
+                }
+
+                if (item.fileSize == 0)
+                    item.fileSize = srcDev.getFileSize(item.sourcePath);
+
+                bool destExists = dstDev.getFileSize(item.destPath) > 0;
+                if (destExists) {
+                    ConflictAction action = batch->conflictAllDecision;
+                    if (action == ConflictAction::None) {
+                        batch->conflictFileName = item.displayName;
+                        batch->waitingConflict = true;
+                        batch->conflictResponse = ConflictAction::None;
+                        batch->state = BatchState::WaitingConflict;
+                        {
+                            std::unique_lock<std::mutex> lk(m_batchMutex);
+                            m_batchCV.wait(lk, [&]() {
+                                return m_shutdownTransfer || batch->stopRequested.load() ||
+                                    batch->conflictResponse.load() != ConflictAction::None;
+                            });
+                        }
+                        batch->waitingConflict = false;
+                        action = batch->conflictResponse.load();
+                        batch->conflictResponse = ConflictAction::None;
+                        batch->state = BatchState::Running;
+                        if (action == ConflictAction::OverwriteAll) {
+                            batch->conflictAllDecision = ConflictAction::OverwriteAll;
+                            action = ConflictAction::Overwrite;
+                        } else if (action == ConflictAction::SkipAll) {
+                            batch->conflictAllDecision = ConflictAction::SkipAll;
+                            action = ConflictAction::Skip;
+                        }
+                    } else {
+                        if (action == ConflictAction::OverwriteAll) action = ConflictAction::Overwrite;
+                        else if (action == ConflictAction::SkipAll) action = ConflictAction::Skip;
+                    }
+
+                    if (batch->stopRequested.load() || m_shutdownTransfer) break;
+                    if (action == ConflictAction::Skip) {
+                        skipped[fi] = true;
+                        batch->skippedFiles++;
+                        continue;
+                    }
+                }
+
+                if (!dstDev.createFile(item.destPath, item.fileSize)) {
+                    batch->state = BatchState::Failed;
+                    batch->errorMessage = item.displayName + ": create destination file failed";
+                    break;
+                }
+                newTotal += item.fileSize;
+            }
+
+            if (batch->state.load() == BatchState::Failed) {
+                for (auto& rc : crossSrcChannels) if (rc.owned) rc.owned->disconnectTcp();
+                for (auto& rc : crossDstChannels) if (rc.owned) rc.owned->disconnectTcp();
+                continue;
+            }
+            if (batch->stopRequested.load() || m_shutdownTransfer) {
+                batch->state = BatchState::Stopped;
+                for (auto& rc : crossSrcChannels) if (rc.owned) rc.owned->disconnectTcp();
+                for (auto& rc : crossDstChannels) if (rc.owned) rc.owned->disconnectTcp();
+                continue;
+            }
+
+            batch->totalBytes = newTotal;
+            std::vector<std::deque<RelayWork>> byFile(batch->totalFiles());
+            std::vector<int> totalBlocksPerFile(batch->totalFiles(), 0);
+            std::vector<int> completedBlocksPerFile(batch->totalFiles(), 0);
+            std::vector<std::vector<RelayRangeCrc>> rangeCrcs(batch->totalFiles());
+            std::set<int> completedFileIndices;
+            int totalReadRanges = 0;
+
+            for (int fi = 0; fi < batch->totalFiles(); fi++) {
+                auto& item = batch->files[fi];
+                if (item.isDirectory || skipped[fi]) continue;
+                uint64_t readRangeSize = relayReadRangeSizeFor(item.fileSize, pairCount);
+                uint64_t remaining = item.fileSize;
+                uint64_t offset = 0;
+                while (remaining > 0) {
+                    uint64_t len = std::min(remaining, readRangeSize);
+                    byFile[fi].push_back({fi, offset, len});
+                    totalReadRanges++;
+                    totalBlocksPerFile[fi]++;
+                    offset += len;
+                    remaining -= len;
+                }
+            }
+
+            std::deque<RelayWork> workQueue;
+            bool added = true;
+            while (added) {
+                added = false;
+                for (auto& blocks : byFile) {
+                    if (blocks.empty()) continue;
+                    workQueue.push_back(blocks.front());
+                    blocks.pop_front();
+                    added = true;
+                }
+            }
+
+            int totalBlocks = totalReadRanges;
+            int progressChannels = std::min(pairCount, (int)TransferBatch::MAX_CHANNELS);
+            for (int c = 0; c < progressChannels; c++) {
+                batch->channels[c].bytesTransferred = 0;
+                batch->channels[c].speed = 0;
+                batch->channels[c].curBlockSize = 0;
+                batch->channels[c].curBlockTransferred = 0;
+                batch->channels[c].relayReadSec = 0;
+                batch->channels[c].relaySendSec = 0;
+                batch->channels[c].currentFile.clear();
+                batch->channels[c].filesAssigned = totalBlocks;
+                batch->channels[c].channelName = crossSrcChannels[c].name + " > " + crossDstChannels[c].name;
+                batch->channels[c].totalBytes = progressChannels > 0 ? batch->totalBytes.load() / progressChannels : 0;
+            }
+            batch->numChannels = progressChannels;
+
+            std::mutex workMutex;
+            std::mutex crcMutex;
+            std::atomic<bool> failed{false};
+            std::atomic<int> completedBlocks{0};
+            std::string relayError;
+            std::mutex relayErrorMutex;
+            std::atomic<uint64_t> bytesWrittenToDest{0};
+
+            auto updateCrossProgress = [&]() {
+                double combinedSpeed = 0;
+                for (int c = 0; c < progressChannels; c++) {
+                    combinedSpeed += batch->channels[c].speed.load();
+                }
+                uint64_t totalTransferred = bytesWrittenToDest.load();
+                uint64_t tb = batch->totalBytes.load();
+                if (tb > 0 && totalTransferred > tb)
+                    totalTransferred = tb;
+                uint64_t currentTotal = batch->totalTransferred.load();
+                if (totalTransferred < currentTotal) totalTransferred = currentTotal;
+                batch->totalTransferred = totalTransferred;
+                if (tb > 0) batch->totalProgress = (float)((double)totalTransferred / (double)tb);
+                batch->speedBytesPerSec = combinedSpeed;
+                batch->etaSeconds = (combinedSpeed > 0 && tb > totalTransferred)
+                    ? (double)(tb - totalTransferred) / combinedSpeed : -1.0;
+            };
+
+            auto relayWorker = [&](int chIdx) {
+                auto& ch = batch->channels[chIdx];
+                DeviceClient& srcCh = *crossSrcChannels[chIdx].dev;
+                DeviceClient& dstCh = *crossDstChannels[chIdx].dev;
+                uint64_t chCompleted = 0;
+                uint64_t lastChBytes = 0;
+                auto chStart = std::chrono::steady_clock::now();
+                auto lastChTime = chStart;
+                ch.channelName = crossSrcChannels[chIdx].name + " > " + crossDstChannels[chIdx].name;
+
+                while (!m_shutdownTransfer && !batch->stopRequested.load() && !failed.load()) {
+                    RelayWork work{};
+                    {
+                        std::lock_guard<std::mutex> lk(workMutex);
+                        if (workQueue.empty()) break;
+                        work = workQueue.front();
+                        workQueue.pop_front();
+                    }
+
+                    auto& item = batch->files[work.fileIndex];
+                    batch->currentFileIndex = work.fileIndex;
+                    batch->curFileSize = item.fileSize;
+                    ch.curBlockSize = work.length;
+                    ch.curBlockTransferred = 0;
+                    ch.currentFile = item.displayName + " [" + formatSize(work.offset) + "]";
+
+                    while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
+                        batch->state = BatchState::Paused;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                    if (m_shutdownTransfer || batch->stopRequested.load() || failed.load())
+                        break;
+                    batch->state = BatchState::Running;
+
+                    auto rangeProgress = [&](uint64_t transferred, uint64_t total) -> bool {
+                        if (m_shutdownTransfer || batch->stopRequested.load() || failed.load())
+                            return false;
+                        while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
+                            batch->state = BatchState::Paused;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        if (m_shutdownTransfer || batch->stopRequested.load()) return false;
+                        batch->state = BatchState::Running;
+
+                        ch.bytesTransferred = chCompleted + transferred;
+                        ch.curBlockTransferred = transferred;
+                        batch->currentFileIndex = work.fileIndex;
+                        batch->curFileSize = item.fileSize;
+                        batch->curFileTransferred = transferred;
+                        if (total > 0)
+                            batch->curFileProgress = (float)((double)transferred / (double)total);
+                        auto now = std::chrono::steady_clock::now();
+                        double dt = std::chrono::duration<double>(now - lastChTime).count();
+                        if (dt >= 0.5) {
+                            uint64_t chBytes = ch.bytesTransferred.load();
+                            double instant = (double)(chBytes - lastChBytes) / dt;
+                            double prev = ch.speed.load();
+                            ch.speed = prev > 0 ? prev * 0.8 + instant * 0.2 : instant;
+                            lastChBytes = chBytes;
+                            lastChTime = now;
+                        }
+                        bytesWrittenToDest = 0;
+                        for (int c = 0; c < progressChannels; c++)
+                            bytesWrittenToDest += batch->channels[c].bytesTransferred.load();
+                        updateCrossProgress();
+                        m_lastTransferActivity = std::chrono::steady_clock::now();
+                        return true;
+                    };
+
+                    DeviceClient::RelayRangeStats relayStats;
+                    bool relayed = DeviceClient::relayRange(srcCh, dstCh,
+                        item.sourcePath, item.destPath,
+                        work.offset, work.offset, work.length,
+                        rangeProgress, &relayStats);
+
+                    ch.relayReadSec = ch.relayReadSec.load() + relayStats.srcRecvSec;
+                    ch.relaySendSec = ch.relaySendSec.load() + relayStats.dstSendSec;
+
+                    if (!relayed && !batch->stopRequested.load()) {
+                        failed = true;
+                        std::lock_guard<std::mutex> lk(relayErrorMutex);
+                        relayError = item.displayName + ": " + ch.channelName;
+                        if (!srcCh.lastError().empty())
+                            relayError += ", " + srcCh.lastError();
+                        if (!dstCh.lastError().empty())
+                            relayError += ", " + dstCh.lastError();
+                        break;
+                    }
+
+                    chCompleted += work.length;
+                    ch.bytesTransferred = chCompleted;
+                    ch.curBlockTransferred = work.length;
+                    ch.filesCompleted++;
+                    bytesWrittenToDest = 0;
+                    for (int c = 0; c < progressChannels; c++)
+                        bytesWrittenToDest += batch->channels[c].bytesTransferred.load();
+                    updateCrossProgress();
+                    completedBlocks++;
+                    {
+                        std::lock_guard<std::mutex> lk(workMutex);
+                        if (relayStats.hasSrcCrc && relayStats.hasDstCrc) {
+                            std::lock_guard<std::mutex> crcLk(crcMutex);
+                            rangeCrcs[work.fileIndex].push_back({
+                                work.offset, work.length, relayStats.srcCrc, relayStats.dstCrc
+                            });
+                        }
+                        completedBlocksPerFile[work.fileIndex]++;
+                        if (completedBlocksPerFile[work.fileIndex] >= totalBlocksPerFile[work.fileIndex])
+                            completedFileIndices.insert(work.fileIndex);
+                    }
+                }
+                ch.speed = 0;
+                ch.elapsedSec = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - chStart).count();
+            };
+
+            LOG_INFO("Transfer", "Cross-device streaming relay: " + std::to_string(batch->totalFiles()) +
+                " files using " + std::to_string(pairCount) + " channel pair(s), " +
+                std::to_string(totalReadRanges) + " interleaved range(s)");
+
+            std::vector<std::thread> relayThreads;
+            for (int c = 0; c < pairCount; c++)
+                relayThreads.emplace_back(relayWorker, c);
+            for (auto& t : relayThreads) t.join();
+
+            if (failed.load() || (!batch->stopRequested.load() && completedBlocks.load() < totalBlocks)) {
+                batch->state = BatchState::Failed;
+                batch->errorMessage = relayError.empty() ? "Cross-device transfer failed" : relayError;
+                for (int fi = 0; fi < batch->totalFiles(); fi++) {
+                    auto& item = batch->files[fi];
+                    if (item.isDirectory || skipped[fi]) continue;
+                    if (completedFileIndices.count(fi)) continue;
+                    dstDev.deleteFile(item.destPath);
+                }
+            } else if (batch->stopRequested.load()) {
+                batch->state = BatchState::Stopped;
+                for (int fi = 0; fi < batch->totalFiles(); fi++) {
+                    auto& item = batch->files[fi];
+                    if (item.isDirectory || skipped[fi]) continue;
+                    if (completedFileIndices.count(fi)) continue;
+                    dstDev.deleteFile(item.destPath);
+                }
+            } else {
+                bool anyCrcFail = false;
+                if (m_prefs.enableCrcVerification) {
+                    batch->state = BatchState::Verifying;
+                    for (int fi = 0; fi < batch->totalFiles() && !batch->stopRequested.load(); fi++) {
+                        auto& item = batch->files[fi];
+                        if (item.isDirectory || skipped[fi]) continue;
+
+                        batch->crcFileName = item.displayName;
+                        batch->crcProgress = 1.0f;
+                        batch->crcPhase = 2;
+                        batch->errorMessage = "Verifying: " + item.displayName;
+
+                        auto blocks = rangeCrcs[fi];
+                        std::sort(blocks.begin(), blocks.end(),
+                                  [](const RelayRangeCrc& a, const RelayRangeCrc& b) {
+                                      return a.offset < b.offset;
+                                  });
+
+                        bool crcOk = !blocks.empty();
+                        bool inlineCrcComplete = !blocks.empty() &&
+                            blocks.size() == (size_t)totalBlocksPerFile[fi];
+                        uint64_t expectedOffset = 0;
+                        uint32_t srcCrc = 0;
+                        uint32_t dstCrc = 0;
+                        std::string crcFailReason;
+                        if (blocks.empty()) {
+                            crcFailReason = "inline range CRC unavailable";
+                        } else if (!inlineCrcComplete) {
+                            crcOk = false;
+                            crcFailReason = "inline range CRC incomplete: " +
+                                std::to_string(blocks.size()) + "/" +
+                                std::to_string(totalBlocksPerFile[fi]) + " ranges";
+                        } else {
+                            srcCrc = blocks[0].srcCrc;
+                            dstCrc = blocks[0].dstCrc;
+                            expectedOffset = blocks[0].length;
+                            crcOk = (blocks[0].offset == 0);
+                            if (!crcOk)
+                                crcFailReason = "first range does not start at offset 0";
+                            else if (blocks[0].srcCrc != blocks[0].dstCrc) {
+                                crcOk = false;
+                                crcFailReason = "range CRC mismatch at offset 0";
+                            }
+                        }
+                        for (size_t i = 1; crcOk && i < blocks.size(); i++) {
+                            if (blocks[i].offset != expectedOffset) {
+                                crcOk = false;
+                                crcFailReason = "missing range at offset " + std::to_string(expectedOffset);
+                                break;
+                            }
+                            if (blocks[i].srcCrc != blocks[i].dstCrc) {
+                                crcOk = false;
+                                crcFailReason = "range CRC mismatch at offset " + std::to_string(blocks[i].offset);
+                                break;
+                            }
+                            srcCrc = crc32Combine(srcCrc, blocks[i].srcCrc, blocks[i].length);
+                            dstCrc = crc32Combine(dstCrc, blocks[i].dstCrc, blocks[i].length);
+                            expectedOffset += blocks[i].length;
+                        }
+                        if (crcOk && expectedOffset != item.fileSize) {
+                            crcOk = false;
+                            crcFailReason = "range coverage ended at " + std::to_string(expectedOffset) +
+                                " of " + std::to_string(item.fileSize);
+                        }
+                        if (crcOk)
+                            crcOk = (srcCrc == dstCrc);
+                        if (!crcOk && crcFailReason.empty())
+                            crcFailReason = "combined CRC mismatch";
+
+                        bool usedFallbackCrc = false;
+                        double srcRemoteMs = 0.0;
+                        double dstRemoteMs = 0.0;
+                        std::string fallbackDetail;
+                        if (!crcOk) {
+                            uint32_t srcRemoteCrc = 0;
+                            uint32_t dstRemoteCrc = 0;
+                            std::string srcDetail;
+                            std::string dstDetail;
+                            bool srcRemoteOk = srcDev.getRemoteCrc32(item.sourcePath, srcRemoteCrc,
+                                srcDetail, item.fileSize, &srcRemoteMs);
+                            bool dstRemoteOk = dstDev.getRemoteCrc32(item.destPath, dstRemoteCrc,
+                                dstDetail, item.fileSize, &dstRemoteMs);
+                            usedFallbackCrc = true;
+
+                            char fbBuf[192];
+                            snprintf(fbBuf, sizeof(fbBuf),
+                                     "Source remote: %08X  Destination remote: %08X",
+                                     srcRemoteCrc, dstRemoteCrc);
+                            fallbackDetail = fbBuf;
+
+                            if (srcRemoteOk && dstRemoteOk) {
+                                crcOk = (srcRemoteCrc == dstRemoteCrc);
+                                if (crcOk) {
+                                    srcCrc = srcRemoteCrc;
+                                    dstCrc = dstRemoteCrc;
+                                } else {
+                                    crcFailReason = "remote CRC mismatch after inline failure: " + crcFailReason;
+                                }
+                            } else {
+                                std::string remoteReason = "remote CRC fallback failed";
+                                if (!srcRemoteOk) remoteReason += " (source: " + srcDetail + ")";
+                                if (!dstRemoteOk) remoteReason += " (destination: " + dstDetail + ")";
+                                crcFailReason = remoteReason + " after inline failure: " + crcFailReason;
+                            }
+                        }
+
+                        char detailBuf[160];
+                        snprintf(detailBuf, sizeof(detailBuf),
+                                 "Source inline: %08X  Destination inline: %08X",
+                                 srcCrc, dstCrc);
+
+                        TransferBatch::CrcResult crcRes;
+                        crcRes.fileName = item.displayName;
+                        crcRes.passed = crcOk;
+                        if (usedFallbackCrc) {
+                            crcRes.detail = fallbackDetail + " (inline: " + crcFailReason + ")";
+                        } else {
+                            crcRes.detail = crcOk ? detailBuf : std::string(detailBuf) + " (" + crcFailReason + ")";
+                        }
+                        crcRes.remoteMs = srcRemoteMs;
+                        crcRes.localMs = dstRemoteMs;
+                        crcRes.totalMs = srcRemoteMs + dstRemoteMs;
+                        crcRes.fileSize = item.fileSize;
+                        crcRes.sourcePath = item.sourcePath;
+                        crcRes.destPath = item.destPath;
+                        batch->crcResults.push_back(std::move(crcRes));
+
+                        if (!crcOk) {
+                            anyCrcFail = true;
+                            LOG_ERROR("Transfer", "CRC FAILED (cross-device inline): " + item.displayName +
+                                " - " + crcFailReason);
+                        } else if (usedFallbackCrc) {
+                            LOG_WARN("Transfer", "CRC OK (cross-device remote fallback): " + item.displayName +
+                                " - inline check could not complete: " + crcFailReason);
+                        } else {
+                            LOG_INFO("Transfer", "CRC OK (cross-device inline): " + item.displayName);
+                        }
+                    }
+                    batch->crcFileName.clear();
+                    batch->crcProgress = 0.0f;
+                    batch->crcPhase = 0;
+                }
+
+                batch->totalProgress = 1.0f;
+                batch->totalTransferred = batch->totalBytes.load();
+                auto totalTime = std::chrono::steady_clock::now() - batch->startTime;
+                double activeSec = std::chrono::duration<double>(totalTime).count() -
+                    batch->pausedSeconds.load();
+                if (activeSec < 0.1) activeSec = 0.1;
+                double avgSpeed = (double)batch->totalTransferred.load() / activeSec;
+                batch->finalAvgSpeed = avgSpeed;
+                batch->finalTimeSec = activeSec;
+                batch->speedBytesPerSec = 0;
+                batch->etaSeconds = -1;
+                if (anyCrcFail) {
+                    batch->state = BatchState::Failed;
+                    batch->errorMessage = "CRC verification failed - file(s) may be corrupted";
+                } else {
+                    batch->state = BatchState::Completed;
+                    logBatchPerformance("cross-device streaming relay", activeSec, avgSpeed);
+                    batch->errorMessage.clear();
+                }
+                m_statusMessage = "Cross-device done: " + std::to_string(batch->totalFiles()) + " files, " +
+                    formatSize(batch->totalTransferred.load()) + " @ " + formatSpeed(avgSpeed);
+                m_statusTime = std::chrono::steady_clock::now();
+                m_leftPanel.needsRefresh = true;
+                m_rightPanel.needsRefresh = true;
+            }
+
+            for (auto& rc : crossSrcChannels) if (rc.owned) rc.owned->disconnectTcp();
+            for (auto& rc : crossDstChannels) if (rc.owned) rc.owned->disconnectTcp();
+            continue;
+        }
+
+        // --- Fast parallel MCRAW batch extraction ---
+        // If this is a local copy and contains MCRAW virtual DNG frames from the same container,
+        // extract the DNG frames in parallel, then handle non-DNG items (metadata, audio) normally.
+        if (batch->isLocalCopy && !batch->files.empty()) {
+            std::string mcrawContainer;
+            int dngCount = 0;
+            int nonDngCount = 0;
+            std::string destDir;
+            for (auto& item : batch->files) {
+                if (item.isDirectory) continue;
+                if (item.isMcrawVirtual && item.virtualName.find(".dng") != std::string::npos) {
+                    if (mcrawContainer.empty()) {
+                        mcrawContainer = item.mcrawPath;
+                        auto dp = std::filesystem::path(item.destPath).parent_path();
+                        destDir = dp.string();
+                    } else if (item.mcrawPath != mcrawContainer) {
+                        mcrawContainer.clear(); // mixed containers, can't batch
+                        break;
+                    }
+                    dngCount++;
+                } else {
+                    nonDngCount++;
+                }
+            }
+
+            if (dngCount >= 2 && !mcrawContainer.empty() && !destDir.empty()) {
+                // Use parallel batch extraction for DNG frames
+                LOG_INFO("Transfer", "MCRAW batch path: " + std::to_string(dngCount) + " DNG + " +
+                         std::to_string(nonDngCount) + " other items from " + mcrawContainer);
+                try { std::filesystem::create_directories(destDir); } catch (...) {}
+
+                int extracted = extractLocalMcrawBatch(
+                    mcrawContainer, destDir, 0, // auto thread count
+                    &batch->stopRequested,
+                    [&](int completed, int total, uint64_t bytesWritten) {
+                        batch->currentFileIndex = completed - 1;
+                        batch->totalTransferred = bytesWritten;
+                        if (total > 0)
+                            batch->totalProgress = (float)completed / (float)total;
+                        batch->curFileProgress = 1.0f;
+
+                        // Speed tracking
+                        auto now = std::chrono::steady_clock::now();
+                        double dt = std::chrono::duration<double>(now - lastSpeedTime).count();
+                        if (dt >= 0.5) {
+                            double delta = (double)(bytesWritten - lastSpeedBytes);
+                            double instantSpeed = delta / dt;
+                            double prevSpeed = batch->speedBytesPerSec.load();
+                            double smoothed = (prevSpeed > 0) ? prevSpeed * 0.8 + instantSpeed * 0.2 : instantSpeed;
+                            batch->speedBytesPerSec = smoothed;
+                            uint64_t tb = batch->totalBytes.load();
+                            if (smoothed > 0 && tb > bytesWritten)
+                                batch->etaSeconds = (double)(tb - bytesWritten) / smoothed;
+                            else batch->etaSeconds = -1.0;
+                            lastSpeedBytes = bytesWritten;
+                            lastSpeedTime = now;
+                        }
+
+                        m_lastTransferActivity = std::chrono::steady_clock::now();
+                    });
+
+                bytesCompletedBefore = batch->totalTransferred.load();
+
+                if (batch->stopRequested.load()) {
+                    batch->state = BatchState::Stopped;
+                    continue;
+                }
+
+                // If there are non-DNG items (metadata.json, audio.wav), extract them now
+                if (nonDngCount > 0) {
+                    for (auto& item : batch->files) {
+                        if (batch->stopRequested.load()) break;
+                        if (item.isDirectory || !item.isMcrawVirtual) continue;
+                        if (item.virtualName.find(".dng") != std::string::npos) continue; // already extracted
+                        extractLocalMcrawItem(mcrawContainer, item.virtualName, item.destPath);
+                    }
+                }
+
+                // Update final state
+                batch->totalTransferred = batch->totalBytes.load();
+                batch->totalProgress = 1.0f;
+                if (extracted >= dngCount) {
+                    batch->state = BatchState::Completed;
+                } else if (extracted > 0) {
+                    batch->state = BatchState::Completed;
+                } else {
+                    batch->state = BatchState::Failed;
+                    batch->errorMessage = "MCRAW batch extraction failed";
+                }
+                if (batch->state.load() == BatchState::Completed) {
+                    auto totalTime = std::chrono::steady_clock::now() - batch->startTime;
+                    double activeSec = std::chrono::duration<double>(totalTime).count() -
+                        batch->pausedSeconds.load();
+                    if (activeSec < 0.1) activeSec = 0.1;
+                    double avgSpeed = (double)batch->totalTransferred.load() / activeSec;
+                    batch->finalAvgSpeed = avgSpeed;
+                    batch->finalTimeSec = activeSec;
+                    logBatchPerformance("MCRAW batch extraction", activeSec, avgSpeed);
+                }
+                continue; // skip per-item loop
+            }
+        }
+
+        for (int fi = 0; fi < batch->totalFiles() && !m_shutdownTransfer; fi++) {
+            if (batch->stopRequested.load()) { batch->state = BatchState::Stopped; break; }
+
+            // Pause — track paused duration for accurate avg speed
+            if (batch->pauseRequested.load()) {
+                auto pauseStart = std::chrono::steady_clock::now();
+                while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
+                    batch->state = BatchState::Paused;
+                    std::unique_lock<std::mutex> lk(m_batchMutex);
+                    m_batchCV.wait_for(lk, std::chrono::milliseconds(200));
+                }
+                batch->pausedSeconds = batch->pausedSeconds.load() +
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - pauseStart).count();
+            }
+            if (batch->stopRequested.load()) { batch->state = BatchState::Stopped; break; }
+            batch->state = BatchState::Running;
+
+            batch->currentFileIndex = fi;
+            auto& item = batch->files[fi];
+
+            // Get file size if unknown
+            if (item.fileSize == 0 && !item.isDirectory) {
+                if (batch->isPull) item.fileSize = batchDev.getFileSize(item.sourcePath);
+                else { try { item.fileSize = std::filesystem::file_size(toFsPath(item.sourcePath)); } catch (...) {} }
+                uint64_t newTotal = 0;
+                for (auto& f : batch->files) newTotal += f.fileSize;
+                batch->totalBytes = newTotal;
+            }
+
+            batch->curFileSize = item.fileSize;
+            batch->curFileTransferred = 0;
+            batch->curFileProgress = 0.0f;
+
+            // --- Write permission pre-check for local destinations ---
+            if (!item.isDirectory && (batch->isPull || batch->isLocalCopy)) {
+                // Test if we can create a file in the destination directory
+                std::filesystem::path destDir = toFsPath(item.destPath).parent_path();
+                try {
+                    std::filesystem::create_directories(destDir);
+                } catch (...) {}
+                std::string testPath = pathToUtf8(destDir) + "\\.afm_write_test";
+                HANDLE hTest = CreateFileW(toWide(testPath).c_str(), GENERIC_WRITE, 0, nullptr,
+                                           CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+                if (hTest == INVALID_HANDLE_VALUE) {
+                    DWORD err = GetLastError();
+                    batch->state = BatchState::Failed;
+                    if (err == ERROR_ACCESS_DENIED)
+                        batch->errorMessage = "Access denied: " + pathToUtf8(destDir) + "\n\nThis location requires administrator rights.";
+                    else
+                        batch->errorMessage = "Cannot write to: " + pathToUtf8(destDir) + " (error " + std::to_string(err) + ")";
+                    break;
+                }
+                CloseHandle(hTest); // FILE_FLAG_DELETE_ON_CLOSE auto-deletes
+
+                // Also check if destination file specifically is read-only
+                if (std::filesystem::exists(toFsPath(item.destPath))) {
+                    auto perms = std::filesystem::status(toFsPath(item.destPath)).permissions();
+                    if ((perms & std::filesystem::perms::owner_write) == std::filesystem::perms::none) {
+                        batch->state = BatchState::Failed;
+                        batch->errorMessage = "Destination file is read-only: " + item.displayName;
+                        break;
+                    }
+                }
+            }
+
+            // --- File conflict check ---
+            if (!item.isDirectory) {
+                bool destExists = false;
+                if (batch->isLocalCopy || batch->isPull) {
+                    // Destination is Windows — check local filesystem
+                    destExists = std::filesystem::exists(toFsPath(item.destPath));
+                } else {
+                    // Destination is Android — use the DESTINATION device client
+                    DeviceClient& destDev = batch->isCrossDevice
+                        ? m_deviceSlots[batch->dstDeviceSlot & 1] : batchDev;
+                    uint64_t remoteSize = destDev.getFileSize(item.destPath);
+                    destExists = (remoteSize > 0);
+                }
+
+                if (destExists) {
+                    ConflictAction action = batch->conflictAllDecision;
+
+                    if (action == ConflictAction::None) {
+                        // No sticky decision — ask the user
+                        batch->conflictFileName = item.displayName;
+                        batch->waitingConflict = true;
+                        batch->conflictResponse = ConflictAction::None;
+                        batch->state = BatchState::WaitingConflict;
+
+                        // Wait for UI thread to set conflictResponse
+                        {
+                            std::unique_lock<std::mutex> lk(m_batchMutex);
+                            m_batchCV.wait(lk, [&]() {
+                                return m_shutdownTransfer || batch->stopRequested.load() ||
+                                       batch->conflictResponse.load() != ConflictAction::None;
+                            });
+                        }
+                        batch->waitingConflict = false;
+                        action = batch->conflictResponse.load();
+                        batch->conflictResponse = ConflictAction::None;
+                        batch->state = BatchState::Running;
+
+                        // Store sticky "All" decisions
+                        if (action == ConflictAction::OverwriteAll) {
+                            batch->conflictAllDecision = ConflictAction::OverwriteAll;
+                            action = ConflictAction::Overwrite;
+                        } else if (action == ConflictAction::SkipAll) {
+                            batch->conflictAllDecision = ConflictAction::SkipAll;
+                            action = ConflictAction::Skip;
+                        }
+                    } else {
+                        // Sticky decision — map "All" variants to their single action
+                        if (action == ConflictAction::OverwriteAll) action = ConflictAction::Overwrite;
+                        else if (action == ConflictAction::SkipAll) action = ConflictAction::Skip;
+                    }
+
+                    if (batch->stopRequested.load() || m_shutdownTransfer) {
+                        batch->state = BatchState::Stopped;
+                        break;
+                    }
+
+                    if (action == ConflictAction::Skip) {
+                        batch->skippedFiles++;
+                        bytesCompletedBefore += item.fileSize;
+                        batch->totalTransferred = bytesCompletedBefore;
+                        if (batch->totalBytes.load() > 0)
+                            batch->totalProgress = (float)((double)bytesCompletedBefore / (double)batch->totalBytes.load());
+                        continue; // skip this file
+                    }
+                    // else: Overwrite — fall through to normal transfer
+                }
+            }
+
+            // Progress callback - updates batch atomics, called from DeviceClient
+            auto progressCb = [&](uint64_t transferred, uint64_t total) -> bool {
+                // Check stop/shutdown
+                if (m_shutdownTransfer || batch->stopRequested.load()) return false;
+
+                // Handle pause inside transfer — track paused duration
+                if (batch->pauseRequested.load()) {
+                    auto pStart = std::chrono::steady_clock::now();
+                    while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
+                        batch->state = BatchState::Paused;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                    batch->pausedSeconds = batch->pausedSeconds.load() +
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - pStart).count();
+                }
+                if (batch->stopRequested.load()) return false;
+                batch->state = BatchState::Running;
+
+                // Update per-file progress
+                batch->curFileTransferred = transferred;
+                if (total > 0) batch->curFileProgress = (float)((double)transferred / (double)total);
+
+                // Update total progress
+                uint64_t totalTx = bytesCompletedBefore + transferred;
+                uint64_t tb = batch->totalBytes.load();
+                if (tb > 0 && totalTx > tb) totalTx = tb;
+                uint64_t currentTotal = batch->totalTransferred.load();
+                if (totalTx < currentTotal) totalTx = currentTotal;
+                batch->totalTransferred = totalTx;
+                if (tb > 0) batch->totalProgress = (float)((double)totalTx / (double)tb);
+
+                // Speed/ETA
+                auto now = std::chrono::steady_clock::now();
+                double dt = std::chrono::duration<double>(now - lastSpeedTime).count();
+                if (dt >= 0.5) {
+                    double delta = (double)(totalTx - lastSpeedBytes);
+                    double instantSpeed = delta / dt;
+                    // Exponential moving average — smooths out burst/pause fluctuations
+                    double prevSpeed = batch->speedBytesPerSec.load();
+                    double smoothed = (prevSpeed > 0) ? prevSpeed * 0.8 + instantSpeed * 0.2 : instantSpeed;
+                    batch->speedBytesPerSec = smoothed;
+                    if (smoothed > 0 && tb > totalTx) batch->etaSeconds = (double)(tb - totalTx) / smoothed;
+                    else batch->etaSeconds = -1.0;
+                    lastSpeedBytes = totalTx;
+                    lastSpeedTime = now;
+                }
+
+                return true;
+            };
+
+            // --- Local copy/move (Windows-to-Windows) ---
+            if (batch->isLocalCopy) {
+                bool ok = false;
+                try {
+                    // Same-drive move: instant rename (no data copy)
+                    bool sameDrive = (item.sourcePath.size() >= 2 && item.destPath.size() >= 2 &&
+                                     toupper(item.sourcePath[0]) == toupper(item.destPath[0]));
+
+                    if (batch->isMove && sameDrive && !item.isDirectory) {
+                        // Create parent directory if needed
+                        auto dp = toFsPath(item.destPath);
+                        if (dp.has_parent_path())
+                            std::filesystem::create_directories(dp.parent_path());
+                        std::filesystem::rename(toFsPath(item.sourcePath), dp);
+                        progressCb(item.fileSize, item.fileSize);
+                        ok = true;
+                    } else if (item.isDirectory) {
+                        if (batch->isMove && sameDrive) {
+                            std::filesystem::rename(toFsPath(item.sourcePath), toFsPath(item.destPath));
+                        } else {
+                            std::filesystem::create_directories(toFsPath(item.destPath));
+                        }
+                        ok = true;
+                    } else {
+                        // Create parent directory if needed
+                        auto dp = toFsPath(item.destPath);
+                        if (dp.has_parent_path())
+                            std::filesystem::create_directories(dp.parent_path());
+
+                        // Buffered copy with progress reporting
+                        FILE* fin = nullptr; FILE* fout = nullptr;
+                        _wfopen_s(&fin, toWide(item.sourcePath).c_str(), L"rb");
+                        if (!fin) throw std::runtime_error("Cannot open source: " + item.sourcePath);
+                        _wfopen_s(&fout, toWide(item.destPath).c_str(), L"wb");
+                        if (!fout) { fclose(fin); throw std::runtime_error("Cannot open dest: " + item.destPath); }
+
+                        const size_t bufSize = 4 * 1024 * 1024; // 4MB
+                        auto buf = std::make_unique<char[]>(bufSize);
+                        uint64_t copied = 0;
+                        bool cancelled = false;
+                        while (true) {
+                            size_t n = fread(buf.get(), 1, bufSize, fin);
+                            if (n == 0) break;
+                            fwrite(buf.get(), 1, n, fout);
+                            copied += n;
+                            if (!progressCb(copied, item.fileSize)) { cancelled = true; break; }
+                        }
+                        fclose(fin);
+                        fclose(fout);
+                        if (cancelled) {
+                            std::filesystem::remove(toFsPath(item.destPath));
+                        } else {
+                            ok = true;
+                            // Cross-drive move: delete source after successful copy
+                            if (batch->isMove) {
+                                std::filesystem::remove(toFsPath(item.sourcePath));
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    batch->errorMessage = item.displayName + ": " + e.what();
+                }
+
+                if (batch->stopRequested.load()) { batch->state = BatchState::Stopped; break; }
+                if (!ok) {
+                    if (batch->errorMessage.empty())
+                        batch->errorMessage = item.displayName + ": " + (batch->isMove ? "move" : "copy") + " failed";
+                    batch->state = BatchState::Failed;
+                    break;
+                }
+
+                bytesCompletedBefore += item.fileSize;
+                batch->totalTransferred = bytesCompletedBefore;
+                batch->curFileProgress = 1.0f;
+                m_lastTransferActivity = std::chrono::steady_clock::now();
+                continue; // next file
+            }
+
+            // --- Cross-device Android-to-Android transfer ---
+            if (batch->isCrossDevice) {
+                DeviceClient& srcDev = m_deviceSlots[batch->srcDeviceSlot & 1];
+                DeviceClient& dstDev = m_deviceSlots[batch->dstDeviceSlot & 1];
+                bool ok = false;
+
+                if (!srcDev.isServerRunning() || !dstDev.isServerRunning()) {
+                    batch->state = BatchState::Failed;
+                    batch->errorMessage = "Both devices must be connected for cross-device transfer";
+                    break;
+                }
+
+                if (item.isDirectory) {
+                    // Create directory on destination device
+                    ok = dstDev.createDirectory(item.destPath);
+                } else if (!batch->useDokanRelay) {
+                    int pairCount = std::min((int)crossSrcChannels.size(), (int)crossDstChannels.size());
+                    pairCount = std::min(pairCount, (int)TransferBatch::MAX_CHANNELS);
+
+                    if (pairCount <= 0) {
+                        ok = DeviceClient::relayFile(srcDev, dstDev, item.sourcePath, item.destPath,
+                                                     item.fileSize, progressCb);
+                    } else {
+                        if (item.fileSize == 0)
+                            item.fileSize = srcDev.getFileSize(item.sourcePath);
+
+                        ok = dstDev.createFile(item.destPath, item.fileSize);
+                        if (ok) {
+                            static const uint64_t MB = 1024ULL * 1024;
+                            static const uint64_t GB = 1024ULL * MB;
+                            auto blockSizeFor = [](uint64_t fileSize, int channels) -> uint64_t {
+                                if (channels <= 1) return fileSize;
+                                const uint64_t MB = 1024ULL * 1024;
+                                const uint64_t GB = 1024ULL * MB;
+                                if (fileSize >= 2 * GB) return 128 * MB;
+                                if (fileSize >= 512 * MB) return 96 * MB;
+                                return 64 * MB;
+                            };
+
+                            struct RelayBlock {
+                                uint64_t offset;
+                                uint64_t length;
+                            };
+
+                            std::deque<RelayBlock> workQueue;
+                            uint64_t blockSize = blockSizeFor(item.fileSize, pairCount);
+                            uint64_t remaining = item.fileSize;
+                            uint64_t offset = 0;
+                            while (remaining > 0) {
+                                uint64_t len = std::min(remaining, blockSize);
+                                workQueue.push_back({offset, len});
+                                offset += len;
+                                remaining -= len;
+                            }
+
+                            std::mutex workMutex;
+                            std::atomic<bool> failed{false};
+                            std::atomic<int> completedBlocks{0};
+                            int totalBlocks = (int)workQueue.size();
+                            std::string relayError;
+                            std::mutex relayErrorMutex;
+
+                            for (int c = 0; c < pairCount; c++) {
+                                batch->channels[c].bytesTransferred = 0;
+                                batch->channels[c].speed = 0;
+                                batch->channels[c].curBlockSize = 0;
+                                batch->channels[c].curBlockTransferred = 0;
+                                batch->channels[c].relayReadSec = 0;
+                                batch->channels[c].relaySendSec = 0;
+                                batch->channels[c].currentFile = item.displayName;
+                                batch->channels[c].filesAssigned = totalBlocks;
+                                batch->channels[c].channelName = crossSrcChannels[c].name + " > " + crossDstChannels[c].name;
+                            }
+                            batch->numChannels = pairCount;
+
+                            auto updateCombinedProgress = [&]() {
+                                uint64_t fileTransferred = 0;
+                                double combinedSpeed = 0;
+                                for (int c = 0; c < pairCount; c++) {
+                                    fileTransferred += batch->channels[c].bytesTransferred.load();
+                                    combinedSpeed += batch->channels[c].speed.load();
+                                }
+                                if (fileTransferred > item.fileSize) fileTransferred = item.fileSize;
+                                batch->curFileTransferred = fileTransferred;
+                                if (item.fileSize > 0)
+                                    batch->curFileProgress = (float)((double)fileTransferred / (double)item.fileSize);
+                                uint64_t totalTx = bytesCompletedBefore + fileTransferred;
+                                uint64_t tb = batch->totalBytes.load();
+                                if (tb > 0 && totalTx > tb) totalTx = tb;
+                                uint64_t currentTotal = batch->totalTransferred.load();
+                                if (totalTx < currentTotal) totalTx = currentTotal;
+                                batch->totalTransferred = totalTx;
+                                if (tb > 0) batch->totalProgress = (float)((double)totalTx / (double)tb);
+                                batch->speedBytesPerSec = combinedSpeed;
+                                batch->etaSeconds = (combinedSpeed > 0 && tb > totalTx)
+                                    ? (double)(tb - totalTx) / combinedSpeed : -1.0;
+                            };
+
+                            auto relayWorker = [&](int chIdx) {
+                                auto& ch = batch->channels[chIdx];
+                                DeviceClient& srcCh = *crossSrcChannels[chIdx].dev;
+                                DeviceClient& dstCh = *crossDstChannels[chIdx].dev;
+                                uint64_t chCompleted = 0;
+                                uint64_t lastChBytes = 0;
+                                auto lastChTime = std::chrono::steady_clock::now();
+
+                                while (!m_shutdownTransfer && !batch->stopRequested.load() && !failed.load()) {
+                                    RelayBlock block{};
+                                    {
+                                        std::lock_guard<std::mutex> lk(workMutex);
+                                        if (workQueue.empty()) break;
+                                        block = workQueue.front();
+                                        workQueue.pop_front();
+                                    }
+
+                                    ch.curBlockSize = block.length;
+                                    ch.curBlockTransferred = 0;
+                                    ch.currentFile = item.displayName + " [" + formatSize(block.offset) + "]";
+
+                                    auto rangeProgress = [&](uint64_t transferred, uint64_t total) -> bool {
+                                        if (m_shutdownTransfer || batch->stopRequested.load() || failed.load())
+                                            return false;
+                                        while (batch->pauseRequested.load() && !m_shutdownTransfer && !batch->stopRequested.load()) {
+                                            batch->state = BatchState::Paused;
+                                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                                        }
+                                        if (m_shutdownTransfer || batch->stopRequested.load()) return false;
+                                        batch->state = BatchState::Running;
+
+                                        ch.bytesTransferred = chCompleted + transferred;
+                                        ch.curBlockTransferred = transferred;
+
+                                        auto now = std::chrono::steady_clock::now();
+                                        double dt = std::chrono::duration<double>(now - lastChTime).count();
+                                        if (dt >= 0.5) {
+                                            uint64_t chBytes = ch.bytesTransferred.load();
+                                            double instant = (double)(chBytes - lastChBytes) / dt;
+                                            double prev = ch.speed.load();
+                                            ch.speed = prev > 0 ? prev * 0.8 + instant * 0.2 : instant;
+                                            lastChBytes = chBytes;
+                                            lastChTime = now;
+                                        }
+
+                                        updateCombinedProgress();
+                                        m_lastTransferActivity = std::chrono::steady_clock::now();
+                                        return true;
+                                    };
+
+                                    DeviceClient::RelayRangeStats relayStats;
+                                    bool relayed = DeviceClient::relayRange(srcCh, dstCh,
+                                        item.sourcePath, item.destPath,
+                                        block.offset, block.offset, block.length,
+                                        rangeProgress, &relayStats);
+
+                                    ch.relayReadSec = ch.relayReadSec.load() + relayStats.srcRecvSec;
+                                    ch.relaySendSec = ch.relaySendSec.load() + relayStats.dstSendSec;
+
+                                    if (!relayed && !batch->stopRequested.load()) {
+                                        failed = true;
+                                        std::lock_guard<std::mutex> lk(relayErrorMutex);
+                                        relayError = ch.channelName + ": " + srcCh.lastError();
+                                        if (relayError.find(": ") == relayError.size() - 2)
+                                            relayError += dstCh.lastError();
+                                        break;
+                                    }
+
+                                    chCompleted += block.length;
+                                    ch.bytesTransferred = chCompleted;
+                                    ch.curBlockTransferred = block.length;
+                                    ch.filesCompleted = completedBlocks.fetch_add(1) + 1;
+                                    updateCombinedProgress();
+                                }
+                                ch.speed = 0;
+                            };
+
+                            LOG_INFO("Transfer", "Cross-device pipelined relay: " + item.displayName +
+                                " using " + std::to_string(pairCount) + " channel pair(s), " +
+                                std::to_string(totalBlocks) + " block(s)");
+
+                            std::vector<std::thread> relayThreads;
+                            for (int c = 0; c < pairCount; c++)
+                                relayThreads.emplace_back(relayWorker, c);
+                            for (auto& t : relayThreads) t.join();
+
+                            ok = !failed.load() && !batch->stopRequested.load() &&
+                                 completedBlocks.load() >= totalBlocks;
+                            if (!ok && !batch->stopRequested.load()) {
+                                if (!relayError.empty())
+                                    batch->errorMessage = item.displayName + ": " + relayError;
+                                dstDev.deleteFile(item.destPath);
+                            }
+                        }
+                    }
+                } else {
+                    // Zero-copy relay: stream directly from device A to device B through PC memory
+                    ok = DeviceClient::relayFile(srcDev, dstDev, item.sourcePath, item.destPath,
+                                                  item.fileSize, progressCb);
+                }
+
+                if (batch->stopRequested.load()) { batch->state = BatchState::Stopped; break; }
+                if (!ok) {
+                    batch->state = BatchState::Failed;
+                    if (batch->errorMessage.empty())
+                        batch->errorMessage = item.displayName + ": cross-device transfer failed";
+                    break;
+                }
+
+                bytesCompletedBefore += item.fileSize;
+                batch->totalTransferred = bytesCompletedBefore;
+                batch->curFileProgress = 1.0f;
+                m_lastTransferActivity = std::chrono::steady_clock::now();
+                continue;
+            }
+
+            // Execute transfer via TCP server, with disconnect recovery
+            bool ok = false;
+            bool isResume = false;
+            int maxRetries = 10;
+
+            for (int attempt = 0; attempt <= maxRetries; attempt++) {
+                if (batch->stopRequested.load()) break;
+
+                if (attempt > 0) {
+                    // Reconnect after disconnect — track disconnected duration
+                    auto disconnectStart = std::chrono::steady_clock::now();
+                    batch->disconnected = true;
+                    batch->errorMessage = "Connection lost - reconnecting... (attempt " +
+                        std::to_string(attempt) + "/" + std::to_string(maxRetries) + ")";
+                    m_statusMessage = batch->errorMessage;
+                    m_statusTime = std::chrono::steady_clock::now();
+
+                    // Wait for device to come back and reconnect (up to 2 minutes)
+                    bool reconnected = false;
+                    for (int wait = 0; wait < 120 && !m_shutdownTransfer && !batch->stopRequested.load(); wait++) {
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+                        batch->errorMessage = "Waiting for device... (" + std::to_string(wait * 2) + "s)";
+
+                        // Poll devices directly from this thread (don't rely on UI thread's m_devices)
+                        auto devices = batchDev.getDevices();
+                        std::string foundSerial;
+                        for (auto& d : devices) {
+                            // Match against original serial to avoid reconnecting to a different device
+                            if (d.state == "device" && d.serial == originalSerial) { foundSerial = d.serial; break; }
+                        }
+                        if (foundSerial.empty()) continue;
+
+                        batch->errorMessage = "Device found (" + foundSerial + ") - connecting...";
+                        LOG_INFO("Transfer", "Device found: " + foundSerial + " - reconnecting");
+                        std::this_thread::sleep_for(std::chrono::seconds(3)); // let device settle
+
+                        // Wait for tethering to finish if poll thread is doing it
+                        while (m_tetheringInProgress && !m_shutdownTransfer && !batch->stopRequested.load()) {
+                            batch->errorMessage = "Waiting for tethering to complete...";
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        }
+                        if (m_shutdownTransfer || batch->stopRequested.load()) break;
+
+                        // Re-enable tethering only if user prefers Direct TCP
+                        if (!m_preferAdbForward) {
+                            std::string ip = batchDev.detectDeviceIp(foundSerial);
+                            if (ip.empty()) {
+                                batch->errorMessage = "Re-enabling USB tethering...";
+                                LOG_INFO("Transfer", "No tethering IP - re-enabling tethering");
+                                m_tetheringInProgress = true;
+                                batchDev.tryEnableUsbTethering(foundSerial);
+                                m_tetheringInProgress = false;
+                            }
+                        }
+
+                        if (batchDev.startServer(foundSerial, m_preferAdbForward, m_prefs.rootEnabledForSerial(foundSerial))) {
+                            std::string connMode = batchDev.isDirectConnection()
+                                ? "Direct TCP: " + batchDev.deviceIp() : "ADB Forward";
+                            m_statusMessage = "Reconnected via " + connMode + " - resuming transfer";
+                            m_statusTime = std::chrono::steady_clock::now();
+
+                            // Update m_lastDeviceSerial so poll thread doesn't
+                            // treat this as a "new device" and re-run tethering
+                            m_lastDeviceSerial = foundSerial;
+
+                            batch->disconnected = false;
+                            batch->errorMessage.clear();
+                            isResume = true;
+                            reconnected = true;
+                            // Accumulate disconnected time
+                            batch->pausedSeconds = batch->pausedSeconds.load() +
+                                std::chrono::duration<double>(std::chrono::steady_clock::now() - disconnectStart).count();
+                            // Reset speed tracking
+                            lastSpeedBytes = batch->totalTransferred.load();
+                            lastSpeedTime = std::chrono::steady_clock::now();
+                            break;
+                        } else {
+                            batch->errorMessage = "Server start failed: " + batchDev.lastError();
+                        }
+                    }
+                    if (!reconnected) continue; // retry loop
+                }
+
+                if (item.isDirectory) {
+                    // Create directory on destination
+                    if (batch->isPull) {
+                        try { std::filesystem::create_directories(item.destPath); } catch (...) {}
+                    } else {
+                        batchDev.createDirectory(item.destPath);
+                    }
+                    ok = true;
+                    break; // no retry needed for mkdir
+                } else if (item.isMcrawVirtual) {
+                    // MCRAW virtual item extraction
+                    if (batch->isPull) {
+                        // Android MCRAW → Windows: use pullMcrawItem
+                        uint64_t outSize = 0;
+                        ok = batchDev.pullMcrawItem(item.mcrawPath, item.virtualName,
+                                                     item.destPath, outSize, progressCb);
+                        if (ok && outSize > 0) item.fileSize = outSize;
+                    } else {
+                        // Windows MCRAW → Android: extract locally to temp, then push
+                        std::string tmpPath = item.destPath + ".tmp";
+                        ok = extractLocalMcrawItem(item.mcrawPath, item.virtualName, tmpPath);
+                        if (ok) {
+                            uint64_t tmpSize = (uint64_t)std::filesystem::file_size(toFsPath(tmpPath));
+                            item.fileSize = tmpSize;
+                            ok = batchDev.pushFile(tmpPath, item.destPath, tmpSize, progressCb);
+                            std::filesystem::remove(toFsPath(tmpPath));
+                        }
+                    }
+                } else if (batch->isPull) {
+                    LOG_INFO("Transfer", "Batch pull: " + item.sourcePath + " -> " + item.destPath);
+                    uint64_t outSize = 0;
+                    if (isResume) {
+                        ok = batchDev.resumePullFile(item.sourcePath, item.destPath, outSize, progressCb);
+                    } else {
+                        ok = batchDev.pullFile(item.sourcePath, item.destPath, outSize, progressCb);
+                    }
+                    LOG_INFO("Transfer", "Batch pull result: " + std::string(ok ? "OK" : "FAIL") +
+                             " error=" + batchDev.lastError());
+                    if (ok && outSize > 0) item.fileSize = outSize;
+                } else {
+                    if (isResume) {
+                        ok = batchDev.resumePushFile(item.sourcePath, item.destPath, item.fileSize, progressCb);
+                    } else {
+                        ok = batchDev.pushFile(item.sourcePath, item.destPath, item.fileSize, progressCb);
+                    }
+                }
+
+                if (ok) break; // success
+
+                // Check if it was a user cancel vs connection error
+                if (batch->stopRequested.load()) break;
+                if (batchDev.lastError() == "Cancelled") break;
+
+                // Local file errors (permission denied, read-only, etc.) — don't retry
+                {
+                    std::string err = batchDev.lastError();
+                    if (err.find("Failed to create local file") != std::string::npos ||
+                        err.find("Cannot open") != std::string::npos ||
+                        err.find("Access is denied") != std::string::npos) {
+                        batch->state = BatchState::Failed;
+                        batch->errorMessage = err + "\n\nThe destination may require administrator rights or be read-only.";
+                        break;
+                    }
+                }
+
+                // If we've used all automatic retries, ask the user
+                if (attempt == maxRetries) {
+                    batch->errorMessage = "Connection failed after " + std::to_string(maxRetries) +
+                        " retries. Click Retry or Stop.";
+                    batch->waitingForUserRetry = true;
+                    batch->userRetryRequested = false;
+
+                    // Wait for user to click Retry or Stop (uses CV instead of busy-wait)
+                    {
+                        std::unique_lock<std::mutex> lk(m_batchMutex);
+                        m_batchCV.wait(lk, [&]() {
+                            return m_shutdownTransfer || batch->stopRequested.load() || batch->userRetryRequested.load();
+                        });
+                    }
+
+                    batch->waitingForUserRetry = false;
+                    if (batch->userRetryRequested.load()) {
+                        batch->userRetryRequested = false;
+                        batch->errorMessage.clear();
+                        attempt = -1; // reset retry counter (will become 0 on loop increment)
+                        isResume = true;
+                        continue;
+                    }
+                    break; // user chose stop
+                }
+
+                // Connection error - will retry
+                isResume = true;
+            }
+
+            if (batch->stopRequested.load()) { batch->state = BatchState::Stopped; break; }
+
+            if (!ok) {
+                batch->state = BatchState::Failed;
+                batch->errorMessage = item.displayName + ": " + batchDev.lastError();
+                break;
+            }
+
+            m_lastTransferActivity = std::chrono::steady_clock::now();
+
+            // CRC32 verification with retry (can be disabled in preferences)
+            // Skip CRC for MCRAW virtual items — data is generated on-the-fly, no remote file to verify against
+            if (!item.isDirectory && !item.isMcrawVirtual && !batch->isLocalCopy && !batch->stopRequested.load() &&
+                batchDev.isServerRunning() && m_prefs.enableCrcVerification) {
+                std::string crcDetail;
+                std::string remotePath = batch->isPull ? item.sourcePath : item.destPath;
+                std::string localPath  = batch->isPull ? item.destPath   : item.sourcePath;
+                batch->crcFileName = item.displayName;
+                batch->crcProgress = 0.0f;
+                batch->crcPhase = 0;
+                batch->state = BatchState::Verifying;
+                batch->errorMessage = "Verifying: " + item.displayName;
+
+                bool crcOk = false;
+                double crcRemoteMs = 0, crcLocalMs = 0;
+                auto crcTotalStart = std::chrono::steady_clock::now();
+                for (int crcAttempt = 0; crcAttempt < 3; crcAttempt++) {
+                    batch->crcProgress = 0.0f;
+                    batch->crcPhase = 0;
+                    if (batchDev.verifyFileCrc(remotePath, localPath, crcDetail, &batch->crcProgress, &batch->crcPhase,
+                                               &crcRemoteMs, &crcLocalMs)) {
+                        crcOk = true;
+                        break;
+                    }
+                    // If it's a connection error (not actual mismatch), retry after reconnect
+                    if (crcDetail.find("Local:") != std::string::npos) break; // actual CRC mismatch, don't retry
+                    LOG_WARN("Transfer", "CRC check failed (attempt " + std::to_string(crcAttempt+1) + "/3): " + crcDetail);
+                    if (crcAttempt < 2 && !batchDev.isServerRunning()) {
+                        // Try to reconnect
+                        batch->errorMessage = "CRC check failed - reconnecting...";
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        batchDev.startServer(originalSerial, m_preferAdbForward, m_prefs.rootEnabledForSerial(originalSerial));
+                        if (!batchDev.isServerRunning()) break;
+                        batch->errorMessage = "Retrying CRC verification: " + item.displayName;
+                    }
+                }
+                batch->state = BatchState::Running;
+                batch->crcFileName.clear();
+                batch->crcProgress = 0.0f;
+                batch->crcPhase = 0;
+
+                double crcTotalMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - crcTotalStart).count();
+
+                TransferBatch::CrcResult crcRes;
+                crcRes.fileName = item.displayName;
+                crcRes.passed = crcOk;
+                crcRes.detail = crcDetail;
+                crcRes.remoteMs = crcRemoteMs;
+                crcRes.localMs = crcLocalMs;
+                crcRes.totalMs = crcTotalMs;
+                crcRes.fileSize = item.fileSize;
+                crcRes.sourcePath = item.sourcePath;  // original batch paths (not CRC-rearranged)
+                crcRes.destPath = item.destPath;
+                batch->crcResults.push_back(std::move(crcRes));
+
+                if (!crcOk) {
+                    LOG_WARN("Transfer", "CRC failed for " + item.displayName + ": " + crcDetail + " — continuing batch");
+                    batch->errorMessage = "CRC failed: " + item.displayName + " — continuing...";
+                } else {
+                    batch->errorMessage.clear();
+                }
+            }
+
+            bytesCompletedBefore += item.fileSize;
+            batch->totalTransferred = bytesCompletedBefore;
+            batch->curFileProgress = 1.0f;
+        }
+
+        for (auto& rc : crossSrcChannels) {
+            if (rc.owned) rc.owned->disconnectTcp();
+        }
+        for (auto& rc : crossDstChannels) {
+            if (rc.owned) rc.owned->disconnectTcp();
+        }
+
+        // Clean up partial files and flush stale data on stop/cancel/error
+        if (batch->state.load() == BatchState::Stopped || batch->state.load() == BatchState::Failed) {
+            // Delete the partially-transferred file (the one that was in progress when stopped)
+            int curIdx = batch->currentFileIndex.load();
+            if (curIdx >= 0 && curIdx < batch->totalFiles()) {
+                auto& item = batch->files[curIdx];
+                if (!item.isDirectory && batch->isPull) {
+                    // Pull: partial file is on Windows
+                    try {
+                        if (std::filesystem::exists(toFsPath(item.destPath))) {
+                            std::filesystem::remove(toFsPath(item.destPath));
+                            LOG_INFO("Transfer", "Deleted partial file: " + item.destPath);
+                        }
+                    } catch (...) {}
+                } else if (!item.isDirectory && !batch->isPull && !batch->isLocalCopy) {
+                    // Push: partial file is on Android
+                    batchDev.deleteFile(item.destPath);
+                    LOG_INFO("Transfer", "Deleted partial remote file: " + item.destPath);
+                } else if (!item.isDirectory && batch->isLocalCopy) {
+                    // Local copy: partial file is on Windows
+                    try {
+                        if (std::filesystem::exists(toFsPath(item.destPath))) {
+                            std::filesystem::remove(toFsPath(item.destPath));
+                            LOG_INFO("Transfer", "Deleted partial file: " + item.destPath);
+                        }
+                    } catch (...) {}
+                }
+            }
+            batchDev.flushStaleData();
+            batchDev.restoreTimeouts();
+        }
+
+        // Finalize batch
+        if (batch->state.load() == BatchState::Running || batch->state.load() == BatchState::Verifying) {
+            batch->totalProgress = 1.0f;
+            batch->totalTransferred = batch->totalBytes.load();
+            auto totalTime = std::chrono::steady_clock::now() - batch->startTime;
+            double wallSec = std::chrono::duration<double>(totalTime).count();
+            double activeSec = wallSec - batch->pausedSeconds.load(); // exclude paused/disconnected time
+            if (activeSec < 0.1) activeSec = 0.1;
+            double avgSpeed = (activeSec > 0) ? (double)batch->totalTransferred.load() / activeSec : 0;
+            batch->finalAvgSpeed = avgSpeed;
+            batch->finalTimeSec = activeSec;
+            batch->speedBytesPerSec = 0;
+            batch->etaSeconds = -1;
+            batch->state = BatchState::Completed;
+            logBatchPerformance(batch->isCrossDevice ? "cross-device streamed" :
+                                (batch->isLocalCopy ? "local copy" : "single-channel"),
+                                activeSec, avgSpeed);
+
+            std::string skippedStr = (batch->skippedFiles > 0)
+                ? " (" + std::to_string(batch->skippedFiles) + " skipped)" : "";
+            m_statusMessage = "Batch done: " + std::to_string(batch->totalFiles()) + " files" + skippedStr + ", " +
+                formatSize(batch->totalTransferred.load()) + " @ " + formatSpeed(avgSpeed);
+            m_statusTime = std::chrono::steady_clock::now();
+
+            m_leftPanel.needsRefresh = true;
+            m_rightPanel.needsRefresh = true;
+        }
+    }
+}
+
+std::string App::queryDeviceDisplayName(const std::string& serial) {
+    // Try properties in priority order: marketing name, then brand + model fallback
+    const char* props[] = {
+        "ro.product.marketname",
+        "ro.product.vendor.marketname",
+        "ro.config.marketing_name",
+    };
+    for (auto prop : props) {
+        std::string val = sanitizeDeviceDisplayValue(
+            m_device.runAdbCommand("-s " + serial + " shell getprop " + prop));
+        if (!val.empty()) return val;
+    }
+    // Fallback: "Brand Model" e.g. "Samsung SM-S911B"
+    std::string brand = sanitizeDeviceDisplayValue(
+        m_device.runAdbCommand("-s " + serial + " shell getprop ro.product.brand"));
+    std::string model = sanitizeDeviceDisplayValue(
+        m_device.runAdbCommand("-s " + serial + " shell getprop ro.product.model"));
+    if (!brand.empty()) {
+        // Capitalize first letter
+        if (!brand.empty()) brand[0] = (char)toupper((unsigned char)brand[0]);
+        if (!model.empty()) return brand + " " + model;
+        return brand;
+    }
+    if (!model.empty()) return model;
+    return "";
+}
+
+std::string App::formatSize(uint64_t bytes) {
+    if (bytes == 0) return "0 B";
+    const char* u[] = {"B","KB","MB","GB","TB"};
+    int i = 0; double s = (double)bytes;
+    while (s >= 1024.0 && i < 4) { s /= 1024.0; i++; }
+    char buf[32];
+    if (i == 0) snprintf(buf, sizeof(buf), "%llu B", bytes);
+    else snprintf(buf, sizeof(buf), "%.1f %s", s, u[i]);
+    return buf;
+}
+
+std::string App::formatSpeed(double bps) {
+    if (bps <= 0) return "0 B/s";
+    const char* u[] = {"B/s","KB/s","MB/s","GB/s"};
+    int i = 0; double v = bps;
+    while (v >= 1024.0 && i < 3) { v /= 1024.0; i++; }
+    char buf[32]; snprintf(buf, sizeof(buf), "%.1f %s", v, u[i]);
+    return buf;
+}
+
+std::string App::formatETA(double sec) {
+    if (sec < 0) return "";
+    if (sec < 60) { char b[16]; snprintf(b,sizeof(b),"%.0fs",sec); return b; }
+    if (sec < 3600) { int m=(int)(sec/60),s=(int)sec%60; char b[16]; snprintf(b,sizeof(b),"%dm %02ds",m,s); return b; }
+    int h=(int)(sec/3600),m=((int)sec%3600)/60; char b[16]; snprintf(b,sizeof(b),"%dh %02dm",h,m); return b;
+}
+
+std::string App::getFileIcon(const std::string& name, bool isDir) {
+    if (isDir) return "[D]";
+    auto p = name.rfind('.'); if (p == std::string::npos) return "   ";
+    std::string ext = name.substr(p);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    if (ext==".jpg"||ext==".jpeg"||ext==".png"||ext==".gif"||ext==".bmp"||ext==".webp"||ext==".dng") return "[I]";
+    if (ext==".mp4"||ext==".mkv"||ext==".avi"||ext==".mov"||ext==".webm") return "[V]";
+    if (ext==".mp3"||ext==".wav"||ext==".ogg"||ext==".flac"||ext==".aac") return "[A]";
+    if (ext==".apk"||ext==".xapk") return "[K]";
+    if (ext==".zip"||ext==".rar"||ext==".7z"||ext==".tar"||ext==".gz") return "[Z]";
+    if (ext==".mcraw") return "[M]";
+    if (ext==".pdf") return "[P]";
+    if (ext==".txt"||ext==".log"||ext==".md"||ext==".json"||ext==".xml"||ext==".csv") return "[T]";
+    return "   ";
+}
+
+std::vector<std::string> App::getWindowsDrives() {
+    std::vector<std::string> drives;
+    DWORD mask = GetLogicalDrives();
+    for (char c='A'; c<='Z'; c++) {
+        std::string drive = std::string(1, c) + ":";
+        if ((mask & 1) && !isOwnMountedDevicePath(drive)) drives.push_back(std::move(drive));
+        mask >>= 1;
+    }
+    return drives;
+}
