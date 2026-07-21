@@ -1394,9 +1394,37 @@ bool DeviceClient::restoreAppBackup(const std::string& serial, const std::string
     if (options.grantRuntimePermissions && meta.contains("permissions")) {
         stageIndex++;
         emitProgress("Restoring permissions", stageIndex);
-        for (auto& p : meta["permissions"]) {
-            if (!p.is_string()) continue;
-            runAdbCommand("-s " + serial + " shell su -c " + quoteCmdArg("pm grant --user 0 " + packageName + " " + p.get<std::string>() + " 2>/dev/null"));
+        std::filesystem::path permissionList = std::filesystem::temp_directory_path() /
+            ("afm-permissions-" + sanitizePathPart(packageName) + ".txt");
+        std::ofstream permissionFile(permissionList, std::ios::binary | std::ios::trunc);
+        int permissionCount = 0;
+        if (!permissionFile) {
+            LOG_ERROR("BackupEngine", "Could not create runtime permission list for " + packageName);
+        } else {
+            for (auto& p : meta["permissions"]) {
+                if (!p.is_string()) continue;
+                permissionFile << p.get<std::string>() << '\n';
+                permissionCount++;
+            }
+            permissionFile.close();
+        }
+        if (permissionCount > 0) {
+            std::string remoteList = "/data/local/tmp/afm-permissions-" + sanitizePathPart(packageName) + ".txt";
+            std::string pushOut = runAdbCommand("-s " + serial + " push " +
+                quoteCmdArg(pathToUtf8(permissionList)) + " " + shellQuote(remoteList));
+            if (pushOut.find("error") == std::string::npos && pushOut.find("failed") == std::string::npos) {
+                std::string grantScript = "while IFS= read -r permission; do pm grant --user 0 " +
+                    shellQuote(packageName) + " \"$permission\" 2>/dev/null; done < " +
+                    shellQuote(remoteList) + "; rm -f " + shellQuote(remoteList);
+                runAdbCommand("-s " + serial + " shell su -c " + quoteCmdArg(grantScript));
+                LOG_INFO("BackupEngine", "Restored " + std::to_string(permissionCount) +
+                    " runtime permissions in one root shell for " + packageName);
+            } else {
+                LOG_ERROR("BackupEngine", "Could not push runtime permission list for " + packageName + ": " +
+                    sanitizeAdbOutput(pushOut));
+            }
+            std::error_code permissionEc;
+            std::filesystem::remove(permissionList, permissionEc);
         }
     }
 

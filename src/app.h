@@ -231,6 +231,14 @@ struct FilePanel {
     bool isConnections = false;
     bool needsRefresh = true;
     bool refreshInProgress = false;
+    bool navigationTransitionPending = false;
+    bool navigationTransitionReady = false;
+    int hoveredEntryIndex = -1;
+    ImVec2 hoveredRowMin{};
+    ImVec2 hoveredRowMax{};
+    ImVec2 previousHoveredRowMin{};
+    ImVec2 previousHoveredRowMax{};
+    std::chrono::steady_clock::time_point hoverTransitionTime{};
     float scrollY = 0.0f;
     char pathInput[1024] = {};
     char searchFilter[256] = {};
@@ -690,6 +698,7 @@ private:
     BackupRootAccess m_backupRootAccess = BackupRootAccess::Unknown;
     std::string m_backupRootAccessSerial;
     bool m_showBackupRootChoice = false;
+    bool m_backupRootChoicePositionInitialized = false;
 
     bool m_backupProgressActive = false;
     bool m_backupProgressIsRestore = false;

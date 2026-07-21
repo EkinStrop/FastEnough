@@ -207,6 +207,16 @@ static std::string backupJobStamp() {
     return ss.str();
 }
 
+static std::string formatBackupCreated(const std::string& created) {
+    if (created.size() == 15 && created[8] == '-' &&
+        std::all_of(created.begin(), created.begin() + 8, ::isdigit) &&
+        std::all_of(created.begin() + 9, created.end(), ::isdigit)) {
+        return created.substr(0, 4) + "-" + created.substr(4, 2) + "-" + created.substr(6, 2) +
+               " " + created.substr(9, 2) + ":" + created.substr(11, 2) + ":" + created.substr(13, 2);
+    }
+    return created;
+}
+
 static std::vector<DetectedNic> enumerateNics() {
     std::vector<DetectedNic> result;
     ULONG bufLen = 16384;
@@ -1877,12 +1887,20 @@ void App::render() {
                     targetPanel->androidEntries = std::move(entries);
                     targetPanel->selectedIndices.clear();
                     strcpy_s(targetPanel->pathInput, targetPanel->currentPath.c_str());
+                    if (targetPanel->navigationTransitionPending) {
+                        targetPanel->navigationTransitionPending = false;
+                        targetPanel->navigationTransitionReady = true;
+                    }
                     m_compareDirty = true;
                 }
                 targetPanel->refreshInProgress = false;
             });
         } else {
             refreshWindowsPanel(panel);
+            if (panel.navigationTransitionPending) {
+                panel.navigationTransitionPending = false;
+                panel.navigationTransitionReady = true;
+            }
             panel.needsRefresh = false;
             panel.refreshInProgress = false;
             panelsRefreshed = true;
@@ -2321,6 +2339,8 @@ void App::renderMenuBar() {
         }
         if (ImGui::MenuItem("Backup Manager")) {
             m_showBackupManager = true;
+            m_backupManagerApps.clear();
+            m_backupManagerAppSelectionAnchor = -1;
             m_backupManagerNeedsAppRefresh = true;
             m_backupManagerNeedsBackupRefresh = true;
             m_backupRootAccess = BackupRootAccess::Unknown;
@@ -3961,12 +3981,18 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         return;
     }
 
-    // Fade-in animation after navigation
+    // Keep the navigation controls stable. Only the directory listing transitions.
+    float directoryContentAlpha = 1.0f;
     {
         auto& navTime = (side == PanelSide::Left) ? m_lastNavTimeLeft : m_lastNavTimeRight;
+        if (panel.navigationTransitionReady) {
+            navTime = std::chrono::steady_clock::now();
+            panel.navigationTransitionReady = false;
+        }
         float elapsed = (float)std::chrono::duration<double>(std::chrono::steady_clock::now() - navTime).count();
-        float alpha = std::min(elapsed / 0.15f, 1.0f); // 150ms fade
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * alpha);
+        float progress = std::clamp(elapsed / 0.20f, 0.0f, 1.0f);
+        float eased = progress * progress * (3.0f - 2.0f * progress);
+        directoryContentAlpha = 0.55f + 0.45f * eased;
     }
 
     // --- Navigation bar: Back / Forward / Up + Breadcrumb ---
@@ -3974,8 +4000,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
     bool canFwd = panel.navHistoryPos >= 0 && panel.navHistoryPos < (int)panel.navHistory.size() - 1;
 
     auto triggerNavAnim = [&]() {
-        if (side == PanelSide::Left) m_lastNavTimeLeft = std::chrono::steady_clock::now();
-        else m_lastNavTimeRight = std::chrono::steady_clock::now();
+        panel.navigationTransitionPending = true;
     };
 
     ImGui::BeginDisabled(!canBack);
@@ -4269,6 +4294,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
 
     ImGuiTableFlags tf = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable;
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * directoryContentAlpha);
     if (ImGui::BeginTable(("##Tbl" + std::string(label)).c_str(), 3, tf)) {
         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_DefaultSort, 0.55f);
         ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthStretch, 0.20f);
@@ -4330,6 +4356,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         // Track row screen positions for rubber-band selection
         struct RowInfo { int index; float yMin, yMax; };
         std::vector<RowInfo> visibleRows;
+        bool rowHovered = false;
 
         std::unique_lock<std::mutex> compareContentLock;
         if (m_compareEnabled && m_compareContentEnabled) {
@@ -4396,6 +4423,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
             else if (compareHighlight) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f,0.86f,0.42f,1));
             else pushedTextColor = false;
             if (isSel) ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.15f,0.28f,0.50f,0.90f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
 
             ImGuiSelectableFlags sf = ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick;
             if (ImGui::Selectable(sid.c_str(), isSel, sf)) {
@@ -4470,6 +4498,21 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                 }
             }
 
+            if (ImGui::IsItemHovered()) {
+                rowHovered = true;
+                ImVec2 rowMin = ImGui::GetItemRectMin();
+                ImVec2 rowMax = ImGui::GetItemRectMax();
+                if (panel.hoveredEntryIndex != i) {
+                    panel.previousHoveredRowMin = panel.hoveredRowMin;
+                    panel.previousHoveredRowMax = panel.hoveredRowMax;
+                    panel.hoveredEntryIndex = i;
+                    panel.hoverTransitionTime = std::chrono::steady_clock::now();
+                }
+                panel.hoveredRowMin = rowMin;
+                panel.hoveredRowMax = rowMax;
+            }
+            ImGui::PopStyleColor(); // header hovered
+
             if (contentState != CompareContentState::Unknown && ImGui::IsItemHovered()) {
                 if (contentState == CompareContentState::SizeMismatch) {
                     ImGui::SetTooltip("Size differs\nLeft: %s\nRight: %s",
@@ -4531,6 +4574,13 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
             visibleRows.push_back({i, rowYMin, rowYMax});
         }
 
+        if (!rowHovered && panel.hoveredEntryIndex != -1) {
+            panel.previousHoveredRowMin = panel.hoveredRowMin;
+            panel.previousHoveredRowMax = panel.hoveredRowMax;
+            panel.hoveredEntryIndex = -1;
+            panel.hoverTransitionTime = std::chrono::steady_clock::now();
+        }
+
         renderContextMenu(panel);
 
         // Right-click on empty space in the table area — background context menu
@@ -4559,6 +4609,20 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         }
 
         ImGui::EndTable();
+
+        const float hoverElapsed = (float)std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - panel.hoverTransitionTime).count();
+        const float hoverProgress = std::clamp(hoverElapsed / 0.12f, 0.0f, 1.0f);
+        const float hoverEase = hoverProgress * hoverProgress * (3.0f - 2.0f * hoverProgress);
+        ImDrawList* hoverDraw = ImGui::GetWindowDrawList();
+        if (panel.hoveredEntryIndex != -1) {
+            hoverDraw->AddRectFilled(panel.hoveredRowMin, panel.hoveredRowMax,
+                IM_COL32(67, 132, 220, (int)(44.0f * hoverEase)));
+        }
+        if (hoverProgress < 1.0f && panel.previousHoveredRowMax.y > panel.previousHoveredRowMin.y) {
+            hoverDraw->AddRectFilled(panel.previousHoveredRowMin, panel.previousHoveredRowMax,
+                IM_COL32(67, 132, 220, (int)(44.0f * (1.0f - hoverEase))));
+        }
 
         // --- Rubber-band (lasso) selection ---
         ImVec2 tableMin = ImGui::GetItemRectMin();
@@ -4610,7 +4674,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         }
     }
 
-    ImGui::PopStyleVar(); // alpha fade
+    ImGui::PopStyleVar(); // directory listing fade
 }
 
 void App::drawProgressBar(float fraction, const char* overlayText, float height,
@@ -5331,6 +5395,46 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
     ImGui::SameLine(0, 10);
     if (modernSmallButton(("Refresh##Apps" + sideId).c_str())) panel.needsRefresh = true;
 
+    auto uninstallSelectedAppsFromMenu = [this, &panel](bool useRoot) {
+        std::vector<std::string> packages;
+        for (int idx : panel.selectedIndices)
+            if (panel.validIndex(idx)) packages.push_back(panel.appEntries[idx].packageName);
+        if (packages.empty()) return;
+        std::string prompt = (useRoot ? "Use root uninstall for " : "Uninstall ") +
+            std::to_string(packages.size()) + " selected app(s) for the current Android user?";
+        if (MessageBoxA(g_mainHwnd, prompt.c_str(), useRoot ? "Confirm Root Uninstall" : "Confirm Uninstall",
+                        MB_YESNO | MB_ICONWARNING) != IDYES)
+            return;
+        int slot = panel.deviceSlot;
+        FilePanel* refreshPanel = &panel;
+        postAsync(useRoot ? "Root uninstalling app..." : "Uninstalling app...",
+            [this, packages, slot, refreshPanel, useRoot]() {
+                int ok = 0;
+                std::string details;
+                std::string serial = m_slotSerial[slot];
+                if (useRoot && !deviceForSlot(slot).isRootAvailable(serial)) {
+                    showNotification("Root Access Unavailable",
+                        "Root uninstall requires a rooted device with ADB root permission granted for this device.", true);
+                    return;
+                }
+                for (const auto& pkg : packages) {
+                    std::string out;
+                    if (deviceForSlot(slot).uninstallPackage(serial, pkg, out, false, true, useRoot)) ok++;
+                    else details += pkg + ": " + out + "\n";
+                }
+                refreshPanel->needsRefresh = true;
+                std::string action = useRoot ? "Root Uninstall" : "Uninstall";
+                if (ok == (int)packages.size()) {
+                    showNotification(action + " Complete", "Removed " + std::to_string(ok) + " app(s) for the current Android user.", false);
+                    m_statusMessage = action + "ed " + std::to_string(ok) + " app(s)";
+                } else {
+                    showNotification(action + " Failed", details.empty() ? "No apps were removed." : details, true);
+                    m_statusMessage = action + " failed";
+                }
+                m_statusTime = std::chrono::steady_clock::now();
+            });
+    };
+
     ImGui::SameLine(0, 10);
     bool hasSelection = !panel.selectedIndices.empty();
     ImGui::BeginDisabled(!hasSelection || m_asyncBusy.load());
@@ -5424,6 +5528,18 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
         return hay.find(filter) != std::string::npos;
     };
 
+    std::vector<int> visibleAppIndices;
+    visibleAppIndices.reserve(panel.appEntries.size());
+    for (int i = 0; i < (int)panel.appEntries.size(); ++i)
+        if (appVisible(panel.appEntries[i])) visibleAppIndices.push_back(i);
+
+    ImGuiIO& appListIo = ImGui::GetIO();
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+        appListIo.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A) && !ImGui::IsAnyItemActive()) {
+        for (int i : visibleAppIndices) panel.selectedIndices.insert(i);
+        m_lastFocusedPanel = &panel;
+    }
+
     ImGui::TextDisabled("Show");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(120);
@@ -5438,9 +5554,7 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
     ImGui::SameLine(0, 4);
     if (modernSmallButton(("Clear Selection##Apps" + sideId).c_str())) panel.selectedIndices.clear();
     ImGui::SameLine(0, 10);
-    int visibleCount = 0;
-    for (const auto& app : panel.appEntries) if (appVisible(app)) visibleCount++;
-    ImGui::TextDisabled("%d shown, %d selected", visibleCount, (int)panel.selectedIndices.size());
+    ImGui::TextDisabled("%d shown, %d selected", (int)visibleAppIndices.size(), (int)panel.selectedIndices.size());
     ImGui::Separator();
 
     ImGuiTableFlags tf = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
@@ -5475,9 +5589,8 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
             }
         }
 
-        for (int i = 0; i < (int)panel.appEntries.size(); i++) {
+        for (int i : visibleAppIndices) {
             const auto& app = panel.appEntries[i];
-            if (!appVisible(app)) continue;
 
             bool selected = panel.selectedIndices.count(i) > 0;
             ImGui::TableNextRow();
@@ -5486,7 +5599,14 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
             std::string rowId = displayName + "##app" + std::to_string(i);
             if (ImGui::Selectable(rowId.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
                 ImGuiIO& io = ImGui::GetIO();
-                if (io.KeyCtrl) {
+                auto anchorIt = std::find(visibleAppIndices.begin(), visibleAppIndices.end(), panel.focusedIndex);
+                auto clickedIt = std::find(visibleAppIndices.begin(), visibleAppIndices.end(), i);
+                if (io.KeyShift && anchorIt != visibleAppIndices.end() && clickedIt != visibleAppIndices.end()) {
+                    if (!io.KeyCtrl) panel.selectedIndices.clear();
+                    auto first = std::min(anchorIt, clickedIt);
+                    auto last = std::max(anchorIt, clickedIt);
+                    for (auto it = first; it != last + 1; ++it) panel.selectedIndices.insert(*it);
+                } else if (io.KeyCtrl) {
                     if (selected) panel.selectedIndices.erase(i);
                     else panel.selectedIndices.insert(i);
                 } else {
@@ -5495,6 +5615,22 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
                 }
                 panel.focusedIndex = i;
                 m_lastFocusedPanel = &panel;
+            }
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && !selected) {
+                panel.selectedIndices.clear();
+                panel.selectedIndices.insert(i);
+                panel.focusedIndex = i;
+                m_lastFocusedPanel = &panel;
+            }
+            if (ImGui::BeginPopupContextItem(("##AppsContext" + sideId + "_" + std::to_string(i)).c_str())) {
+                ImGui::TextDisabled("%d app%s selected", (int)panel.selectedIndices.size(),
+                                    panel.selectedIndices.size() == 1 ? "" : "s");
+                ImGui::Separator();
+                ImGui::BeginDisabled(m_asyncBusy.load());
+                if (ImGui::MenuItem("Uninstall")) uninstallSelectedAppsFromMenu(false);
+                if (ImGui::MenuItem("Uninstall with Root")) uninstallSelectedAppsFromMenu(true);
+                ImGui::EndDisabled();
+                ImGui::EndPopup();
             }
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(app.packageName.c_str());
@@ -6127,6 +6263,8 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
     m_backupProgressTotalBytes = 0;
     m_backupProgressPackage.clear();
     m_backupProgressStageLabel = "Starting restore";
+    m_backupPauseRequested = false;
+    m_backupCancelRequested = false;
     m_backupProgressPackages.clear();
     m_backupProgressActiveAppIndex = -1;
     std::unordered_map<std::string, std::string> installedLabels;
@@ -6222,6 +6360,13 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                 postUiMessage(std::move(batchMessage));
                 std::string installOutput;
                 auto installProgress = [this](uint64_t done, uint64_t total) {
+                    {
+                        std::unique_lock<std::mutex> lock(m_backupControlMutex);
+                        m_backupControlCV.wait(lock, [this]() {
+                            return !m_backupPauseRequested.load() || m_backupCancelRequested.load();
+                        });
+                    }
+                    if (m_backupCancelRequested.load()) return false;
                     UiMessage message;
                     message.hasBackupProgress = true;
                     message.backupProgressActive = true;
@@ -6233,6 +6378,13 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                     return true;
                 };
                 auto appInstallProgress = [this](const AppInstallProgress& progress) {
+                    {
+                        std::unique_lock<std::mutex> lock(m_backupControlMutex);
+                        m_backupControlCV.wait(lock, [this]() {
+                            return !m_backupPauseRequested.load() || m_backupCancelRequested.load();
+                        });
+                    }
+                    if (m_backupCancelRequested.load()) return false;
                     UiMessage message;
                     message.hasBackupProgress = true;
                     message.backupProgressActive = true;
@@ -6253,6 +6405,13 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                 restoreOptions.includeApk = false;
             }
             for (int backupIndex = 0; backupIndex < (int)backups.size(); backupIndex++) {
+                {
+                    std::unique_lock<std::mutex> lock(m_backupControlMutex);
+                    m_backupControlCV.wait(lock, [this]() {
+                        return !m_backupPauseRequested.load() || m_backupCancelRequested.load();
+                    });
+                }
+                if (m_backupCancelRequested.load()) break;
                 const auto& backup = backups[backupIndex];
                 std::string out;
                 std::string packageName;
@@ -6274,6 +6433,13 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                 postUiMessage(std::move(progressMessage));
                 LOG_INFO("BackupManager", "Starting restore: " + backup);
                 auto progressCb = [this, backupIndex, usedBatchInstall, totalBackups = (int)backups.size()](const AppBackupProgress& progress) {
+                    {
+                        std::unique_lock<std::mutex> lock(m_backupControlMutex);
+                        m_backupControlCV.wait(lock, [this]() {
+                            return !m_backupPauseRequested.load() || m_backupCancelRequested.load();
+                        });
+                    }
+                    if (m_backupCancelRequested.load()) return false;
                     float byteFraction = progress.bytesTotal > 0
                         ? std::clamp((float)progress.bytesTransferred / (float)progress.bytesTotal, 0.0f, 1.0f)
                         : 0.0f;
@@ -6322,11 +6488,13 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                     LOG_ERROR("BackupManager", "Restore failed: " + backup + ": " + out);
                 }
             }
-            LOG_INFO("BackupManager", "Restore finished. ok=" + std::to_string(ok) + " total=" + std::to_string(backups.size()));
+            bool cancelled = m_backupCancelRequested.load();
+            LOG_INFO("BackupManager", std::string(cancelled ? "Restore cancelled. ok=" : "Restore finished. ok=") +
+                std::to_string(ok) + " total=" + std::to_string(backups.size()));
             UiMessage message;
             message.refreshAppList = true;
             message.hasStatus = true;
-            message.status = "Restored " + std::to_string(ok) + " backup(s)";
+            message.status = cancelled ? "Restore cancelled" : "Restored " + std::to_string(ok) + " backup(s)";
             message.hasBackupProgress = true;
             message.backupProgressActive = false;
             message.backupProgressIsRestore = true;
@@ -6342,7 +6510,12 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
             if (options.includeExternalData) restoreSummary += "External data\n";
             if (options.includeObb) restoreSummary += "OBB data\n";
             if (options.includeMedia) restoreSummary += "Media data\n";
-            if (ok == (int)backups.size()) {
+            if (cancelled) {
+                message.notificationTitle = "Restore Cancelled";
+                message.notificationMessage = "Restored " + std::to_string(ok) + " of " +
+                    std::to_string(backups.size()) + " selected app(s) before stopping.";
+                message.notificationIsError = false;
+            } else if (ok == (int)backups.size()) {
                 message.notificationTitle = "Restore Complete";
                 message.notificationMessage = restoreSummary + "\nAll selected apps were restored successfully.";
                 message.notificationIsError = false;
@@ -6419,10 +6592,13 @@ void App::renderBackupManagerWindow() {
             std::string label = slotLabel(slot) + "##backupSlot" + std::to_string(slot);
             if (ImGui::Selectable(label.c_str(), selected)) {
                 m_backupManagerSlot = slot;
+                m_backupManagerApps.clear();
+                m_backupManagerAppSelectionAnchor = -1;
                 m_backupManagerNeedsAppRefresh = true;
                 m_backupRootAccess = BackupRootAccess::Unknown;
                 m_backupRootAccessSerial.clear();
                 m_showBackupRootChoice = false;
+                refreshBackupManagerApps();
             }
             if (selected) ImGui::SetItemDefaultFocus();
             ImGui::EndDisabled();
@@ -6472,12 +6648,23 @@ void App::renderBackupManagerWindow() {
     ImGui::Checkbox("Allow downgrade", &m_backupAllowDowngrade);
 
     if (m_showBackupRootChoice) {
-        ImGui::OpenPopup("Backup capabilities");
+        if (!ImGui::IsPopupOpen("Backup capabilities")) {
+            ImGui::OpenPopup("Backup capabilities");
+            if (!m_backupRootChoicePositionInitialized) {
+                ImGuiViewport* viewport = ImGui::GetMainViewport();
+                ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                                viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
+                                        ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+                m_backupRootChoicePositionInitialized = true;
+            }
+        }
         m_showBackupRootChoice = false;
     }
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Backup capabilities", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.25f, 1), "Root access was not detected");
+        if (m_backupRootAccess == BackupRootAccess::Checking)
+            ImGui::TextColored(ImVec4(0.35f, 0.70f, 1.0f, 1), "Checking root access...");
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.25f, 1), "Root access was not detected");
         ImGui::Spacing();
         ImGui::TextWrapped("Fast Enough can still back up APK files and shared app folders. Private app data and device-protected data require root access.");
         ImGui::Spacing();
@@ -6492,7 +6679,6 @@ void App::renderBackupManagerWindow() {
         if (modernButton("Check Root Again", ImVec2(200, 0))) {
             m_backupRootAccess = BackupRootAccess::Unknown;
             m_backupRootAccessSerial.clear();
-            ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
     }
@@ -6556,6 +6742,44 @@ void App::renderBackupManagerWindow() {
         return record.packageName;
     };
 
+    auto deleteSelectedBackupJobs = [this]() {
+        std::vector<std::string> paths;
+        for (const auto& row : m_backupManagerBackups)
+            if (row.selected && row.isJob) paths.push_back(row.record.backupPath);
+        if (paths.empty()) return;
+        std::string prompt = "Permanently delete " + std::to_string(paths.size()) + " selected backup job";
+        if (paths.size() != 1) prompt += "s";
+        prompt += " and all files inside?";
+        if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Delete Backup Jobs", MB_YESNO | MB_ICONWARNING) != IDYES)
+            return;
+        std::string jobsRoot = pathToUtf8(toFsPath(getBackupsRootPath()) / "Jobs");
+        postAsync("Deleting backup jobs...", [this, paths, jobsRoot]() {
+            std::error_code ec;
+            std::filesystem::path allowed = std::filesystem::weakly_canonical(toFsPath(jobsRoot), ec);
+            int deleted = 0;
+            for (const auto& value : paths) {
+                ec.clear();
+                std::filesystem::path target = std::filesystem::weakly_canonical(toFsPath(value), ec);
+                if (ec || _wcsicmp(target.parent_path().c_str(), allowed.c_str()) != 0) {
+                    LOG_ERROR("BackupManager", "Refused to delete backup outside the Jobs folder: " + value);
+                    continue;
+                }
+                uintmax_t removed = std::filesystem::remove_all(target, ec);
+                if (!ec && removed > 0) deleted++;
+                else if (ec) LOG_ERROR("BackupManager", "Could not delete backup job: " + value + ": " + ec.message());
+            }
+            UiMessage message;
+            message.refreshBackupList = true;
+            message.hasStatus = true;
+            message.status = "Deleted " + std::to_string(deleted) + " backup job(s)";
+            message.hasNotification = true;
+            message.notificationTitle = deleted == (int)paths.size() ? "Backup Jobs Deleted" : "Some Jobs Could Not Be Deleted";
+            message.notificationMessage = "Deleted " + std::to_string(deleted) + " of " + std::to_string(paths.size()) + " selected backup job(s).";
+            message.notificationIsError = deleted != (int)paths.size();
+            postUiMessage(std::move(message));
+        });
+    };
+
     ImGui::BeginChild("##BackupAppsPane", ImVec2(columnW, bodyH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
             ImGui::TextColored(m_theme.gradientPrimary, "Installed Apps");
         ImGui::SameLine();
@@ -6579,7 +6803,47 @@ void App::renderBackupManagerWindow() {
             std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
             if (filter.empty() || hay.find(filter) != std::string::npos) visibleAppIndices.push_back(i);
         }
-        if (ImGui::BeginTable("##BackupAppsTable", 4,
+        bool appsLoading = m_backupManagerNeedsAppRefresh;
+        if (appsLoading && m_backupManagerApps.empty()) {
+            ImGui::BeginChild("##BackupAppsLoading", ImVec2(0, tableH), 0, ImGuiWindowFlags_NoScrollbar);
+            ImVec2 panelPos = ImGui::GetWindowPos();
+            ImVec2 panelSize = ImGui::GetWindowSize();
+            float cardWidth = std::min(420.0f, std::max(180.0f, panelSize.x - 24.0f));
+            float cardHeight = 122.0f;
+            ImGui::SetCursorPos(ImVec2(std::max(12.0f, (panelSize.x - cardWidth) * 0.5f),
+                                       std::max(12.0f, (panelSize.y - cardHeight) * 0.38f)));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.035f, 0.065f, 0.105f, 0.96f));
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.16f, 0.35f, 0.58f, 0.85f));
+            ImGui::BeginChild("##BackupAppsLoadingCard", ImVec2(cardWidth, cardHeight),
+                              ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ImVec2 cardPos = ImGui::GetWindowPos();
+            ImVec2 spinnerCenter(cardPos.x + 28.0f, cardPos.y + 52.0f);
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            float phase = (float)ImGui::GetTime() * 8.0f;
+            for (int dotIndex = 0; dotIndex < 12; ++dotIndex) {
+                float angle = ((float)dotIndex / 12.0f) * 6.2831853f - 1.5707963f;
+                float intensity = 0.20f + 0.80f * std::max(0.0f, std::cos(angle - phase));
+                ImVec2 dot(spinnerCenter.x + std::cos(angle) * 12.0f,
+                           spinnerCenter.y + std::sin(angle) * 12.0f);
+                drawList->AddCircleFilled(dot, 2.4f, IM_COL32(74, 174, 255, (int)(255.0f * intensity)));
+            }
+            const char* loadingTitle = "Loading installed apps";
+            const char* loadingStatus = "Reading apps from the selected device";
+            const char* loadingDetail = "This can take longer on devices with many installed apps.";
+            ImGui::SetCursorPos(ImVec2(54.0f, 16.0f));
+            ImGui::TextColored(ImVec4(0.36f, 0.72f, 1.0f, 1.0f), "%s", loadingTitle);
+            ImGui::SetCursorPos(ImVec2(54.0f, 43.0f));
+            ImGui::TextDisabled("%s", loadingStatus);
+            ImGui::SetCursorPos(ImVec2(54.0f, 69.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::PushTextWrapPos(cardWidth - 12.0f);
+            ImGui::TextWrapped("%s", loadingDetail);
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+            ImGui::EndChild();
+            ImGui::PopStyleColor(2);
+            ImGui::EndChild();
+        } else if (ImGui::BeginTable("##BackupAppsTable", 4,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_Borders |
                 ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
                 ImVec2(0, tableH))) {
@@ -6597,6 +6861,22 @@ void App::renderBackupManagerWindow() {
                 std::string id = displayName + "##bmapp" + std::to_string(i);
                 if (ImGui::Selectable(id.c_str(), row.selected, ImGuiSelectableFlags_SpanAllColumns))
                     applyRowSelection(m_backupManagerApps, visibleAppIndices, i, m_backupManagerAppSelectionAnchor);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && !row.selected) {
+                    for (auto& candidate : m_backupManagerApps) candidate.selected = false;
+                    row.selected = true;
+                    m_backupManagerAppSelectionAnchor = i;
+                }
+                if (ImGui::BeginPopupContextItem(("##BackupAppsContext" + std::to_string(i)).c_str())) {
+                    int selectedCount = 0;
+                    for (const auto& candidate : m_backupManagerApps)
+                        if (candidate.selected) selectedCount++;
+                    ImGui::TextDisabled("%d app%s selected", selectedCount, selectedCount == 1 ? "" : "s");
+                    ImGui::Separator();
+                    ImGui::BeginDisabled(!hasDevice || m_asyncBusy.load());
+                    if (ImGui::MenuItem("Back Up Selected Apps")) startBackupManagerBackup();
+                    ImGui::EndDisabled();
+                    ImGui::EndPopup();
+                }
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(row.app.packageName.c_str());
                 ImGui::TableNextColumn();
@@ -6672,7 +6952,7 @@ void App::renderBackupManagerWindow() {
                     ImVec2(0, tableH))) {
                 ImGui::TableSetupColumn("App Name", ImGuiTableColumnFlags_WidthStretch, 0.25f);
                 ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch, 0.29f);
-                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Contents", ImGuiTableColumnFlags_WidthStretch, 0.32f);
                 ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 76.0f);
                 ImGui::TableSetupScrollFreeze(0, 1);
@@ -6693,6 +6973,27 @@ void App::renderBackupManagerWindow() {
                     if (ImGui::Selectable(id.c_str(), row.selected, ImGuiSelectableFlags_SpanAllColumns))
                         applyRowSelection(m_backupManagerJobApps, visibleJobAppIndices, i,
                             m_backupManagerJobAppSelectionAnchor);
+                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && !row.selected) {
+                        for (auto& candidate : m_backupManagerJobApps) candidate.selected = false;
+                        row.selected = true;
+                        m_backupManagerJobAppSelectionAnchor = i;
+                    }
+                    if (ImGui::BeginPopupContextItem(("##BackupJobAppsContext" + std::to_string(i)).c_str())) {
+                        int selectedCount = 0;
+                        for (const auto& candidate : m_backupManagerJobApps)
+                            if (candidate.selected) selectedCount++;
+                        ImGui::TextDisabled("%d app%s selected", selectedCount, selectedCount == 1 ? "" : "s");
+                        ImGui::Separator();
+                        ImGui::BeginDisabled(!hasDevice || m_asyncBusy.load());
+                        if (ImGui::MenuItem("Restore Selected Apps")) {
+                            std::vector<std::string> paths;
+                            for (const auto& candidate : m_backupManagerJobApps)
+                                if (candidate.selected) paths.push_back(candidate.record.backupPath);
+                            if (!paths.empty()) startBackupManagerRestorePaths(std::move(paths));
+                        }
+                        ImGui::EndDisabled();
+                        ImGui::EndPopup();
+                    }
                     if (ImGui::BeginDragDropSource()) {
                         if (!row.selected) {
                             for (auto& candidate : m_backupManagerJobApps) candidate.selected = false;
@@ -6709,7 +7010,8 @@ void App::renderBackupManagerWindow() {
                     ImGui::TableNextColumn();
                     ImGui::TextUnformatted(row.record.packageName.c_str());
                     ImGui::TableNextColumn();
-                    ImGui::TextDisabled("%s", row.record.created.c_str());
+                    std::string createdText = formatBackupCreated(row.record.created);
+                    ImGui::TextDisabled("%s", createdText.c_str());
                     ImGui::TableNextColumn();
                     ImGui::TextDisabled("%s", contents.c_str());
                     ImGui::TableNextColumn();
@@ -6740,42 +7042,7 @@ void App::renderBackupManagerWindow() {
                 }
             }
             ImGui::BeginDisabled(selectedJobCount == 0 || m_asyncBusy.load());
-            if (modernSmallButton("Delete Selected Jobs")) {
-                std::string prompt = "Permanently delete " + std::to_string(selectedJobCount) + " selected backup job";
-                if (selectedJobCount != 1) prompt += "s";
-                prompt += " and all files inside?";
-                if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Delete Backup Jobs", MB_YESNO | MB_ICONWARNING) == IDYES) {
-                    std::vector<std::string> paths;
-                    for (const auto& row : m_backupManagerBackups)
-                        if (row.selected && row.isJob) paths.push_back(row.record.backupPath);
-                    std::string jobsRoot = pathToUtf8(toFsPath(getBackupsRootPath()) / "Jobs");
-                    postAsync("Deleting backup jobs...", [this, paths, jobsRoot]() {
-                        std::error_code ec;
-                        std::filesystem::path allowed = std::filesystem::weakly_canonical(toFsPath(jobsRoot), ec);
-                        int deleted = 0;
-                        for (const auto& value : paths) {
-                            ec.clear();
-                            std::filesystem::path target = std::filesystem::weakly_canonical(toFsPath(value), ec);
-                            if (ec || _wcsicmp(target.parent_path().c_str(), allowed.c_str()) != 0) {
-                                LOG_ERROR("BackupManager", "Refused to delete backup outside the Jobs folder: " + value);
-                                continue;
-                            }
-                            uintmax_t removed = std::filesystem::remove_all(target, ec);
-                            if (!ec && removed > 0) deleted++;
-                            else if (ec) LOG_ERROR("BackupManager", "Could not delete backup job: " + value + ": " + ec.message());
-                        }
-                        UiMessage message;
-                        message.refreshBackupList = true;
-                        message.hasStatus = true;
-                        message.status = "Deleted " + std::to_string(deleted) + " backup job(s)";
-                        message.hasNotification = true;
-                        message.notificationTitle = deleted == (int)paths.size() ? "Backup Jobs Deleted" : "Some Jobs Could Not Be Deleted";
-                        message.notificationMessage = "Deleted " + std::to_string(deleted) + " of " + std::to_string(paths.size()) + " selected backup job(s).";
-                        message.notificationIsError = deleted != (int)paths.size();
-                        postUiMessage(std::move(message));
-                    });
-                }
-            }
+            if (modernSmallButton("Delete Selected Jobs")) deleteSelectedBackupJobs();
             ImGui::EndDisabled();
 
             bool restoreBackupSelection = false;
@@ -6797,7 +7064,7 @@ void App::renderBackupManagerWindow() {
                     ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
                     ImVec2(0, tableH))) {
                 ImGui::TableSetupColumn("Backup", ImGuiTableColumnFlags_WidthStretch, 0.42f);
-                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Contents", ImGuiTableColumnFlags_WidthStretch, 0.35f);
                 ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 76.0f);
                 ImGui::TableSetupScrollFreeze(0, 1);
@@ -6811,6 +7078,26 @@ void App::renderBackupManagerWindow() {
                     if (ImGui::Selectable(id.c_str(), row.selected, ImGuiSelectableFlags_SpanAllColumns))
                         applyRowSelection(m_backupManagerBackups, visibleBackupIndices, i,
                             m_backupManagerBackupSelectionAnchor);
+                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && !row.selected) {
+                        for (auto& candidate : m_backupManagerBackups) candidate.selected = false;
+                        row.selected = true;
+                        m_backupManagerBackupSelectionAnchor = i;
+                    }
+                    if (ImGui::BeginPopupContextItem(("##BackupJobsContext" + std::to_string(i)).c_str())) {
+                        int selectedCount = 0;
+                        for (const auto& candidate : m_backupManagerBackups)
+                            if (candidate.selected) selectedCount++;
+                        ImGui::TextDisabled("%d backup%s selected", selectedCount, selectedCount == 1 ? "" : "s");
+                        ImGui::Separator();
+                        ImGui::BeginDisabled(m_asyncBusy.load());
+                        if (ImGui::MenuItem("Open Job")) openBackupManagerJob(row);
+                        ImGui::BeginDisabled(!hasDevice);
+                        if (ImGui::MenuItem("Restore Selected Backups")) startBackupManagerRestore();
+                        ImGui::EndDisabled();
+                        if (ImGui::MenuItem("Delete Selected Jobs")) deleteSelectedBackupJobs();
+                        ImGui::EndDisabled();
+                        ImGui::EndPopup();
+                    }
                     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                         openBackupManagerJob(row);
                     }
@@ -6829,7 +7116,8 @@ void App::renderBackupManagerWindow() {
                         ImGui::EndDragDropSource();
                     }
                     ImGui::TableNextColumn();
-                    ImGui::TextDisabled("%s", row.record.created.c_str());
+                    std::string createdText = formatBackupCreated(row.record.created);
+                    ImGui::TextDisabled("%s", createdText.c_str());
                     ImGui::TableNextColumn();
                     ImGui::TextDisabled("%s", row.contentsSummary.c_str());
                     ImGui::TableNextColumn();
@@ -6852,20 +7140,26 @@ void App::renderBackupManagerWindow() {
     ImGui::BeginDisabled(!hasDevice || !anyBackup || m_asyncBusy.load());
     if (modernButton("Restore Selected Backups", ImVec2(restoreButtonW, 0))) startBackupManagerRestore();
     ImGui::EndDisabled();
-    if (m_backupProgressActive && !m_backupProgressIsRestore) {
+    if (m_backupProgressActive) {
+        const char* operation = m_backupProgressIsRestore ? "Restore" : "Backup";
         ImGui::SameLine();
         bool paused = m_backupPauseRequested.load();
-        if (modernButton(paused ? "Resume Backup" : "Pause Backup")) {
+        std::string pauseLabel = paused ? "Resume " : "Pause ";
+        pauseLabel += operation;
+        if (modernButton(pauseLabel.c_str())) {
             m_backupPauseRequested = !paused;
-            m_backupProgressStageLabel = paused ? "Resuming backup" : "Backup paused";
+            m_backupProgressStageLabel = paused ? std::string("Resuming ") + operation :
+                std::string(operation) + " paused";
             m_backupControlCV.notify_all();
         }
         ImGui::SameLine();
         ImGui::BeginDisabled(m_backupCancelRequested.load());
-        if (modernButton("Cancel Backup")) {
+        std::string stopLabel = "Stop ";
+        stopLabel += operation;
+        if (modernButton(stopLabel.c_str())) {
             m_backupCancelRequested = true;
             m_backupPauseRequested = false;
-            m_backupProgressStageLabel = "Cancelling backup";
+            m_backupProgressStageLabel = std::string("Stopping ") + operation;
             m_backupControlCV.notify_all();
         }
         ImGui::EndDisabled();
@@ -9338,9 +9632,7 @@ void App::navigateToDirectory(FilePanel& panel, const std::string& path) {
         }
     }
 
-    // Trigger fade-in animation
-    if (&panel == &m_leftPanel) m_lastNavTimeLeft = std::chrono::steady_clock::now();
-    else m_lastNavTimeRight = std::chrono::steady_clock::now();
+    panel.navigationTransitionPending = true;
 }
 
 bool App::isOwnMountedDevicePath(const std::string& path, std::string* mountPoint) const {
