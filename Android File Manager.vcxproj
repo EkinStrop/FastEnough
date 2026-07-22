@@ -161,6 +161,7 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\app.cpp" />
+    <ClCompile Include="src\backup_archive.cpp" />
     <ClCompile Include="src\device_client.cpp" />
     <ClCompile Include="src\mcraw_local.cpp" />
     <ClCompile Include="src\mcraw_projfs.cpp" />
@@ -188,6 +189,7 @@
   <!-- Header Files -->
   <ItemGroup>
     <ClInclude Include="src\app.h" />
+    <ClInclude Include="src\backup_archive.h" />
     <ClInclude Include="src\device_client.h" />
     <ClInclude Include="src\protocol.h" />
     <ClInclude Include="src\mcraw_local.h" />

@@ -377,11 +377,14 @@ struct BackupManagerBackupRow {
     int appCount = 0;
     std::string contentsSummary;
     std::string searchText;
+    bool isArchive = false;
 };
 
 struct BackupManagerJobAppRow {
     AppBackupRecord record;
     bool selected = false;
+    std::string archivePath;
+    std::string archivePrefix;
 };
 
 struct AppPreferences {
@@ -467,6 +470,15 @@ private:
         bool markBackupAppsFresh = false;
         bool refreshBackupList = false;
         bool refreshAppList = false;
+        FilePanel* refreshFilePanel = nullptr;
+        bool hasAppUninstallProgress = false;
+        bool appUninstallActive = false;
+        bool appUninstallUseRoot = false;
+        int appUninstallCurrent = 0;
+        int appUninstallTotal = 0;
+        int appUninstallSucceeded = 0;
+        int appUninstallFailed = 0;
+        std::string appUninstallPackage;
         bool hasBackupProgress = false;
         bool backupProgressActive = false;
         bool backupProgressIsRestore = false;
@@ -480,6 +492,8 @@ private:
         int backupProgressStageTotal = 1;
         uint64_t backupProgressBytes = 0;
         uint64_t backupProgressTotalBytes = 0;
+        double backupProgressBytesPerSecond = 0.0;
+        double backupProgressEtaSeconds = -1.0;
         std::string backupProgressPackage;
         std::string backupProgressStageLabel;
         int backupProgressAppIndex = -1;
@@ -496,6 +510,7 @@ private:
     void renderConnectionActivity();
     void renderPanel(FilePanel& panel, PanelSide side);
     void renderAppsPanel(FilePanel& panel, PanelSide side);
+    void startAppUninstall(FilePanel& panel, bool useRoot);
     void renderTransferOverlay();
     void renderStatusBar();
     void renderContextMenu(FilePanel& panel);
@@ -556,6 +571,18 @@ private:
     std::string getBackupsRootPath() const;
     void refreshBackupManagerApps();
     void refreshBackupManagerBackups();
+    struct ArchiveTransportChannel {
+        DeviceClient* dev = nullptr;
+        std::unique_ptr<DeviceClient> owned;
+        std::string name;
+        std::string endpoint;
+        std::string forwardSerial;
+        int forwardPort = 0;
+    };
+    std::vector<ArchiveTransportChannel> buildArchiveTransportChannels(
+        DeviceClient& baseClient, int slot, int localPortBase);
+    void closeArchiveTransportChannels(
+        DeviceClient& baseClient, std::vector<ArchiveTransportChannel>& channels);
     void startBackupManagerBackup();
     void startBackupManagerRestore();
     void startBackupManagerRestorePaths(std::vector<std::string> backups);
@@ -700,6 +727,15 @@ private:
     bool m_showBackupRootChoice = false;
     bool m_backupRootChoicePositionInitialized = false;
 
+    bool m_appUninstallActive = false;
+    bool m_appUninstallUseRoot = false;
+    int m_appUninstallCurrent = 0;
+    int m_appUninstallTotal = 0;
+    int m_appUninstallSucceeded = 0;
+    int m_appUninstallFailed = 0;
+    std::string m_appUninstallPackage;
+    FilePanel* m_appUninstallPanel = nullptr;
+
     bool m_backupProgressActive = false;
     bool m_backupProgressIsRestore = false;
     int m_backupProgressCurrent = 0;
@@ -708,6 +744,8 @@ private:
     int m_backupProgressStageTotal = 1;
     uint64_t m_backupProgressBytes = 0;
     uint64_t m_backupProgressTotalBytes = 0;
+    double m_backupProgressBytesPerSecond = 0.0;
+    double m_backupProgressEtaSeconds = -1.0;
     std::string m_backupProgressPackage;
     std::string m_backupProgressStageLabel;
     std::vector<std::string> m_backupProgressPackages;

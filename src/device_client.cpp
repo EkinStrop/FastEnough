@@ -638,6 +638,64 @@ static std::string sanitizeAdbOutput(std::string text) {
     return text;
 }
 
+static std::string numericValueAfter(const std::string& text, const std::string& marker) {
+    const size_t markerPosition = text.find(marker);
+    if (markerPosition == std::string::npos) return {};
+    size_t position = markerPosition + marker.size();
+    while (position < text.size() && !std::isdigit((unsigned char)text[position])) ++position;
+    const size_t start = position;
+    while (position < text.size() && std::isdigit((unsigned char)text[position])) ++position;
+    return text.substr(start, position - start);
+}
+
+static std::string friendlyRestoreFailure(const std::string& rawOutput,
+                                          const std::string& appName,
+                                          const std::string& packageName,
+                                          bool allowDowngrade) {
+    const std::string heading = (appName.empty() ? packageName : appName) +
+        (appName.empty() || appName == packageName ? "" : " (" + packageName + ")");
+    std::string result = heading + "\n";
+    if (rawOutput.find("INSTALL_FAILED_VERSION_DOWNGRADE") != std::string::npos) {
+        result += "The APK was not installed because the backup contains an older app version than the device.\n";
+        const std::string backupVersion = numericValueAfter(rawOutput, "Update version code");
+        const std::string installedVersion = numericValueAfter(rawOutput, "older than current");
+        if (!backupVersion.empty()) result += "Backup version code: " + backupVersion + "\n";
+        if (!installedVersion.empty()) result += "Installed version code: " + installedVersion + "\n";
+        result += allowDowngrade
+            ? "Android rejected the downgrade. Uninstall the newer version first, then restore again."
+            : "Enable Allow downgrade and retry, or uninstall the newer version first.";
+    } else if (rawOutput.find("INSTALL_FAILED_UPDATE_INCOMPATIBLE") != std::string::npos) {
+        result += "The installed app has a different signing certificate from the backup.\n";
+        result += "Uninstall the installed version before restoring this backup.";
+    } else if (rawOutput.find("INSTALL_FAILED_INSUFFICIENT_STORAGE") != std::string::npos) {
+        result += "The device does not have enough free storage to install this app.";
+    } else if (rawOutput.find("INSTALL_FAILED_MISSING_SPLIT") != std::string::npos) {
+        result += "The backup is missing one or more required split APK files.";
+    } else if (rawOutput.find("INSTALL_FAILED_INVALID_APK") != std::string::npos ||
+               rawOutput.find("INSTALL_PARSE_FAILED") != std::string::npos) {
+        result += "Android rejected the backed-up APK because it is invalid or incomplete.";
+    } else if (rawOutput.find("INSTALL_FAILED_USER_RESTRICTED") != std::string::npos) {
+        result += "Android blocked the installation because app installation is restricted on this device.";
+    } else if (rawOutput.find("INSTALL_FAILED_CONFLICTING_PROVIDER") != std::string::npos) {
+        result += "The app conflicts with a content provider owned by another installed app.";
+    } else if (rawOutput.find("data.tar is missing") != std::string::npos ||
+               rawOutput.find("data_de.tar is missing") != std::string::npos) {
+        result += "The backup is missing one or more selected app-data archives.";
+    } else {
+        const size_t failurePosition = rawOutput.find("Failure [");
+        if (failurePosition != std::string::npos) {
+            size_t end = rawOutput.find_first_of("\r\n", failurePosition);
+            result += "Android reported: " + rawOutput.substr(failurePosition,
+                end == std::string::npos ? std::string::npos : end - failurePosition);
+        } else {
+            result += "The app could not be restored.";
+            const std::string cleaned = sanitizeAdbOutput(rawOutput);
+            if (!cleaned.empty()) result += "\nDevice response: " + cleaned;
+        }
+    }
+    return result;
+}
+
 static std::string quoteCmdArg(const std::string& s) {
     std::string out = "\"";
     for (char c : s) {
@@ -958,6 +1016,212 @@ bool DeviceClient::installBackupApksBatch(const std::vector<std::string>& backup
     }
     if (progress) progress(totalBytes, totalBytes);
     return allOk;
+}
+
+bool DeviceClient::restoreStagedBackupArchive(const std::string& remoteArchive,
+                                              const std::vector<ArchiveRestoreSelection>& selections,
+                                              const AppBackupOptions& options,
+                                              std::vector<bool>& restored,
+                                              std::string& output,
+                                              InstallProgressCallback progress) {
+    restored.assign(selections.size(), false);
+    output.clear();
+    if (!m_connected || selections.empty()) {
+        m_lastError = m_connected ? "No archive restore selections were provided" : "Not connected";
+        output = m_lastError;
+        return false;
+    }
+    const auto restoreStarted = std::chrono::steady_clock::now();
+    nlohmann::json request;
+    request["archive"] = remoteArchive;
+    request["includeApk"] = options.includeApk;
+    request["includeData"] = options.includeData;
+    request["includeDeviceProtectedData"] = options.includeDeviceProtectedData;
+    request["includeExternalData"] = options.includeExternalData;
+    request["includeObb"] = options.includeObb;
+    request["includeMedia"] = options.includeMedia;
+    request["grantRuntimePermissions"] = options.grantRuntimePermissions;
+    request["reinstall"] = options.reinstall;
+    request["allowDowngrade"] = options.allowDowngrade;
+    request["parallelism"] = 4;
+    request["apps"] = nlohmann::json::array();
+    std::vector<std::string> restoreAppNames;
+    std::vector<std::string> restorePackageNames;
+    restoreAppNames.reserve(selections.size());
+    restorePackageNames.reserve(selections.size());
+    for (const auto& selection : selections) {
+        nlohmann::json metadata = nlohmann::json::parse(selection.metadataJson, nullptr, false);
+        if (metadata.is_discarded()) {
+            output = "A selected app has invalid backup metadata";
+            return false;
+        }
+        restoreAppNames.push_back(metadata.value("label", ""));
+        restorePackageNames.push_back(metadata.value("packageName", ""));
+        request["apps"].push_back({{"prefix", selection.prefix}, {"metadata", std::move(metadata)}});
+    }
+    std::string encoded = request.dump();
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    SOCKET sock = (SOCKET)m_socket;
+    DWORD longTimeout = 1800000;
+    DWORD normalTimeout = 10000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&longTimeout, sizeof(longTimeout));
+    MsgHeader header{};
+    std::vector<char> payload;
+    bool received = sendMsg(CMD_RESTORE_BACKUP_ARCHIVE, encoded.data(), (uint32_t)encoded.size()) &&
+        recvMsg(header, payload);
+    if (!received || header.cmd != RSP_OK) {
+        if (received && header.cmd == RSP_ERROR) output.assign(payload.begin(), payload.end());
+        else output = m_lastError.empty() ? "The device did not accept the restore archive" : m_lastError;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&normalTimeout, sizeof(normalTimeout));
+        return false;
+    }
+    const double stagingSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - restoreStarted).count();
+    LOG_INFO("BackupManager", "Android restore staging completed in " +
+        std::to_string(stagingSeconds) + " s, starting " +
+        std::to_string(selections.size()) + " app restore(s) with 4 workers");
+
+    bool protocolOk = false;
+    while (recvMsg(header, payload)) {
+        if (header.cmd == RSP_DONE) {
+            protocolOk = true;
+            break;
+        }
+        if (header.cmd == RSP_ERROR) {
+            output.append(payload.begin(), payload.end());
+            break;
+        }
+        if (header.cmd != RSP_DATA) break;
+        nlohmann::json event = nlohmann::json::parse(payload.begin(), payload.end(), nullptr, false);
+        if (event.is_discarded()) continue;
+        const size_t index = event.value("index", selections.size());
+        if (index >= selections.size()) continue;
+        const std::string state = event.value("state", "");
+        if (state == "complete") {
+            restored[index] = event.value("success", false);
+            if (!restored[index]) {
+                output += friendlyRestoreFailure(event.value("output", ""), restoreAppNames[index],
+                    restorePackageNames[index], options.allowDowngrade) + "\n\n";
+            }
+        }
+        if (progress) {
+            AppInstallProgress update;
+            update.packageName = event.value("packageName", "");
+            update.stageLabel = event.value("stage", state);
+            update.backupIndex = (int)index;
+            update.completedApps = event.value("completed", 0);
+            update.totalApps = (int)selections.size();
+            update.appProgress = event.value("progress", state == "complete" ? 1.0f : 0.0f);
+            progress(update);
+        }
+    }
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&normalTimeout, sizeof(normalTimeout));
+    if (!protocolOk && output.empty()) output = "The device returned an incomplete archive restore result";
+    const double totalSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - restoreStarted).count();
+    LOG_INFO("BackupManager", "Android archive restore processing finished in " +
+        std::to_string(totalSeconds) + " s");
+    return protocolOk && std::all_of(restored.begin(), restored.end(), [](bool value) { return value; });
+}
+
+bool DeviceClient::createDeviceBackupArchive(const std::string& serial,
+                                             const std::string& created,
+                                             const std::vector<ArchiveBackupApp>& apps,
+                                             const AppBackupOptions& options,
+                                             std::string& remoteArchive,
+                                             uint64_t& archiveSize,
+                                             std::vector<bool>& backedUp,
+                                             std::string& output,
+                                             InstallProgressCallback progress) {
+    remoteArchive.clear();
+    archiveSize = 0;
+    backedUp.assign(apps.size(), false);
+    output.clear();
+    if (!m_connected || apps.empty()) {
+        output = m_connected ? "No apps were selected for backup" : "The device helper is not connected";
+        return false;
+    }
+
+    nlohmann::json request;
+    request["serial"] = serial;
+    request["created"] = created;
+    request["includeApk"] = options.includeApk;
+    request["includeData"] = options.includeData;
+    request["includeDeviceProtectedData"] = options.includeDeviceProtectedData;
+    request["includeExternalData"] = options.includeExternalData;
+    request["includeObb"] = options.includeObb;
+    request["includeMedia"] = options.includeMedia;
+    request["excludeCache"] = options.excludeCache;
+    request["apps"] = nlohmann::json::array();
+    for (const auto& app : apps) {
+        request["apps"].push_back({{"packageName", app.packageName}, {"label", app.label}});
+    }
+    const std::string encoded = request.dump();
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    SOCKET sock = (SOCKET)m_socket;
+    DWORD longTimeout = 1800000;
+    DWORD normalTimeout = 10000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&longTimeout, sizeof(longTimeout));
+    MsgHeader header{};
+    std::vector<char> payload;
+    bool received = sendMsg(CMD_CREATE_BACKUP_ARCHIVE, encoded.data(), (uint32_t)encoded.size()) &&
+        recvMsg(header, payload);
+    if (!received || header.cmd != RSP_OK) {
+        if (received && header.cmd == RSP_ERROR) output.assign(payload.begin(), payload.end());
+        else output = m_lastError.empty() ? "The device did not accept the backup request" : m_lastError;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&normalTimeout, sizeof(normalTimeout));
+        return false;
+    }
+
+    bool protocolOk = false;
+    while (recvMsg(header, payload)) {
+        if (header.cmd == RSP_DONE) {
+            nlohmann::json done = nlohmann::json::parse(payload.begin(), payload.end(), nullptr, false);
+            if (!done.is_discarded()) {
+                remoteArchive = done.value("archive", "");
+                archiveSize = done.value("size", uint64_t{0});
+                if (done.contains("results") && done["results"].is_array()) {
+                    const size_t count = std::min(backedUp.size(), done["results"].size());
+                    for (size_t index = 0; index < count; ++index) {
+                        if (done["results"][index].is_boolean()) backedUp[index] = done["results"][index].get<bool>();
+                    }
+                }
+                protocolOk = !remoteArchive.empty() && archiveSize > 0;
+            }
+            break;
+        }
+        if (header.cmd == RSP_ERROR) {
+            output.append(payload.begin(), payload.end());
+            break;
+        }
+        if (header.cmd != RSP_DATA) break;
+        nlohmann::json event = nlohmann::json::parse(payload.begin(), payload.end(), nullptr, false);
+        if (event.is_discarded()) continue;
+        const size_t index = event.value("index", apps.size());
+        if (index >= apps.size()) continue;
+        const std::string state = event.value("state", "");
+        if (state == "complete") {
+            backedUp[index] = event.value("success", false);
+            if (!backedUp[index]) {
+                output += apps[index].packageName + ": " + event.value("output", "Backup failed") + "\n";
+            }
+        }
+        if (progress) {
+            AppInstallProgress update;
+            update.packageName = event.value("packageName", apps[index].packageName);
+            update.stageLabel = event.value("stage", state);
+            update.backupIndex = (int)index;
+            update.completedApps = event.value("completed", 0);
+            update.totalApps = (int)apps.size();
+            update.appProgress = event.value("progress", state == "complete" ? 1.0f : 0.0f);
+            progress(update);
+        }
+    }
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&normalTimeout, sizeof(normalTimeout));
+    if (!protocolOk && output.empty()) output = "The device returned an incomplete backup archive result";
+    return protocolOk;
 }
 
 bool DeviceClient::uninstallPackage(const std::string& serial, const std::string& packageName, std::string& output,
@@ -1411,7 +1675,7 @@ bool DeviceClient::restoreAppBackup(const std::string& serial, const std::string
         if (permissionCount > 0) {
             std::string remoteList = "/data/local/tmp/afm-permissions-" + sanitizePathPart(packageName) + ".txt";
             std::string pushOut = runAdbCommand("-s " + serial + " push " +
-                quoteCmdArg(pathToUtf8(permissionList)) + " " + shellQuote(remoteList));
+                quoteCmdArg(pathToUtf8(permissionList)) + " " + remoteList);
             if (pushOut.find("error") == std::string::npos && pushOut.find("failed") == std::string::npos) {
                 std::string grantScript = "while IFS= read -r permission; do pm grant --user 0 " +
                     shellQuote(packageName) + " \"$permission\" 2>/dev/null; done < " +

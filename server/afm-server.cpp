@@ -35,6 +35,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <fstream>
 
 #include <motioncam/Decoder.hpp>
 #include <nlohmann/json.hpp>
@@ -591,32 +592,57 @@ static void handle_install_batch(int fd, const char* payload, uint32_t payload_l
             if (index >= tasks.size()) return;
             InstallTask& task = tasks[index];
             send_event(index, "installing");
-            std::string command = "/system/bin/pm ";
-            command += task.apks.size() > 1 ? "install-multiple" : "install";
-            if (reinstall) command += " -r";
-            if (grant) command += " -g";
-            if (downgrade) command += " -d";
-            for (const auto& apk : task.apks) {
-                std::vector<char> quoted(apk.size() * 4 + 3);
-                shell_quote(apk.c_str(), quoted.data(), quoted.size());
+            auto run_pm = [](const std::string& command, std::string& output) {
+                FILE* pipe = popen((command + " 2>&1").c_str(), "r");
+                if (!pipe) {
+                    output = strerror(errno);
+                    return false;
+                }
+                char line[1024];
+                while (fgets(line, sizeof(line), pipe)) output += line;
+                int status = pclose(pipe);
+                return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+                    output.find("Success") != std::string::npos && output.find("Failure") == std::string::npos;
+            };
+
+            if (task.apks.size() == 1) {
+                std::vector<char> quoted(task.apks.front().size() * 4 + 3);
+                shell_quote(task.apks.front().c_str(), quoted.data(), quoted.size());
+                std::string command = "/system/bin/pm install";
+                if (reinstall) command += " -r";
+                if (grant) command += " -g";
+                if (downgrade) command += " -d";
                 command += " ";
                 command += quoted.data();
+                task.success = run_pm(command, task.output);
+            } else {
+                std::string create = "/system/bin/pm install-create";
+                if (reinstall) create += " -r";
+                if (grant) create += " -g";
+                if (downgrade) create += " -d";
+                std::string createOutput;
+                bool created = run_pm(create, createOutput);
+                size_t begin = createOutput.find_last_of('[');
+                size_t end = createOutput.find_last_of(']');
+                std::string sessionId = (begin != std::string::npos && end != std::string::npos && end > begin)
+                    ? createOutput.substr(begin + 1, end - begin - 1) : "";
+                task.output += createOutput;
+                bool written = created && !sessionId.empty();
+                for (size_t apkIndex = 0; written && apkIndex < task.apks.size(); ++apkIndex) {
+                    std::vector<char> quoted(task.apks[apkIndex].size() * 4 + 3);
+                    shell_quote(task.apks[apkIndex].c_str(), quoted.data(), quoted.size());
+                    std::string write = "/system/bin/pm install-write " + sessionId + " split" +
+                        std::to_string(apkIndex) + " " + quoted.data();
+                    written = run_pm(write, task.output);
+                }
+                if (written) {
+                    task.success = run_pm("/system/bin/pm install-commit " + sessionId, task.output);
+                } else {
+                    std::string ignored;
+                    run_pm("/system/bin/pm install-abandon " + sessionId, ignored);
+                    task.success = false;
+                }
             }
-            command += " 2>&1";
-
-            FILE* pipe = popen(command.c_str(), "r");
-            if (!pipe) {
-                task.output = strerror(errno);
-                completed.fetch_add(1);
-                send_event(index, "complete");
-                continue;
-            }
-            char line[1024];
-            while (fgets(line, sizeof(line), pipe)) task.output += line;
-            int status = pclose(pipe);
-            task.success = status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
-                           task.output.find("Success") != std::string::npos &&
-                           task.output.find("Failure") == std::string::npos;
             completed.fetch_add(1);
             send_event(index, "complete");
         }
@@ -632,6 +658,816 @@ static void handle_install_batch(int fd, const char* payload, uint32_t payload_l
     cleanup += quoted_root;
     system(cleanup.c_str());
 
+    send_msg(fd, RSP_DONE, NULL, 0);
+}
+
+static uint16_t zip_u16(const unsigned char* value) {
+    return (uint16_t)value[0] | ((uint16_t)value[1] << 8);
+}
+
+static uint32_t zip_u32(const unsigned char* value) {
+    return (uint32_t)value[0] | ((uint32_t)value[1] << 8) |
+        ((uint32_t)value[2] << 16) | ((uint32_t)value[3] << 24);
+}
+
+static uint64_t zip_u64(const unsigned char* value) {
+    uint64_t result = 0;
+    for (unsigned shift = 0; shift < 64; shift += 8) result |= (uint64_t)(*value++) << shift;
+    return result;
+}
+
+static bool safe_relative_path(const std::string& value) {
+    if (value.empty() || value[0] == '/' || value[0] == '\\' || value.find('\\') != std::string::npos) return false;
+    size_t begin = 0;
+    while (begin <= value.size()) {
+        size_t end = value.find('/', begin);
+        std::string part = value.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        if (part == ".." || part == ".") return false;
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    return true;
+}
+
+static bool safe_package_name(const std::string& value) {
+    if (value.empty() || value.size() > 255) return false;
+    for (char c : value) {
+        if (!(c == '.' || c == '_' || (c >= 'a' && c <= 'z') ||
+              (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return false;
+    }
+    return value.find("..") == std::string::npos;
+}
+
+static std::string quoted_shell(const std::string& value) {
+    std::vector<char> quoted(value.size() * 4 + 3);
+    shell_quote(value.c_str(), quoted.data(), quoted.size());
+    return quoted.data();
+}
+
+static bool run_command_output(const std::string& command, std::string& output) {
+    FILE* pipe = popen((command + " 2>&1").c_str(), "r");
+    if (!pipe) {
+        output = strerror(errno);
+        return false;
+    }
+    char line[2048];
+    while (fgets(line, sizeof(line), pipe)) output += line;
+    int status = pclose(pipe);
+    return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static bool make_parent_directories(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) return false;
+    std::string parent = path.substr(0, slash);
+    std::string output;
+    return run_command_output("mkdir -p " + quoted_shell(parent), output);
+}
+
+static bool parse_zip64_values(const std::vector<unsigned char>& extra,
+                               bool needSize, bool needCompressed, bool needOffset,
+                               uint64_t& size, uint64_t& compressed, uint64_t& offset) {
+    size_t position = 0;
+    while (position + 4 <= extra.size()) {
+        uint16_t tag = zip_u16(extra.data() + position);
+        uint16_t length = zip_u16(extra.data() + position + 2);
+        position += 4;
+        if (position + length > extra.size()) return false;
+        if (tag == 1) {
+            const unsigned char* value = extra.data() + position;
+            size_t remaining = length;
+            auto take = [&](uint64_t& target) {
+                if (remaining < 8) return false;
+                target = zip_u64(value);
+                value += 8;
+                remaining -= 8;
+                return true;
+            };
+            if (needSize && !take(size)) return false;
+            if (needCompressed && !take(compressed)) return false;
+            if (needOffset && !take(offset)) return false;
+            return true;
+        }
+        position += length;
+    }
+    return !(needSize || needCompressed || needOffset);
+}
+
+static bool extract_store_zip(const std::string& archivePath, const std::string& destination, std::string& error) {
+    int archive = open(archivePath.c_str(), O_RDONLY);
+    if (archive < 0) {
+        error = strerror(errno);
+        return false;
+    }
+    struct stat info{};
+    if (fstat(archive, &info) != 0 || info.st_size < 22) {
+        error = "Archive is too small";
+        close(archive);
+        return false;
+    }
+    uint64_t fileSize = (uint64_t)info.st_size;
+    size_t tailSize = (size_t)std::min<uint64_t>(fileSize, 65557);
+    std::vector<unsigned char> tail(tailSize);
+    if (pread(archive, tail.data(), tail.size(), (off_t)(fileSize - tailSize)) != (ssize_t)tail.size()) {
+        error = "Could not read archive index";
+        close(archive);
+        return false;
+    }
+    size_t endPosition = SIZE_MAX;
+    for (size_t i = tail.size() - 22;; --i) {
+        if (zip_u32(tail.data() + i) == 0x06054b50) {
+            endPosition = i;
+            break;
+        }
+        if (i == 0) break;
+    }
+    if (endPosition == SIZE_MAX) {
+        error = "Archive index was not found";
+        close(archive);
+        return false;
+    }
+    uint64_t entryCount = zip_u16(tail.data() + endPosition + 10);
+    uint64_t centralOffset = zip_u32(tail.data() + endPosition + 16);
+    if (entryCount == 0xffff || centralOffset == 0xffffffffu) {
+        uint64_t absoluteEnd = fileSize - tailSize + endPosition;
+        unsigned char locator[20];
+        if (absoluteEnd < sizeof(locator) ||
+            pread(archive, locator, sizeof(locator), (off_t)(absoluteEnd - sizeof(locator))) != sizeof(locator) ||
+            zip_u32(locator) != 0x07064b50) {
+            error = "ZIP64 locator is invalid";
+            close(archive);
+            return false;
+        }
+        unsigned char zip64[56];
+        uint64_t zip64Offset = zip_u64(locator + 8);
+        if (pread(archive, zip64, sizeof(zip64), (off_t)zip64Offset) != sizeof(zip64) ||
+            zip_u32(zip64) != 0x06064b50) {
+            error = "ZIP64 index is invalid";
+            close(archive);
+            return false;
+        }
+        entryCount = zip_u64(zip64 + 32);
+        centralOffset = zip_u64(zip64 + 48);
+    }
+    if (entryCount > 1000000 || centralOffset >= fileSize) {
+        error = "Archive index is out of range";
+        close(archive);
+        return false;
+    }
+
+    std::string setupOutput;
+    if (!run_command_output("rm -rf " + quoted_shell(destination) + " && mkdir -p " + quoted_shell(destination), setupOutput)) {
+        error = setupOutput.empty() ? "Could not create restore staging directory" : setupOutput;
+        close(archive);
+        return false;
+    }
+    uint64_t position = centralOffset;
+    std::vector<unsigned char> copyBuffer(1024 * 1024);
+    for (uint64_t index = 0; index < entryCount; ++index) {
+        unsigned char header[46];
+        if (pread(archive, header, sizeof(header), (off_t)position) != sizeof(header) ||
+            zip_u32(header) != 0x02014b50) {
+            error = "Archive contains an invalid entry";
+            close(archive);
+            return false;
+        }
+        uint16_t flags = zip_u16(header + 8);
+        uint16_t method = zip_u16(header + 10);
+        uint32_t expectedCrc = zip_u32(header + 16);
+        uint64_t compressed = zip_u32(header + 20);
+        uint64_t size = zip_u32(header + 24);
+        uint16_t nameLength = zip_u16(header + 28);
+        uint16_t extraLength = zip_u16(header + 30);
+        uint16_t commentLength = zip_u16(header + 32);
+        uint64_t localOffset = zip_u32(header + 42);
+        std::string name(nameLength, '\0');
+        std::vector<unsigned char> extra(extraLength);
+        if (pread(archive, name.data(), name.size(), (off_t)(position + 46)) != (ssize_t)name.size() ||
+            pread(archive, extra.data(), extra.size(), (off_t)(position + 46 + nameLength)) != (ssize_t)extra.size()) {
+            error = "Archive entry is truncated";
+            close(archive);
+            return false;
+        }
+        position += 46 + nameLength + extraLength + commentLength;
+        bool needCompressed = compressed == 0xffffffffu;
+        bool needSize = size == 0xffffffffu;
+        bool needOffset = localOffset == 0xffffffffu;
+        if ((flags & 1) || method != 0 || !safe_relative_path(name) ||
+            ((needCompressed || needSize || needOffset) &&
+             !parse_zip64_values(extra, needSize, needCompressed, needOffset, size, compressed, localOffset)) ||
+            compressed != size || localOffset + 30 > fileSize) {
+            error = "Archive entry is unsupported or unsafe";
+            close(archive);
+            return false;
+        }
+        unsigned char local[30];
+        if (pread(archive, local, sizeof(local), (off_t)localOffset) != sizeof(local) ||
+            zip_u32(local) != 0x04034b50) {
+            error = "Archive local entry is invalid";
+            close(archive);
+            return false;
+        }
+        uint64_t dataOffset = localOffset + 30 + zip_u16(local + 26) + zip_u16(local + 28);
+        if (dataOffset > fileSize || size > fileSize - dataOffset) {
+            error = "Archive entry exceeds file size";
+            close(archive);
+            return false;
+        }
+        std::string outputPath = destination + "/" + name;
+        if (!make_parent_directories(outputPath)) {
+            error = "Could not create archive entry directory";
+            close(archive);
+            return false;
+        }
+        int output = open(outputPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (output < 0) {
+            error = strerror(errno);
+            close(archive);
+            return false;
+        }
+        uint64_t copied = 0;
+        uint32_t crc = 0xffffffffu;
+        bool copyOk = true;
+        while (copied < size) {
+            size_t chunk = (size_t)std::min<uint64_t>(size - copied, copyBuffer.size());
+            ssize_t readBytes = pread(archive, copyBuffer.data(), chunk, (off_t)(dataOffset + copied));
+            if (readBytes != (ssize_t)chunk) {
+                copyOk = false;
+                break;
+            }
+            size_t written = 0;
+            while (written < chunk) {
+                ssize_t count = write(output, copyBuffer.data() + written, chunk - written);
+                if (count <= 0) {
+                    copyOk = false;
+                    break;
+                }
+                written += (size_t)count;
+            }
+            if (!copyOk) break;
+            crc32_update_raw(&crc, copyBuffer.data(), chunk);
+            copied += chunk;
+        }
+        close(output);
+        if (!copyOk || (crc ^ 0xffffffffu) != expectedCrc) {
+            error = copyOk ? "Archive entry failed its integrity check" : "Could not extract archive entry";
+            close(archive);
+            return false;
+        }
+    }
+    close(archive);
+    return true;
+}
+
+static bool write_fd_all(int fd, const void* data, size_t length) {
+    const unsigned char* value = (const unsigned char*)data;
+    while (length > 0) {
+        ssize_t count = write(fd, value, length);
+        if (count <= 0) return false;
+        value += count;
+        length -= (size_t)count;
+    }
+    return true;
+}
+
+static bool zip_write16(int fd, uint16_t value) {
+    unsigned char bytes[2] = {(unsigned char)(value & 0xff), (unsigned char)((value >> 8) & 0xff)};
+    return write_fd_all(fd, bytes, sizeof(bytes));
+}
+
+static bool zip_write32(int fd, uint32_t value) {
+    unsigned char bytes[4] = {
+        (unsigned char)(value & 0xff), (unsigned char)((value >> 8) & 0xff),
+        (unsigned char)((value >> 16) & 0xff), (unsigned char)((value >> 24) & 0xff)
+    };
+    return write_fd_all(fd, bytes, sizeof(bytes));
+}
+
+static bool zip_write64(int fd, uint64_t value) {
+    unsigned char bytes[8];
+    for (unsigned shift = 0; shift < 64; shift += 8) bytes[shift / 8] = (unsigned char)((value >> shift) & 0xff);
+    return write_fd_all(fd, bytes, sizeof(bytes));
+}
+
+struct DeviceZipEntry {
+    std::string diskPath;
+    std::string name;
+    uint64_t size = 0;
+    uint64_t localOffset = 0;
+    uint32_t crc = 0;
+};
+
+static bool collect_zip_files(const std::string& root, const std::string& relative,
+                              std::vector<DeviceZipEntry>& files, std::string& error) {
+    std::string directory = relative.empty() ? root : root + "/" + relative;
+    DIR* dir = opendir(directory.c_str());
+    if (!dir) {
+        error = strerror(errno);
+        return false;
+    }
+    std::vector<std::string> names;
+    while (dirent* item = readdir(dir)) {
+        if (!strcmp(item->d_name, ".") || !strcmp(item->d_name, "..")) continue;
+        names.push_back(item->d_name);
+    }
+    closedir(dir);
+    std::sort(names.begin(), names.end());
+    for (const auto& name : names) {
+        std::string childRelative = relative.empty() ? name : relative + "/" + name;
+        std::string diskPath = root + "/" + childRelative;
+        struct stat info{};
+        if (lstat(diskPath.c_str(), &info) != 0) {
+            error = strerror(errno);
+            return false;
+        }
+        if (S_ISDIR(info.st_mode)) {
+            if (!collect_zip_files(root, childRelative, files, error)) return false;
+        } else if (S_ISREG(info.st_mode)) {
+            if (!safe_relative_path(childRelative) || childRelative.size() > 65535) {
+                error = "Backup contains an invalid archive path";
+                return false;
+            }
+            files.push_back({diskPath, childRelative, (uint64_t)info.st_size, 0, 0});
+        }
+    }
+    return true;
+}
+
+static bool create_store_zip(const std::string& sourceRoot, const std::string& archivePath, std::string& error) {
+    std::vector<DeviceZipEntry> files;
+    if (!collect_zip_files(sourceRoot, "", files, error)) return false;
+    int output = open(archivePath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (output < 0) {
+        error = strerror(errno);
+        return false;
+    }
+    std::vector<unsigned char> buffer(1024 * 1024);
+    bool ok = true;
+    for (auto& entry : files) {
+        entry.localOffset = (uint64_t)lseek64(output, 0, SEEK_CUR);
+        ok = zip_write32(output, 0x04034b50) && zip_write16(output, 45) && zip_write16(output, 0x0800) &&
+            zip_write16(output, 0) && zip_write16(output, 0) && zip_write16(output, 0) && zip_write32(output, 0) &&
+            zip_write32(output, 0xffffffffu) && zip_write32(output, 0xffffffffu) &&
+            zip_write16(output, (uint16_t)entry.name.size()) && zip_write16(output, 20) &&
+            write_fd_all(output, entry.name.data(), entry.name.size()) && zip_write16(output, 1) &&
+            zip_write16(output, 16) && zip_write64(output, entry.size) && zip_write64(output, entry.size);
+        if (!ok) break;
+        int input = open(entry.diskPath.c_str(), O_RDONLY);
+        if (input < 0) {
+            error = strerror(errno);
+            ok = false;
+            break;
+        }
+        uint32_t crc = 0xffffffffu;
+        uint64_t copied = 0;
+        while (copied < entry.size) {
+            size_t chunk = (size_t)std::min<uint64_t>(entry.size - copied, buffer.size());
+            ssize_t count = read(input, buffer.data(), chunk);
+            if (count <= 0 || !write_fd_all(output, buffer.data(), (size_t)count)) {
+                ok = false;
+                error = strerror(errno);
+                break;
+            }
+            crc32_update_raw(&crc, buffer.data(), (size_t)count);
+            copied += (uint64_t)count;
+        }
+        close(input);
+        if (!ok) break;
+        entry.crc = crc ^ 0xffffffffu;
+        off64_t end = lseek64(output, 0, SEEK_CUR);
+        unsigned char crcBytes[4] = {
+            (unsigned char)(entry.crc & 0xff), (unsigned char)((entry.crc >> 8) & 0xff),
+            (unsigned char)((entry.crc >> 16) & 0xff), (unsigned char)((entry.crc >> 24) & 0xff)
+        };
+        if (pwrite64(output, crcBytes, sizeof(crcBytes), (off64_t)(entry.localOffset + 14)) != sizeof(crcBytes) ||
+            lseek64(output, end, SEEK_SET) != end) {
+            ok = false;
+            error = strerror(errno);
+            break;
+        }
+    }
+    uint64_t centralOffset = (uint64_t)lseek64(output, 0, SEEK_CUR);
+    if (ok) {
+        for (const auto& entry : files) {
+            ok = zip_write32(output, 0x02014b50) && zip_write16(output, 45) && zip_write16(output, 45) &&
+                zip_write16(output, 0x0800) && zip_write16(output, 0) && zip_write16(output, 0) && zip_write16(output, 0) &&
+                zip_write32(output, entry.crc) && zip_write32(output, 0xffffffffu) && zip_write32(output, 0xffffffffu) &&
+                zip_write16(output, (uint16_t)entry.name.size()) && zip_write16(output, 28) && zip_write16(output, 0) &&
+                zip_write16(output, 0) && zip_write16(output, 0) && zip_write32(output, 0) && zip_write32(output, 0xffffffffu) &&
+                write_fd_all(output, entry.name.data(), entry.name.size()) && zip_write16(output, 1) &&
+                zip_write16(output, 24) && zip_write64(output, entry.size) && zip_write64(output, entry.size) &&
+                zip_write64(output, entry.localOffset);
+            if (!ok) break;
+        }
+    }
+    uint64_t centralSize = (uint64_t)lseek64(output, 0, SEEK_CUR) - centralOffset;
+    uint64_t zip64Offset = (uint64_t)lseek64(output, 0, SEEK_CUR);
+    if (ok) {
+        ok = zip_write32(output, 0x06064b50) && zip_write64(output, 44) && zip_write16(output, 45) &&
+            zip_write16(output, 45) && zip_write32(output, 0) && zip_write32(output, 0) &&
+            zip_write64(output, files.size()) && zip_write64(output, files.size()) &&
+            zip_write64(output, centralSize) && zip_write64(output, centralOffset) &&
+            zip_write32(output, 0x07064b50) && zip_write32(output, 0) && zip_write64(output, zip64Offset) &&
+            zip_write32(output, 1) && zip_write32(output, 0x06054b50) && zip_write16(output, 0) &&
+            zip_write16(output, 0) && zip_write16(output, 0xffff) && zip_write16(output, 0xffff) &&
+            zip_write32(output, 0xffffffffu) && zip_write32(output, 0xffffffffu) && zip_write16(output, 0);
+    }
+    if (fsync(output) != 0) ok = false;
+    close(output);
+    if (!ok) {
+        if (error.empty()) error = strerror(errno);
+        unlink(archivePath.c_str());
+    }
+    return ok;
+}
+
+static bool write_json_file(const std::string& path, const nlohmann::json& value, std::string& error) {
+    if (!make_parent_directories(path)) {
+        error = "Could not create backup metadata directory";
+        return false;
+    }
+    std::string encoded = value.dump(2);
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || !write_fd_all(fd, encoded.data(), encoded.size())) {
+        error = strerror(errno);
+        if (fd >= 0) close(fd);
+        return false;
+    }
+    close(fd);
+    return true;
+}
+
+static void handle_create_backup_archive(int fd, const char* payload, uint32_t payloadLen) {
+    nlohmann::json request = nlohmann::json::parse(payload, payload + payloadLen, nullptr, false);
+    if (request.is_discarded() || !request.contains("apps") || !request["apps"].is_array()) {
+        send_error(fd, "Invalid backup archive manifest");
+        return;
+    }
+    std::string created = request.value("created", "");
+    if (created.empty() || created.find_first_not_of("0123456789-") != std::string::npos) {
+        send_error(fd, "Invalid backup timestamp");
+        return;
+    }
+    std::string staging = "/data/local/tmp/afm-backup-staging-" + std::to_string(getpid()) + "-" + created;
+    std::string archive = "/data/local/tmp/afm-backup-job-" + std::to_string(getpid()) + "-" + created + ".zip";
+    std::string setupOutput;
+    if (!run_command_output("rm -rf " + quoted_shell(staging) + " " + quoted_shell(archive) +
+                            " && mkdir -p " + quoted_shell(staging + "/Apps"), setupOutput)) {
+        send_error(fd, setupOutput.c_str());
+        return;
+    }
+    uint32_t appCount = (uint32_t)request["apps"].size();
+    if (send_ok(fd, &appCount, sizeof(appCount)) < 0) return;
+    bool includeApk = request.value("includeApk", true);
+    bool includeData = request.value("includeData", true);
+    bool includeDe = request.value("includeDeviceProtectedData", true);
+    bool includeExternal = request.value("includeExternalData", true);
+    bool includeObb = request.value("includeObb", true);
+    bool includeMedia = request.value("includeMedia", true);
+    bool excludeCache = request.value("excludeCache", true);
+    std::vector<std::string> successfulPackages;
+    nlohmann::json results = nlohmann::json::array();
+    std::string cleanupOutput;
+
+    for (size_t index = 0; index < request["apps"].size(); ++index) {
+        const auto& app = request["apps"][index];
+        std::string packageName = app.value("packageName", "");
+        std::string label = app.value("label", packageName);
+        bool ok = safe_package_name(packageName);
+        std::string appOutput;
+        nlohmann::json metadata;
+        metadata["format"] = "FastEnoughAppBackup";
+        metadata["formatVersion"] = 2;
+        metadata["packageName"] = packageName;
+        metadata["label"] = label;
+        metadata["serial"] = request.value("serial", "");
+        metadata["created"] = created;
+        metadata["apkFiles"] = nlohmann::json::array();
+        metadata["permissions"] = nlohmann::json::array();
+        metadata["paths"] = {
+            {"data", "/data/data/" + packageName}, {"data_de", "/data/user_de/0/" + packageName},
+            {"external", "/sdcard/Android/data/" + packageName}, {"obb", "/sdcard/Android/obb/" + packageName},
+            {"media", "/sdcard/Android/media/" + packageName}
+        };
+        nlohmann::json has = {{"apk", false}, {"data", false}, {"data_de", false},
+            {"external", false}, {"obb", false}, {"media", false}};
+        std::string appRoot = staging + "/Apps/" + packageName + "/" + created;
+        std::string ignored;
+        if (ok) ok = run_command_output("mkdir -p " + quoted_shell(appRoot), ignored);
+
+        nlohmann::json event = {{"index", index}, {"state", "preparing"}, {"stage", "Collecting APK and app data"},
+            {"progress", 0.05f}, {"packageName", packageName}, {"completed", successfulPackages.size()}};
+        std::string eventText = event.dump();
+        send_msg(fd, RSP_DATA, eventText.data(), eventText.size());
+
+        if (ok && includeApk) {
+            std::string pathsOutput;
+            if (!run_command_output("pm path " + quoted_shell(packageName), pathsOutput)) ok = false;
+            std::istringstream lines(pathsOutput);
+            std::string line;
+            int apkIndex = 0;
+            while (std::getline(lines, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.rfind("package:", 0) != 0) continue;
+                std::string source = line.substr(8);
+                size_t slash = source.find_last_of('/');
+                std::string name = slash == std::string::npos ? "base.apk" : source.substr(slash + 1);
+                if (!safe_relative_path(name) || name.find('/') != std::string::npos) name = "split" + std::to_string(apkIndex) + ".apk";
+                std::string copyOutput;
+                if (!run_command_output("cp -f " + quoted_shell(source) + " " + quoted_shell(appRoot + "/" + name), copyOutput)) {
+                    ok = false;
+                    appOutput += copyOutput;
+                    break;
+                }
+                metadata["apkFiles"].push_back({{"name", name}, {"source", source}});
+                apkIndex++;
+            }
+            has["apk"] = !metadata["apkFiles"].empty();
+            if (!has["apk"].get<bool>()) ok = false;
+        }
+
+        std::string dumpsys;
+        run_command_output("dumpsys package " + quoted_shell(packageName), dumpsys);
+        std::istringstream permissionLines(dumpsys);
+        std::string permissionLine;
+        while (std::getline(permissionLines, permissionLine)) {
+            size_t permissionStart = permissionLine.find("android.permission.");
+            if (permissionStart == std::string::npos || permissionLine.find("granted=true") == std::string::npos) continue;
+            std::string permission = permissionLine.substr(permissionStart);
+            size_t end = permission.find_first_of(": ");
+            if (end != std::string::npos) permission.resize(end);
+            if (!permission.empty()) metadata["permissions"].push_back(permission);
+        }
+
+        auto addTar = [&](const char* key, const std::string& source, const char* filename, bool enabled) {
+            if (!ok || !enabled) return;
+            struct stat sourceInfo{};
+            if (stat(source.c_str(), &sourceInfo) != 0 || !S_ISDIR(sourceInfo.st_mode)) return;
+            std::string command = "cd " + quoted_shell(source) + " && tar -cpf " + quoted_shell(appRoot + "/" + filename);
+            if (excludeCache) command += " --exclude=cache --exclude=code_cache --exclude=no_backup";
+            command += " .";
+            std::string tarOutput;
+            if (!run_command_output(command, tarOutput)) {
+                ok = false;
+                appOutput += tarOutput;
+                return;
+            }
+            has[key] = true;
+        };
+        addTar("data", "/data/data/" + packageName, "data.tar", includeData);
+        addTar("data_de", "/data/user_de/0/" + packageName, "data_de.tar", includeDe);
+        addTar("external", "/sdcard/Android/data/" + packageName, "external.tar", includeExternal);
+        addTar("obb", "/sdcard/Android/obb/" + packageName, "obb.tar", includeObb);
+        addTar("media", "/sdcard/Android/media/" + packageName, "media.tar", includeMedia);
+        metadata["has"] = has;
+        std::string metadataError;
+        if (ok && !write_json_file(appRoot + "/backup.json", metadata, metadataError)) {
+            ok = false;
+            appOutput += metadataError;
+        }
+        if (ok) successfulPackages.push_back(packageName);
+        else run_command_output("rm -rf " + quoted_shell(appRoot), ignored);
+        results.push_back(ok);
+        event = {{"index", index}, {"state", "complete"}, {"stage", ok ? "App prepared" : "Backup failed"},
+            {"progress", 0.70f}, {"success", ok}, {"output", appOutput}, {"packageName", packageName},
+            {"completed", successfulPackages.size()}};
+        eventText = event.dump();
+        send_msg(fd, RSP_DATA, eventText.data(), eventText.size());
+    }
+
+    nlohmann::json contents = nlohmann::json::array();
+    if (includeApk) contents.push_back("APK");
+    if (includeData) contents.push_back("Data");
+    if (includeDe) contents.push_back("DE");
+    if (includeExternal) contents.push_back("External");
+    if (includeObb) contents.push_back("OBB");
+    if (includeMedia) contents.push_back("Media");
+    nlohmann::json job = {{"format", "FastEnoughBackupJob"}, {"formatVersion", 2}, {"archiveMode", "ZIP64 store"},
+        {"name", "Backup job " + created}, {"created", created}, {"serial", request.value("serial", "")},
+        {"appCount", successfulPackages.size()}, {"requestedAppCount", request["apps"].size()},
+        {"cancelled", false}, {"packages", successfulPackages}, {"contents", contents}};
+    std::string jobError;
+    bool archiveOk = !successfulPackages.empty() && write_json_file(staging + "/job.json", job, jobError) &&
+        create_store_zip(staging, archive, jobError);
+    run_command_output("rm -rf " + quoted_shell(staging), cleanupOutput);
+    if (!archiveOk) {
+        send_error(fd, jobError.empty() ? "Could not create device backup archive" : jobError.c_str());
+        return;
+    }
+    struct stat archiveInfo{};
+    if (stat(archive.c_str(), &archiveInfo) != 0) {
+        unlink(archive.c_str());
+        send_error(fd, strerror(errno));
+        return;
+    }
+    nlohmann::json done = {{"archive", archive}, {"size", (uint64_t)archiveInfo.st_size},
+        {"results", results}, {"packages", successfulPackages}};
+    std::string doneText = done.dump();
+    send_msg(fd, RSP_DONE, doneText.data(), doneText.size());
+}
+
+static bool install_device_apks(const std::vector<std::string>& apks,
+                                bool reinstall, bool grant, bool downgrade,
+                                std::string& output) {
+    if (apks.empty()) return true;
+    if (apks.size() == 1) {
+        std::string command = "/system/bin/pm install";
+        if (reinstall) command += " -r";
+        if (grant) command += " -g";
+        if (downgrade) command += " -d";
+        command += " " + quoted_shell(apks.front());
+        return run_command_output(command, output) && output.find("Success") != std::string::npos;
+    }
+    std::string create = "/system/bin/pm install-create";
+    if (reinstall) create += " -r";
+    if (grant) create += " -g";
+    if (downgrade) create += " -d";
+    std::string createOutput;
+    bool created = run_command_output(create, createOutput) && createOutput.find("Success") != std::string::npos;
+    output += createOutput;
+    size_t begin = createOutput.find_last_of('[');
+    size_t end = createOutput.find_last_of(']');
+    std::string session = begin != std::string::npos && end != std::string::npos && end > begin
+        ? createOutput.substr(begin + 1, end - begin - 1) : "";
+    if (!created || session.empty()) return false;
+    for (size_t index = 0; index < apks.size(); ++index) {
+        std::string writeOutput;
+        std::string command = "/system/bin/pm install-write " + session + " split" +
+            std::to_string(index) + " " + quoted_shell(apks[index]);
+        if (!run_command_output(command, writeOutput) || writeOutput.find("Success") == std::string::npos) {
+            output += writeOutput;
+            std::string ignored;
+            run_command_output("/system/bin/pm install-abandon " + session, ignored);
+            return false;
+        }
+        output += writeOutput;
+    }
+    std::string commitOutput;
+    bool committed = run_command_output("/system/bin/pm install-commit " + session, commitOutput) &&
+        commitOutput.find("Success") != std::string::npos;
+    output += commitOutput;
+    return committed;
+}
+
+static void handle_restore_backup_archive(int fd, const char* payload, uint32_t payload_len) {
+    nlohmann::json request = nlohmann::json::parse(payload, payload + payload_len, nullptr, false);
+    if (request.is_discarded() || !request.contains("archive") || !request.contains("apps") || !request["apps"].is_array()) {
+        send_error(fd, "Invalid backup archive restore manifest");
+        return;
+    }
+    std::string archive = request.value("archive", "");
+    if (archive.rfind("/data/local/tmp/afm-restore-job-", 0) != 0 || archive.find("..") != std::string::npos) {
+        send_error(fd, "Invalid backup archive path");
+        return;
+    }
+    std::string staging = "/data/local/tmp/afm-restore-extracted-" + std::to_string(getpid()) + "-" +
+        std::to_string((unsigned long long)time(nullptr));
+    std::string extractError;
+    if (!extract_store_zip(archive, staging, extractError)) {
+        unlink(archive.c_str());
+        send_error(fd, extractError.c_str());
+        return;
+    }
+    uint32_t appCount = (uint32_t)request["apps"].size();
+    if (send_ok(fd, &appCount, sizeof(appCount)) < 0) return;
+
+    struct RestoreTask {
+        std::string prefix;
+        nlohmann::json metadata;
+        bool success = false;
+        std::string output;
+    };
+    std::vector<RestoreTask> tasks;
+    for (const auto& app : request["apps"]) {
+        RestoreTask task;
+        task.prefix = app.value("prefix", "");
+        task.metadata = app.value("metadata", nlohmann::json::object());
+        if (!safe_relative_path(task.prefix) || !safe_package_name(task.metadata.value("packageName", ""))) {
+            send_error(fd, "Invalid app entry in restore archive");
+            return;
+        }
+        tasks.push_back(std::move(task));
+    }
+
+    bool includeApk = request.value("includeApk", true);
+    bool includeData = request.value("includeData", true);
+    bool includeDe = request.value("includeDeviceProtectedData", true);
+    bool includeExternal = request.value("includeExternalData", true);
+    bool includeObb = request.value("includeObb", true);
+    bool includeMedia = request.value("includeMedia", true);
+    bool grantPermissions = request.value("grantRuntimePermissions", true);
+    bool reinstall = request.value("reinstall", true);
+    bool downgrade = request.value("allowDowngrade", false);
+    unsigned parallelism = std::max(1u, std::min(4u, request.value("parallelism", 4u)));
+    parallelism = std::min<unsigned>(parallelism, tasks.size());
+    std::atomic<size_t> next{0};
+    std::atomic<int> completed{0};
+    std::mutex sendMutex;
+    auto sendEvent = [&](size_t index, const char* state, const char* stage, float progress) {
+        nlohmann::json event = {
+            {"index", index}, {"state", state}, {"stage", stage},
+            {"progress", progress}, {"success", tasks[index].success},
+            {"output", tasks[index].output}, {"completed", completed.load()},
+            {"packageName", tasks[index].metadata.value("packageName", "")}
+        };
+        std::string encoded = event.dump();
+        std::lock_guard<std::mutex> lock(sendMutex);
+        send_msg(fd, RSP_DATA, encoded.data(), encoded.size());
+    };
+
+    auto worker = [&]() {
+        while (true) {
+            size_t index = next.fetch_add(1);
+            if (index >= tasks.size()) return;
+            RestoreTask& task = tasks[index];
+            const std::string packageName = task.metadata.value("packageName", "");
+            const std::string appRoot = staging + "/" + task.prefix;
+            const auto has = task.metadata.value("has", nlohmann::json::object());
+            bool ok = true;
+            sendEvent(index, "restoring", "Installing APK", 0.10f);
+            if (includeApk && has.value("apk", false)) {
+                std::vector<std::string> apks;
+                for (const auto& apk : task.metadata.value("apkFiles", nlohmann::json::array())) {
+                    std::string name = apk.value("name", "");
+                    if (!safe_relative_path(name) || name.find('/') != std::string::npos) {
+                        ok = false;
+                        task.output += "Invalid APK entry\n";
+                        break;
+                    }
+                    apks.push_back(appRoot + "/" + name);
+                }
+                std::string installOutput;
+                if (ok && !install_device_apks(apks, reinstall, grantPermissions, downgrade, installOutput)) ok = false;
+                task.output += installOutput;
+            }
+            if (ok) {
+                std::string ignored;
+                run_command_output("am force-stop --user 0 " + quoted_shell(packageName), ignored);
+            }
+
+            auto restoreTar = [&](const char* filename, const std::string& target, bool enabled, bool present) {
+                if (!ok || !enabled || !present) return;
+                std::string archiveFile = appRoot + "/" + filename;
+                struct stat archiveInfo{};
+                if (stat(archiveFile.c_str(), &archiveInfo) != 0 || !S_ISREG(archiveInfo.st_mode)) {
+                    task.output += std::string(filename) + " is missing\n";
+                    ok = false;
+                    return;
+                }
+                std::string ownerOutput;
+                bool hadOwner = run_command_output("stat -c '%u:%g' " + quoted_shell(target) + " 2>/dev/null", ownerOutput);
+                ownerOutput.erase(std::remove(ownerOutput.begin(), ownerOutput.end(), '\n'), ownerOutput.end());
+                ownerOutput.erase(std::remove(ownerOutput.begin(), ownerOutput.end(), '\r'), ownerOutput.end());
+                if (ownerOutput.empty() || ownerOutput.find_first_not_of("0123456789:") != std::string::npos ||
+                    ownerOutput.find(':') == std::string::npos) hadOwner = false;
+                std::string command = "mkdir -p " + quoted_shell(target) +
+                    " && rm -rf " + quoted_shell(target) + "/* " + quoted_shell(target) + "/.[!.]* " +
+                    quoted_shell(target) + "/..?* 2>/dev/null || true; tar -xpf " + quoted_shell(archiveFile) +
+                    " -C " + quoted_shell(target);
+                std::string restoreOutput;
+                if (!run_command_output(command, restoreOutput)) {
+                    task.output += restoreOutput;
+                    ok = false;
+                    return;
+                }
+                if (hadOwner) {
+                    std::string fixOutput;
+                    run_command_output("chown -R " + ownerOutput + " " + quoted_shell(target) +
+                        "; restorecon -RF " + quoted_shell(target) + " >/dev/null 2>&1 || true", fixOutput);
+                }
+            };
+
+            sendEvent(index, "restoring", "Restoring app data", 0.45f);
+            restoreTar("data.tar", "/data/data/" + packageName, includeData, has.value("data", false));
+            restoreTar("data_de.tar", "/data/user_de/0/" + packageName, includeDe, has.value("data_de", false));
+            restoreTar("external.tar", "/sdcard/Android/data/" + packageName, includeExternal, has.value("external", false));
+            restoreTar("obb.tar", "/sdcard/Android/obb/" + packageName, includeObb, has.value("obb", false));
+            restoreTar("media.tar", "/sdcard/Android/media/" + packageName, includeMedia, has.value("media", false));
+
+            sendEvent(index, "restoring", "Restoring permissions", 0.90f);
+            if (ok && grantPermissions && task.metadata.contains("permissions")) {
+                std::string command;
+                for (const auto& permission : task.metadata["permissions"]) {
+                    if (!permission.is_string()) continue;
+                    command += "pm grant --user 0 " + quoted_shell(packageName) + " " +
+                        quoted_shell(permission.get<std::string>()) + " 2>/dev/null; ";
+                }
+                if (!command.empty()) {
+                    std::string ignored;
+                    run_command_output(command, ignored);
+                }
+            }
+            task.success = ok;
+            completed.fetch_add(1);
+            sendEvent(index, "complete", ok ? "App restored" : "Restore failed", 1.0f);
+        }
+    };
+
+    std::vector<std::thread> workers;
+    for (unsigned i = 0; i < parallelism; ++i) workers.emplace_back(worker);
+    for (auto& thread : workers) thread.join();
+    std::string cleanupOutput;
+    run_command_output("rm -rf " + quoted_shell(staging) + " " + quoted_shell(archive), cleanupOutput);
     send_msg(fd, RSP_DONE, NULL, 0);
 }
 
@@ -1959,6 +2795,8 @@ static void handle_client(int client_fd) {
             case CMD_ARCHIVE_PATH:  handle_archive_path(client_fd, payload_buf, hdr.length); break;
             case CMD_EXTRACT_ARCHIVE: handle_extract_archive(client_fd, payload_buf, hdr.length); break;
             case CMD_INSTALL_BATCH: handle_install_batch(client_fd, payload_buf, hdr.length); break;
+            case CMD_RESTORE_BACKUP_ARCHIVE: handle_restore_backup_archive(client_fd, payload_buf, hdr.length); break;
+            case CMD_CREATE_BACKUP_ARCHIVE: handle_create_backup_archive(client_fd, payload_buf, hdr.length); break;
             default:              send_error(client_fd, "Unknown command"); break;
         }
     }

@@ -1,4 +1,5 @@
 #include "app.h"
+#include "backup_archive.h"
 #include "imgui_internal.h"
 #include "mcraw_local.h"
 #include "mcraw_projfs.h"
@@ -58,6 +59,44 @@ static std::wstring toWide(const std::string& utf8) {
 // UTF-8 string to std::filesystem::path (via wide string to avoid ANSI codepage issues)
 static std::filesystem::path toFsPath(const std::string& utf8) {
     return std::filesystem::path(toWide(utf8));
+}
+
+static constexpr const char* kBackupArchiveReferenceSeparator = "|fezip|";
+
+static std::string makeBackupArchiveReference(const std::string& archivePath, const std::string& prefix) {
+    return archivePath + kBackupArchiveReferenceSeparator + prefix;
+}
+
+static bool splitBackupArchiveReference(const std::string& value, std::string& archivePath, std::string& prefix) {
+    const auto position = value.find(kBackupArchiveReferenceSeparator);
+    if (position == std::string::npos) return false;
+    archivePath = value.substr(0, position);
+    prefix = value.substr(position + strlen(kBackupArchiveReferenceSeparator));
+    return !archivePath.empty() && !prefix.empty();
+}
+
+static bool readBackupMetadata(const std::string& reference, nlohmann::json& metadata, std::string& error) {
+    std::string archivePath;
+    std::string prefix;
+    if (splitBackupArchiveReference(reference, archivePath, prefix)) {
+        BackupArchive archive;
+        if (!archive.open(toFsPath(archivePath), error)) return false;
+        std::string data;
+        if (!archive.readEntry(prefix + "/backup.json", data, error)) return false;
+        metadata = nlohmann::json::parse(data, nullptr, false);
+    } else {
+        std::ifstream file(toFsPath(reference) / "backup.json", std::ios::binary);
+        if (!file) {
+            error = "Backup metadata is missing";
+            return false;
+        }
+        metadata = nlohmann::json::parse(file, nullptr, false);
+    }
+    if (metadata.is_discarded()) {
+        error = "Backup metadata is not valid JSON";
+        return false;
+    }
+    return true;
 }
 
 static void appendPathSeparator(std::string& path, char sep) {
@@ -1366,6 +1405,18 @@ void App::drainUiMessages() {
         if (message.refreshAppList) {
             m_backupManagerNeedsAppRefresh = true;
         }
+        if (message.refreshFilePanel) {
+            message.refreshFilePanel->needsRefresh = true;
+        }
+        if (message.hasAppUninstallProgress) {
+            m_appUninstallActive = message.appUninstallActive;
+            m_appUninstallUseRoot = message.appUninstallUseRoot;
+            m_appUninstallCurrent = message.appUninstallCurrent;
+            m_appUninstallTotal = message.appUninstallTotal;
+            m_appUninstallSucceeded = message.appUninstallSucceeded;
+            m_appUninstallFailed = message.appUninstallFailed;
+            m_appUninstallPackage = std::move(message.appUninstallPackage);
+        }
         if (message.backupRootProbeComplete && message.backupRootSlot == (m_backupManagerSlot & 1) &&
             message.backupRootSerial == m_slotSerial[m_backupManagerSlot & 1]) {
             m_backupRootAccessSerial = message.backupRootSerial;
@@ -1389,6 +1440,8 @@ void App::drainUiMessages() {
             m_backupProgressStageTotal = message.backupProgressStageTotal;
             m_backupProgressBytes = message.backupProgressBytes;
             m_backupProgressTotalBytes = message.backupProgressTotalBytes;
+            m_backupProgressBytesPerSecond = message.backupProgressBytesPerSecond;
+            m_backupProgressEtaSeconds = message.backupProgressEtaSeconds;
             m_backupProgressPackage = std::move(message.backupProgressPackage);
             m_backupProgressStageLabel = std::move(message.backupProgressStageLabel);
             if (message.backupProgressAppIndex >= 0 &&
@@ -5320,6 +5373,118 @@ static std::string buildLogText(const std::vector<LogEntry>& entries, const std:
     return text;
 }
 
+void App::startAppUninstall(FilePanel& panel, bool useRoot) {
+    struct AppToRemove {
+        std::string packageName;
+        std::string displayName;
+    };
+
+    std::vector<AppToRemove> apps;
+    for (int index : panel.selectedIndices) {
+        if (!panel.validIndex(index)) continue;
+        const auto& entry = panel.appEntries[index];
+        apps.push_back({ entry.packageName, entry.appName.empty() ? entry.packageName : entry.appName });
+    }
+    if (apps.empty()) return;
+
+    std::string prompt = useRoot ? "Use root to uninstall " : "Uninstall ";
+    prompt += std::to_string(apps.size()) + " selected app";
+    if (apps.size() != 1) prompt += "s";
+    prompt += " for the current Android user?";
+    if (MessageBoxA(g_mainHwnd, prompt.c_str(), useRoot ? "Confirm Root Uninstall" : "Confirm Uninstall",
+                    MB_YESNO | MB_ICONWARNING) != IDYES)
+        return;
+
+    int slot = panel.deviceSlot;
+    std::string serial = m_slotSerial[slot];
+    m_appUninstallActive = true;
+    m_appUninstallUseRoot = useRoot;
+    m_appUninstallCurrent = 0;
+    m_appUninstallTotal = (int)apps.size();
+    m_appUninstallSucceeded = 0;
+    m_appUninstallFailed = 0;
+    m_appUninstallPackage = "Preparing uninstall";
+    m_appUninstallPanel = &panel;
+
+    postAsync(useRoot ? "Root uninstalling apps..." : "Uninstalling apps...",
+        [this, apps = std::move(apps), slot, serial, refreshPanel = &panel, useRoot]() {
+            int succeeded = 0;
+            int failed = 0;
+            std::string details;
+
+            if (useRoot && !deviceForSlot(slot).isRootAvailable(serial)) {
+                UiMessage message;
+                message.hasAppUninstallProgress = true;
+                message.appUninstallActive = false;
+                message.appUninstallUseRoot = true;
+                message.appUninstallTotal = (int)apps.size();
+                message.appUninstallFailed = (int)apps.size();
+                message.hasNotification = true;
+                message.notificationTitle = "Root Access Unavailable";
+                message.notificationMessage =
+                    "Root uninstall requires a rooted device with root permission granted for this device.";
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+
+            for (int index = 0; index < (int)apps.size(); ++index) {
+                UiMessage progress;
+                progress.hasAppUninstallProgress = true;
+                progress.appUninstallActive = true;
+                progress.appUninstallUseRoot = useRoot;
+                progress.appUninstallCurrent = index + 1;
+                progress.appUninstallTotal = (int)apps.size();
+                progress.appUninstallSucceeded = succeeded;
+                progress.appUninstallFailed = failed;
+                progress.appUninstallPackage = apps[index].displayName;
+                postUiMessage(std::move(progress));
+
+                std::string output;
+                if (deviceForSlot(slot).uninstallPackage(
+                        serial, apps[index].packageName, output, false, true, useRoot)) {
+                    ++succeeded;
+                } else {
+                    ++failed;
+                    details += apps[index].displayName + " (" + apps[index].packageName + "): " + output + "\n";
+                }
+
+                UiMessage completedItem;
+                completedItem.hasAppUninstallProgress = true;
+                completedItem.appUninstallActive = true;
+                completedItem.appUninstallUseRoot = useRoot;
+                completedItem.appUninstallCurrent = index + 1;
+                completedItem.appUninstallTotal = (int)apps.size();
+                completedItem.appUninstallSucceeded = succeeded;
+                completedItem.appUninstallFailed = failed;
+                completedItem.appUninstallPackage = apps[index].displayName;
+                postUiMessage(std::move(completedItem));
+            }
+
+            UiMessage result;
+            result.hasAppUninstallProgress = true;
+            result.appUninstallActive = false;
+            result.appUninstallUseRoot = useRoot;
+            result.appUninstallCurrent = (int)apps.size();
+            result.appUninstallTotal = (int)apps.size();
+            result.appUninstallSucceeded = succeeded;
+            result.appUninstallFailed = failed;
+            result.refreshFilePanel = refreshPanel;
+            result.hasStatus = true;
+            result.status = "Removed " + std::to_string(succeeded) + " of " + std::to_string(apps.size()) + " app(s)";
+            result.hasNotification = true;
+            result.notificationTitle = failed == 0 ? "Uninstall Complete" : "Uninstall Finished With Errors";
+            if (failed == 0) {
+                result.notificationMessage = "Removed " + std::to_string(succeeded) + " app(s) for the current Android user.";
+            } else {
+                result.notificationMessage = "Removed " + std::to_string(succeeded) + " of " +
+                    std::to_string(apps.size()) + " app(s).\n\n" + details;
+                result.notificationIsError = true;
+            }
+            postUiMessage(std::move(result));
+        });
+}
+
 void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
     if (!deviceFor(panel).isServerRunning()) {
         ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.25f, 1), "No Android device connected");
@@ -5396,113 +5561,18 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
     if (modernSmallButton(("Refresh##Apps" + sideId).c_str())) panel.needsRefresh = true;
 
     auto uninstallSelectedAppsFromMenu = [this, &panel](bool useRoot) {
-        std::vector<std::string> packages;
-        for (int idx : panel.selectedIndices)
-            if (panel.validIndex(idx)) packages.push_back(panel.appEntries[idx].packageName);
-        if (packages.empty()) return;
-        std::string prompt = (useRoot ? "Use root uninstall for " : "Uninstall ") +
-            std::to_string(packages.size()) + " selected app(s) for the current Android user?";
-        if (MessageBoxA(g_mainHwnd, prompt.c_str(), useRoot ? "Confirm Root Uninstall" : "Confirm Uninstall",
-                        MB_YESNO | MB_ICONWARNING) != IDYES)
-            return;
-        int slot = panel.deviceSlot;
-        FilePanel* refreshPanel = &panel;
-        postAsync(useRoot ? "Root uninstalling app..." : "Uninstalling app...",
-            [this, packages, slot, refreshPanel, useRoot]() {
-                int ok = 0;
-                std::string details;
-                std::string serial = m_slotSerial[slot];
-                if (useRoot && !deviceForSlot(slot).isRootAvailable(serial)) {
-                    showNotification("Root Access Unavailable",
-                        "Root uninstall requires a rooted device with ADB root permission granted for this device.", true);
-                    return;
-                }
-                for (const auto& pkg : packages) {
-                    std::string out;
-                    if (deviceForSlot(slot).uninstallPackage(serial, pkg, out, false, true, useRoot)) ok++;
-                    else details += pkg + ": " + out + "\n";
-                }
-                refreshPanel->needsRefresh = true;
-                std::string action = useRoot ? "Root Uninstall" : "Uninstall";
-                if (ok == (int)packages.size()) {
-                    showNotification(action + " Complete", "Removed " + std::to_string(ok) + " app(s) for the current Android user.", false);
-                    m_statusMessage = action + "ed " + std::to_string(ok) + " app(s)";
-                } else {
-                    showNotification(action + " Failed", details.empty() ? "No apps were removed." : details, true);
-                    m_statusMessage = action + " failed";
-                }
-                m_statusTime = std::chrono::steady_clock::now();
-            });
+        startAppUninstall(panel, useRoot);
     };
 
     ImGui::SameLine(0, 10);
     bool hasSelection = !panel.selectedIndices.empty();
     ImGui::BeginDisabled(!hasSelection || m_asyncBusy.load());
     if (modernSmallButton(("Uninstall##Apps" + sideId).c_str())) {
-        std::vector<std::string> packages;
-        for (int idx : panel.selectedIndices)
-            if (panel.validIndex(idx)) packages.push_back(panel.appEntries[idx].packageName);
-        std::string prompt = "Uninstall " + std::to_string(packages.size()) + " selected app(s) for the current Android user?";
-        if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Uninstall", MB_YESNO | MB_ICONWARNING) != IDYES)
-            packages.clear();
-        if (packages.empty()) { ImGui::EndDisabled(); return; }
-        int slot = panel.deviceSlot;
-        FilePanel* refreshPanel = &panel;
-        postAsync("Uninstalling app...", [this, packages, slot, refreshPanel]() {
-            int ok = 0;
-            std::string details;
-            std::string serial = m_slotSerial[slot];
-            for (const auto& pkg : packages) {
-                std::string out;
-                if (deviceForSlot(slot).uninstallPackage(serial, pkg, out, false, true, false)) ok++;
-                else details += pkg + ": " + out + "\n";
-            }
-            refreshPanel->needsRefresh = true;
-            if (ok == (int)packages.size()) {
-                showNotification("Uninstall Complete", "Removed " + std::to_string(ok) + " app(s) for the current Android user.", false);
-                m_statusMessage = "Uninstalled " + std::to_string(ok) + " app(s)";
-            } else {
-                showNotification("Uninstall Failed", details.empty() ? "No apps were removed." : details, true);
-                m_statusMessage = "Uninstall failed";
-            }
-            m_statusTime = std::chrono::steady_clock::now();
-        });
+        startAppUninstall(panel, false);
     }
     ImGui::SameLine(0, 4);
     if (modernSmallButton(("Root Uninstall##Apps" + sideId).c_str())) {
-        std::vector<std::string> packages;
-        for (int idx : panel.selectedIndices)
-            if (panel.validIndex(idx)) packages.push_back(panel.appEntries[idx].packageName);
-        std::string prompt = "Use root uninstall for " + std::to_string(packages.size()) + " selected app(s)?";
-        if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Root Uninstall", MB_YESNO | MB_ICONWARNING) != IDYES)
-            packages.clear();
-        if (packages.empty()) { ImGui::EndDisabled(); return; }
-        int slot = panel.deviceSlot;
-        FilePanel* refreshPanel = &panel;
-        postAsync("Root uninstalling app...", [this, packages, slot, refreshPanel]() {
-            int ok = 0;
-            std::string details;
-            std::string serial = m_slotSerial[slot];
-            if (!deviceForSlot(slot).isRootAvailable(serial)) {
-                showNotification("Root Access Unavailable",
-                    "Root uninstall requires a rooted device with ADB root permission granted for this device.", true);
-                return;
-            }
-            for (const auto& pkg : packages) {
-                std::string out;
-                if (deviceForSlot(slot).uninstallPackage(serial, pkg, out, false, true, true)) ok++;
-                else details += pkg + ": " + out + "\n";
-            }
-            refreshPanel->needsRefresh = true;
-            if (ok == (int)packages.size()) {
-                showNotification("Root Uninstall Complete", "Removed " + std::to_string(ok) + " app(s) for the current Android user.", false);
-                m_statusMessage = "Root uninstalled " + std::to_string(ok) + " app(s)";
-            } else {
-                showNotification("Root Uninstall Failed", details.empty() ? "No apps were removed." : details, true);
-                m_statusMessage = "Root uninstall failed";
-            }
-            m_statusTime = std::chrono::steady_clock::now();
-        });
+        startAppUninstall(panel, true);
     }
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
@@ -5516,6 +5586,69 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
         ImGui::TextDisabled("Loading...");
     }
     ImGui::Separator();
+
+    if (m_appUninstallActive && m_appUninstallPanel == &panel) {
+        ImVec2 available = ImGui::GetContentRegionAvail();
+        ImGui::BeginChild(("##AppUninstallProgress" + sideId).c_str(), available, 0,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImVec2 panelSize = ImGui::GetWindowSize();
+        float cardWidth = std::min(480.0f, std::max(250.0f, panelSize.x - 24.0f));
+        float cardHeight = 176.0f;
+        ImGui::SetCursorPos(ImVec2(std::max(12.0f, (panelSize.x - cardWidth) * 0.5f),
+                                   std::max(12.0f, (panelSize.y - cardHeight) * 0.38f)));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.035f, 0.065f, 0.105f, 0.98f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.16f, 0.35f, 0.58f, 0.90f));
+        ImGui::BeginChild(("##AppUninstallCard" + sideId).c_str(), ImVec2(cardWidth, cardHeight),
+                          ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+        ImVec2 cardPos = ImGui::GetWindowPos();
+        ImVec2 spinnerCenter(cardPos.x + 34.0f, cardPos.y + 50.0f);
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        float phase = (float)ImGui::GetTime() * 8.0f;
+        for (int dotIndex = 0; dotIndex < 12; ++dotIndex) {
+            float angle = ((float)dotIndex / 12.0f) * 6.2831853f - 1.5707963f;
+            float intensity = 0.20f + 0.80f * std::max(0.0f, std::cos(angle - phase));
+            ImVec2 dot(spinnerCenter.x + std::cos(angle) * 12.0f,
+                       spinnerCenter.y + std::sin(angle) * 12.0f);
+            drawList->AddCircleFilled(dot, 2.4f, IM_COL32(74, 174, 255, (int)(255.0f * intensity)));
+        }
+
+        ImGui::SetCursorPos(ImVec2(64.0f, 18.0f));
+        ImGui::TextColored(ImVec4(0.36f, 0.72f, 1.0f, 1.0f), "%s",
+                           m_appUninstallUseRoot ? "Root uninstall in progress" : "Uninstall in progress");
+        ImGui::SetCursorPos(ImVec2(64.0f, 45.0f));
+        if (m_appUninstallCurrent > 0) {
+            ImGui::Text("App %d of %d", m_appUninstallCurrent, m_appUninstallTotal);
+        } else {
+            ImGui::TextDisabled("Preparing selected apps");
+        }
+
+        ImGui::SetCursorPos(ImVec2(16.0f, 78.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::PushTextWrapPos(cardWidth - 16.0f);
+        ImGui::TextWrapped("%s", m_appUninstallPackage.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+
+        float progress = m_appUninstallTotal > 0
+            ? (float)(m_appUninstallSucceeded + m_appUninstallFailed) / (float)m_appUninstallTotal
+            : 0.0f;
+        ImGui::SetCursorPos(ImVec2(16.0f, 114.0f));
+        ImGui::ProgressBar(progress, ImVec2(cardWidth - 32.0f, 10.0f), "");
+        ImGui::SetCursorPos(ImVec2(16.0f, 137.0f));
+        ImGui::TextDisabled("%d removed", m_appUninstallSucceeded);
+        if (m_appUninstallFailed > 0) {
+            ImGui::SameLine(0, 14.0f);
+            ImGui::TextColored(ImVec4(1.0f, 0.38f, 0.38f, 1.0f), "%d failed", m_appUninstallFailed);
+        }
+        ImGui::SameLine(0, 14.0f);
+        ImGui::TextDisabled("Keep the device connected");
+
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+        ImGui::EndChild();
+        return;
+    }
 
     std::string filter(panel.searchFilter);
     std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
@@ -5705,6 +5838,49 @@ void App::refreshBackupManagerBackups() {
     if (std::filesystem::exists(jobsRoot, ec)) {
         for (auto jobIt = std::filesystem::directory_iterator(jobsRoot, ec);
              !ec && jobIt != std::filesystem::directory_iterator(); jobIt.increment(ec)) {
+            if (jobIt->is_regular_file(ec) && _wcsicmp(jobIt->path().extension().c_str(), L".zip") == 0) {
+                BackupArchive archive;
+                std::string archiveError;
+                if (!archive.open(jobIt->path(), archiveError)) {
+                    LOG_ERROR("BackupManager", "Could not open backup archive " + pathToUtf8(jobIt->path()) + ": " + archiveError);
+                    continue;
+                }
+                std::string jobData;
+                if (!archive.readEntry("job.json", jobData, archiveError)) continue;
+                nlohmann::json meta = nlohmann::json::parse(jobData, nullptr, false);
+                if (meta.is_discarded()) continue;
+                BackupManagerBackupRow row;
+                row.isJob = true;
+                row.isArchive = true;
+                row.record.packageName = meta.value("name", "Backup job");
+                row.record.serial = meta.value("serial", "");
+                row.record.created = meta.value("created", pathToUtf8(jobIt->path().stem()));
+                row.record.backupPath = pathToUtf8(jobIt->path());
+                row.appCount = meta.value("appCount", 0);
+                row.record.sizeBytes = jobIt->file_size(ec);
+                row.contentsSummary = std::to_string(row.appCount) + " app";
+                if (row.appCount != 1) row.contentsSummary += "s";
+                row.contentsSummary += "  ZIP store archive";
+                if (meta.contains("contents") && meta["contents"].is_array()) {
+                    for (const auto& item : meta["contents"]) {
+                        if (item.is_string()) row.contentsSummary += " " + item.get<std::string>();
+                    }
+                }
+                if (meta.contains("packages") && meta["packages"].is_array()) {
+                    for (const auto& package : meta["packages"])
+                        if (package.is_string()) row.searchText += " " + package.get<std::string>();
+                }
+                for (const auto& entry : archive.entries()) {
+                    if (entry.name.size() < 11 || entry.name.compare(entry.name.size() - 11, 11, "backup.json") != 0) continue;
+                    std::string appData;
+                    if (!archive.readEntry(entry.name, appData, archiveError)) continue;
+                    nlohmann::json appMeta = nlohmann::json::parse(appData, nullptr, false);
+                    if (!appMeta.is_discarded())
+                        row.searchText += " " + appMeta.value("label", "") + " " + appMeta.value("packageName", "");
+                }
+                rows.push_back(std::move(row));
+                continue;
+            }
             if (!jobIt->is_directory(ec)) continue;
             std::ifstream jf(jobIt->path() / "job.json", std::ios::binary);
             if (!jf) continue;
@@ -5842,6 +6018,48 @@ void App::openBackupManagerJob(const BackupManagerBackupRow& row) {
     m_backupManagerOpenJobPath = row.record.backupPath;
     m_backupManagerOpenJobTitle = row.record.packageName;
 
+    if (row.isArchive) {
+        BackupArchive archive;
+        std::string archiveError;
+        if (!archive.open(toFsPath(row.record.backupPath), archiveError)) {
+            LOG_ERROR("BackupManager", "Could not open backup archive: " + archiveError);
+            return;
+        }
+        for (const auto& entry : archive.entries()) {
+            if (entry.name.size() < 11 || entry.name.compare(entry.name.size() - 11, 11, "backup.json") != 0) continue;
+            std::string appData;
+            if (!archive.readEntry(entry.name, appData, archiveError)) continue;
+            nlohmann::json meta = nlohmann::json::parse(appData, nullptr, false);
+            if (meta.is_discarded()) continue;
+            BackupManagerJobAppRow appRow;
+            appRow.archivePath = row.record.backupPath;
+            appRow.archivePrefix = entry.name.substr(0, entry.name.size() - 11);
+            while (!appRow.archivePrefix.empty() && appRow.archivePrefix.back() == '/') appRow.archivePrefix.pop_back();
+            auto& rec = appRow.record;
+            rec.packageName = meta.value("packageName", "");
+            rec.label = meta.value("label", "");
+            rec.serial = meta.value("serial", "");
+            rec.created = meta.value("created", "");
+            rec.backupPath = makeBackupArchiveReference(appRow.archivePath, appRow.archivePrefix);
+            if (meta.contains("has")) {
+                rec.hasApk = meta["has"].value("apk", false);
+                rec.hasData = meta["has"].value("data", false);
+                rec.hasDeviceProtectedData = meta["has"].value("data_de", false);
+                rec.hasExternalData = meta["has"].value("external", false);
+                rec.hasObb = meta["has"].value("obb", false);
+                rec.hasMedia = meta["has"].value("media", false);
+            }
+            const std::string sizePrefix = appRow.archivePrefix + "/";
+            for (const auto& appEntry : archive.entries())
+                if (appEntry.name.compare(0, sizePrefix.size(), sizePrefix) == 0) rec.sizeBytes += appEntry.size;
+            if (!rec.packageName.empty()) m_backupManagerJobApps.push_back(std::move(appRow));
+        }
+        std::sort(m_backupManagerJobApps.begin(), m_backupManagerJobApps.end(), [](const BackupManagerJobAppRow& a, const BackupManagerJobAppRow& b) {
+            return _stricmp(a.record.packageName.c_str(), b.record.packageName.c_str()) < 0;
+        });
+        return;
+    }
+
     std::filesystem::path appsRoot = toFsPath(row.record.backupPath);
     if (row.isJob) appsRoot /= "Apps";
     std::error_code ec;
@@ -5890,6 +6108,182 @@ void App::closeBackupManagerJob() {
     m_backupManagerJobAppSelectionAnchor = -1;
 }
 
+std::vector<App::ArchiveTransportChannel> App::buildArchiveTransportChannels(
+    DeviceClient& baseClient, int slot, int localPortBase) {
+    std::vector<ArchiveTransportChannel> channels;
+    const std::string baseSerial = baseClient.connectedSerial().empty()
+        ? m_slotSerial[slot & 1]
+        : baseClient.connectedSerial();
+    const int remotePort = baseClient.localPort();
+    std::string usbSerial;
+    std::string wifiIp;
+
+    if (isWifiSerial(baseSerial)) {
+        auto colon = baseSerial.rfind(':');
+        wifiIp = baseSerial.substr(0, colon);
+    } else {
+        usbSerial = baseSerial;
+    }
+
+    for (const auto& saved : m_prefs.savedWifiDevices) {
+        const std::string wifiSerial = saved.wifiIp.empty()
+            ? ""
+            : saved.wifiIp + ":" + std::to_string(saved.port);
+        if (saved.serial == baseSerial || wifiSerial == baseSerial ||
+            (!usbSerial.empty() && saved.serial == usbSerial)) {
+            if (usbSerial.empty()) usbSerial = saved.serial;
+            if (wifiIp.empty()) wifiIp = saved.wifiIp;
+            break;
+        }
+    }
+
+    std::string hardwareSerial;
+    if (!baseSerial.empty()) {
+        hardwareSerial = baseClient.runAdbCommand(
+            "-s " + baseSerial + " shell getprop ro.serialno");
+        while (!hardwareSerial.empty() &&
+            (hardwareSerial.back() == '\n' || hardwareSerial.back() == '\r' ||
+             hardwareSerial.back() == ' ' || hardwareSerial.back() == '\t')) {
+            hardwareSerial.pop_back();
+        }
+    }
+
+    std::vector<DeviceInfo> deviceSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(m_deviceMutex);
+        deviceSnapshot = m_devices;
+    }
+    if (usbSerial.empty() && !hardwareSerial.empty()) {
+        for (const auto& device : deviceSnapshot) {
+            if (device.state != "device" || isWifiSerial(device.serial)) continue;
+            std::string candidateHardware = baseClient.runAdbCommand(
+                "-s " + device.serial + " shell getprop ro.serialno");
+            while (!candidateHardware.empty() &&
+                (candidateHardware.back() == '\n' || candidateHardware.back() == '\r' ||
+                 candidateHardware.back() == ' ' || candidateHardware.back() == '\t')) {
+                candidateHardware.pop_back();
+            }
+            if (candidateHardware == hardwareSerial) {
+                usbSerial = device.serial;
+                break;
+            }
+        }
+    }
+
+    if (wifiIp.empty() && !baseSerial.empty()) {
+        const std::string wlanOutput = baseClient.runAdbCommand(
+            "-s " + baseSerial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+        const auto inetPosition = wlanOutput.find("inet ");
+        if (inetPosition != std::string::npos) {
+            const auto start = inetPosition + 5;
+            const auto slash = wlanOutput.find('/', start);
+            if (slash != std::string::npos) wifiIp = wlanOutput.substr(start, slash - start);
+        }
+    }
+
+    const DevicePipePreference pipePreference = m_prefs.pipePreferencesFor(baseSerial);
+    const int requestedUsb = std::clamp(pipePreference.usbPipeCount, 1, 4);
+    const int requestedWifi = std::clamp(pipePreference.wifiPipeCount, 1, 4);
+    const bool baseUsesWifi = baseClient.isDirectConnection() || isWifiSerial(baseSerial);
+
+    ArchiveTransportChannel base;
+    base.dev = &baseClient;
+    base.name = baseUsesWifi
+        ? (baseClient.isDirectConnection() ? "WiFi (Direct)" : "WiFi (ADB)")
+        : "USB (ADB)";
+    base.endpoint = baseClient.isDirectConnection()
+        ? wifiIp + ":" + std::to_string(remotePort)
+        : "127.0.0.1:" + std::to_string(remotePort);
+    channels.push_back(std::move(base));
+
+    int usbCount = baseUsesWifi ? 0 : 1;
+    int wifiCount = baseUsesWifi ? 1 : 0;
+    int nextPort = localPortBase + (slot & 1) * 32;
+
+    auto addUsbChannel = [&]() -> bool {
+        if (usbSerial.empty()) return false;
+        for (int attempt = 0; attempt < 32; ++attempt) {
+            const int localPort = nextPort++;
+            const std::string forwardResult = baseClient.runAdbCommand(
+                "-s " + usbSerial + " forward tcp:" + std::to_string(localPort) +
+                " tcp:" + std::to_string(remotePort));
+            if (forwardResult.find("offline") != std::string::npos ||
+                forwardResult.find("not found") != std::string::npos) {
+                return false;
+            }
+            if (forwardResult.find("error") != std::string::npos) continue;
+
+            auto client = std::make_unique<DeviceClient>();
+            client->setAdbPath(baseClient.getAdbPath());
+            client->setLocalPort(localPort);
+            if (!client->connectTcp("127.0.0.1", localPort) || !client->verifyConnection()) {
+                client->disconnectTcp();
+                baseClient.runAdbCommand("-s " + usbSerial + " forward --remove tcp:" +
+                    std::to_string(localPort));
+                continue;
+            }
+
+            ArchiveTransportChannel channel;
+            channel.dev = client.get();
+            channel.owned = std::move(client);
+            channel.name = "USB (ADB)";
+            channel.endpoint = "127.0.0.1:" + std::to_string(localPort) +
+                " -> " + usbSerial + ":" + std::to_string(remotePort);
+            channel.forwardSerial = usbSerial;
+            channel.forwardPort = localPort;
+            channels.push_back(std::move(channel));
+            ++usbCount;
+            return true;
+        }
+        return false;
+    };
+
+    auto addWifiChannel = [&]() -> bool {
+        if (wifiIp.empty()) return false;
+        auto client = std::make_unique<DeviceClient>();
+        client->setAdbPath(baseClient.getAdbPath());
+        if (!client->connectTcp(wifiIp, remotePort) || !client->verifyConnection()) return false;
+
+        ArchiveTransportChannel channel;
+        channel.dev = client.get();
+        channel.owned = std::move(client);
+        channel.name = "WiFi (Direct)";
+        channel.endpoint = wifiIp + ":" + std::to_string(remotePort);
+        channels.push_back(std::move(channel));
+        ++wifiCount;
+        return true;
+    };
+
+    while (usbCount < requestedUsb && channels.size() < TransferBatch::MAX_CHANNELS) {
+        if (!addUsbChannel()) break;
+    }
+    while (wifiCount < requestedWifi && channels.size() < TransferBatch::MAX_CHANNELS) {
+        if (!addWifiChannel()) break;
+    }
+
+    LOG_INFO("BackupManager", "Prepared " + std::to_string(channels.size()) +
+        " archive transport channel(s), USB " + std::to_string(usbCount) + "/" +
+        std::to_string(requestedUsb) + ", WiFi " + std::to_string(wifiCount) + "/" +
+        std::to_string(requestedWifi) + ", helper port " + std::to_string(remotePort));
+    for (size_t index = 0; index < channels.size(); ++index) {
+        LOG_INFO("BackupManager", "Archive channel " + std::to_string(index + 1) + ": " +
+            channels[index].name + " at " + channels[index].endpoint);
+    }
+    return channels;
+}
+
+void App::closeArchiveTransportChannels(
+    DeviceClient& baseClient, std::vector<ArchiveTransportChannel>& channels) {
+    for (auto& channel : channels) {
+        if (channel.owned) channel.owned->disconnectTcp();
+        if (!channel.forwardSerial.empty() && channel.forwardPort > 0) {
+            baseClient.runAdbCommand("-s " + channel.forwardSerial +
+                " forward --remove tcp:" + std::to_string(channel.forwardPort));
+        }
+    }
+    channels.clear();
+}
+
 void App::startBackupManagerBackup() {
     int slot = m_backupManagerSlot & 1;
     std::vector<std::string> packages;
@@ -5930,6 +6324,8 @@ void App::startBackupManagerBackup() {
     m_backupProgressStageTotal = 1;
     m_backupProgressBytes = 0;
     m_backupProgressTotalBytes = 0;
+    m_backupProgressBytesPerSecond = 0.0;
+    m_backupProgressEtaSeconds = -1.0;
     m_backupProgressPackage.clear();
     m_backupProgressStageLabel = "Starting backup";
     m_backupPauseRequested = false;
@@ -5949,6 +6345,7 @@ void App::startBackupManagerBackup() {
 
     postAsync("Backing up apps...", [this, slot, serial, adbPath, packages, appLabels, root, created, jobPath = pathToUtf8(jobDir), options, requiresRoot]() {
         int ok = 0;
+        bool archiveOk = true;
         std::string details;
         std::vector<std::string> successfulPackages;
         try {
@@ -6010,19 +6407,263 @@ void App::startBackupManagerBackup() {
                 m_prefs.setRootEnabledForSerial(serial, true);
                 m_prefs.save();
             }
+            if (!slotClient.isServerRunning()) {
+                LOG_INFO("BackupManager", "Starting device helper for archive backup on " + serial);
+                if (!slotClient.startServer(serial, m_preferAdbForward, requiresRoot)) {
+                    UiMessage message;
+                    message.hasBackupProgress = true;
+                    message.backupProgressActive = false;
+                    message.hasNotification = true;
+                    message.notificationTitle = "Backup Failed";
+                    message.notificationMessage = "The device helper could not be started.\n\nDetails: " + slotClient.lastError();
+                    message.notificationIsError = true;
+                    postUiMessage(std::move(message));
+                    return;
+                }
+            }
+
+            std::vector<ArchiveBackupApp> archiveApps;
+            archiveApps.reserve(packages.size());
+            for (const auto& packageName : packages) {
+                auto label = appLabels.find(packageName);
+                archiveApps.push_back({packageName, label == appLabels.end() ? packageName : label->second});
+            }
+            std::string remoteArchive;
+            uint64_t remoteArchiveSize = 0;
+            std::vector<bool> backedUp;
+            std::string archiveDetails;
+            auto prepareProgress = [this](const AppInstallProgress& progress) {
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = true;
+                message.backupProgressCurrent = progress.completedApps;
+                message.backupProgressTotal = progress.totalApps;
+                message.backupProgressPackage = progress.packageName;
+                message.backupProgressStageLabel = progress.stageLabel;
+                message.backupProgressAppIndex = progress.backupIndex;
+                message.backupProgressAppFraction = progress.appProgress;
+                postUiMessage(std::move(message));
+                return !m_backupCancelRequested.load();
+            };
+            LOG_INFO("BackupManager", "Preparing one device-local archive for " +
+                std::to_string(packages.size()) + " app(s)");
+            bool prepared = slotClient.createDeviceBackupArchive(serial, created, archiveApps, options,
+                remoteArchive, remoteArchiveSize, backedUp, archiveDetails, prepareProgress);
+            if (!prepared) {
+                LOG_ERROR("BackupManager", "Device archive preparation failed: " + archiveDetails);
+                std::error_code removeEc;
+                std::filesystem::remove_all(toFsPath(jobPath), removeEc);
+                UiMessage message;
+                message.hasBackupProgress = true;
+                message.backupProgressActive = false;
+                message.hasNotification = true;
+                message.notificationTitle = "Backup Failed";
+                message.notificationMessage = archiveDetails.empty()
+                    ? "The device could not create the backup archive."
+                    : archiveDetails;
+                message.notificationIsError = true;
+                postUiMessage(std::move(message));
+                return;
+            }
+
+            const std::filesystem::path archivePath = toFsPath(jobPath).parent_path() /
+                (toFsPath(created).wstring() + L".zip");
+            const std::filesystem::path temporaryArchivePath = archivePath.wstring() + L".tmp";
+            HANDLE seed = CreateFileW(temporaryArchivePath.c_str(), GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            bool downloadOk = seed != INVALID_HANDLE_VALUE;
+            if (downloadOk) {
+                LARGE_INTEGER size{};
+                size.QuadPart = (LONGLONG)remoteArchiveSize;
+                downloadOk = SetFilePointerEx(seed, size, nullptr, FILE_BEGIN) && SetEndOfFile(seed);
+                CloseHandle(seed);
+            }
+
+            auto archiveChannels = buildArchiveTransportChannels(slotClient, slot, 6040);
+            std::vector<DeviceClient*> downloadWorkers;
+            for (auto& channel : archiveChannels) downloadWorkers.push_back(channel.dev);
+            if (downloadWorkers.empty()) downloadWorkers.push_back(&slotClient);
+            const int activeUsbPipes = (int)std::count_if(archiveChannels.begin(), archiveChannels.end(),
+                [](const ArchiveTransportChannel& channel) { return channel.name.find("USB") != std::string::npos; });
+            const int activeWifiPipes = (int)archiveChannels.size() - activeUsbPipes;
+            const std::string activePipeSummary = std::to_string(activeUsbPipes) + " USB + " +
+                std::to_string(activeWifiPipes) + " WiFi pipes";
+            LOG_INFO("BackupManager", "Downloading the device archive over " + activePipeSummary);
+
+            const uint64_t maximumStripeSize = remoteArchiveSize >= 8ull * 1024ull * 1024ull * 1024ull
+                ? 128ull * 1024ull * 1024ull
+                : 64ull * 1024ull * 1024ull;
+            const uint64_t fairStripeSize = remoteArchiveSize /
+                std::max<uint64_t>(1, (uint64_t)downloadWorkers.size() * 4);
+            const uint64_t archiveStripeSize = std::clamp<uint64_t>(fairStripeSize,
+                8ull * 1024ull * 1024ull, maximumStripeSize);
+            std::atomic<uint64_t> nextArchiveOffset{0};
+            std::atomic<uint64_t> downloadedBytes{0};
+            std::atomic<bool> transferFailed{!downloadOk};
+            std::vector<uint64_t> channelBytes(downloadWorkers.size(), 0);
+            std::vector<double> channelSeconds(downloadWorkers.size(), 0.0);
+            const auto archiveTransferStart = std::chrono::steady_clock::now();
+            auto downloadWorker = [&](DeviceClient* client, size_t channelIndex) {
+                const auto channelStart = std::chrono::steady_clock::now();
+                HANDLE output = CreateFileW(temporaryArchivePath.c_str(), GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (output == INVALID_HANDLE_VALUE) {
+                    transferFailed = true;
+                    return;
+                }
+                while (!transferFailed.load()) {
+                    {
+                        std::unique_lock<std::mutex> lock(m_backupControlMutex);
+                        m_backupControlCV.wait(lock, [this]() {
+                            return !m_backupPauseRequested.load() || m_backupCancelRequested.load();
+                        });
+                    }
+                    if (m_backupCancelRequested.load()) break;
+                    uint64_t offset = nextArchiveOffset.fetch_add(archiveStripeSize);
+                    if (offset >= remoteArchiveSize) break;
+                    uint64_t length = std::min(archiveStripeSize, remoteArchiveSize - offset);
+                    uint64_t received = client->readRangeStreaming(remoteArchive, offset, length,
+                        [&](const void* data, uint32_t byteCount, uint64_t chunkOffset) {
+                            if (m_backupCancelRequested.load()) return false;
+                            LARGE_INTEGER position{};
+                            position.QuadPart = (LONGLONG)chunkOffset;
+                            DWORD written = 0;
+                            if (!SetFilePointerEx(output, position, nullptr, FILE_BEGIN) ||
+                                !WriteFile(output, data, byteCount, &written, nullptr) || written != byteCount) {
+                                transferFailed = true;
+                                return false;
+                            }
+                            channelBytes[channelIndex] += byteCount;
+                            uint64_t total = downloadedBytes.fetch_add(byteCount) + byteCount;
+                            UiMessage message;
+                            message.hasBackupProgress = true;
+                            message.backupProgressActive = true;
+                            message.backupProgressCurrent = (int)std::count(backedUp.begin(), backedUp.end(), true);
+                            message.backupProgressTotal = (int)packages.size();
+                            message.backupProgressBytes = total;
+                            message.backupProgressTotalBytes = remoteArchiveSize;
+                            message.backupProgressStageLabel = "Downloading over " + activePipeSummary;
+                            postUiMessage(std::move(message));
+                            return true;
+                        });
+                    if (received != length && !m_backupCancelRequested.load()) transferFailed = true;
+                }
+                FlushFileBuffers(output);
+                CloseHandle(output);
+                channelSeconds[channelIndex] = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - channelStart).count();
+            };
+            std::vector<std::thread> archiveThreads;
+            if (downloadOk) {
+                for (size_t index = 0; index < downloadWorkers.size(); ++index)
+                    archiveThreads.emplace_back(downloadWorker, downloadWorkers[index], index);
+                for (auto& thread : archiveThreads) thread.join();
+            }
+            const double archiveTransferSeconds = std::max(0.001, std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - archiveTransferStart).count());
+            for (size_t index = 0; index < downloadWorkers.size(); ++index) {
+                const double seconds = std::max(0.001, channelSeconds[index]);
+                LOG_INFO("BackupManager", "Archive download channel " + std::to_string(index + 1) +
+                    " " + archiveChannels[index].name + ": " + formatSize(channelBytes[index]) +
+                    " at " + formatSpeed((double)channelBytes[index] / seconds));
+            }
+            LOG_INFO("BackupManager", "Archive download aggregate: " + formatSize(downloadedBytes.load()) +
+                " in " + std::to_string(archiveTransferSeconds) + " s, " +
+                formatSpeed((double)downloadedBytes.load() / archiveTransferSeconds));
+            closeArchiveTransportChannels(slotClient, archiveChannels);
+            slotClient.deleteFile(remoteArchive);
+
+            bool archiveCancelled = m_backupCancelRequested.load();
+            std::string verifyError;
+            BackupArchive verification;
+            if (!archiveCancelled && !transferFailed.load() && downloadedBytes.load() == remoteArchiveSize) {
+                downloadOk = verification.open(temporaryArchivePath, verifyError) &&
+                    verification.find("job.json") != nullptr;
+            } else {
+                downloadOk = false;
+            }
+            if (downloadOk) {
+                std::error_code renameEc;
+                std::filesystem::rename(temporaryArchivePath, archivePath, renameEc);
+                if (renameEc) {
+                    std::filesystem::remove(archivePath, renameEc);
+                    renameEc.clear();
+                    std::filesystem::rename(temporaryArchivePath, archivePath, renameEc);
+                }
+                downloadOk = !renameEc;
+                if (!downloadOk) verifyError = renameEc.message();
+            }
+            if (!downloadOk) {
+                std::error_code removeEc;
+                std::filesystem::remove(temporaryArchivePath, removeEc);
+            }
+            {
+                std::error_code removeEc;
+                std::filesystem::remove_all(toFsPath(jobPath), removeEc);
+            }
+
+            ok = (int)std::count(backedUp.begin(), backedUp.end(), true);
+            LOG_INFO("BackupManager", std::string(downloadOk ? "Archive backup complete: " : "Archive backup failed: ") +
+                pathToUtf8(archivePath));
+            UiMessage archiveResult;
+            archiveResult.refreshBackupList = true;
+            archiveResult.hasStatus = true;
+            archiveResult.status = archiveCancelled ? "Backup cancelled" :
+                (downloadOk ? "Backed up " + std::to_string(ok) + " app(s)" : "Backup failed");
+            archiveResult.hasBackupProgress = true;
+            archiveResult.backupProgressActive = false;
+            archiveResult.backupProgressCurrent = ok;
+            archiveResult.backupProgressTotal = (int)packages.size();
+            archiveResult.backupProgressStageLabel = archiveCancelled ? "Backup cancelled" :
+                (downloadOk ? "Backup finished" : "Backup failed");
+            archiveResult.hasNotification = true;
+            if (archiveCancelled) {
+                archiveResult.notificationTitle = "Backup Cancelled";
+                archiveResult.notificationMessage = "The partial archive was removed.";
+                archiveResult.notificationIsError = false;
+            } else if (downloadOk && ok == (int)packages.size()) {
+                archiveResult.notificationTitle = "Backup Complete";
+                archiveResult.notificationMessage = "All selected apps were prepared on the device and saved as one indexed archive.";
+                archiveResult.notificationIsError = false;
+            } else if (downloadOk) {
+                archiveResult.notificationTitle = "Backup Finished With Errors";
+                archiveResult.notificationMessage = "Completed apps: " + std::to_string(ok) + " of " +
+                    std::to_string(packages.size()) + "\n\n" + archiveDetails;
+                archiveResult.notificationIsError = true;
+            } else {
+                archiveResult.notificationTitle = "Backup Failed";
+                archiveResult.notificationMessage = verifyError.empty()
+                    ? "The backup archive could not be downloaded or verified."
+                    : "The backup archive could not be verified.\n\nDetails: " + verifyError;
+                archiveResult.notificationIsError = true;
+            }
+            postUiMessage(std::move(archiveResult));
+            return;
+
             DeviceClient& backupWorkClient = slotClient.isServerRunning() ? slotClient : backupClient;
             std::vector<std::unique_ptr<DeviceClient>> parallelClients;
             std::vector<DeviceClient*> workers;
             if (backupWorkClient.isServerRunning() && backupWorkClient.useRoot()) {
-                int targetWorkers = std::min(3, (int)packages.size());
+                std::vector<DeviceClient*> channelSources{ &backupWorkClient };
+                if (slot == 0 && m_dualChannelAvailable && m_secondaryChannel.isServerRunning()) {
+                    channelSources.push_back(&m_secondaryChannel);
+                }
+                if (slot == 0) {
+                    for (auto& extra : m_extraChannels) {
+                        if (extra.dev && extra.dev->isServerRunning()) channelSources.push_back(extra.dev.get());
+                    }
+                }
+                int targetWorkers = std::min((int)channelSources.size(), (int)packages.size());
                 for (int i = 0; i < targetWorkers; ++i) {
                     auto client = std::make_unique<DeviceClient>();
-                    if (!client->connectParallelFrom(backupWorkClient)) break;
+                    if (!client->connectParallelFrom(*channelSources[i])) continue;
                     workers.push_back(client.get());
                     parallelClients.push_back(std::move(client));
                 }
             }
             if (workers.empty()) workers.push_back(&backupWorkClient);
+            LOG_INFO("BackupManager", "Using " + std::to_string(workers.size()) +
+                " active transport channel(s) for backup");
 
             std::atomic<int> nextPackage{0};
             std::atomic<int> completedPackages{0};
@@ -6115,7 +6756,8 @@ void App::startBackupManagerBackup() {
             LOG_INFO("BackupManager", std::string(cancelled ? "Backup cancelled. ok=" : "Backup finished. ok=") + std::to_string(ok) + " total=" + std::to_string(packages.size()));
             nlohmann::json job;
             job["format"] = "FastEnoughBackupJob";
-            job["formatVersion"] = 1;
+            job["formatVersion"] = 2;
+            job["archiveMode"] = "ZIP64 store";
             job["name"] = "Backup job " + created;
             job["created"] = created;
             job["serial"] = serial;
@@ -6134,6 +6776,27 @@ void App::startBackupManagerBackup() {
             std::ofstream jf(toFsPath(jobPath) / "job.json", std::ios::binary);
             jf << job.dump(2);
             jf.close();
+            if (ok > 0) {
+                UiMessage archiveMessage;
+                archiveMessage.hasBackupProgress = true;
+                archiveMessage.backupProgressActive = true;
+                archiveMessage.backupProgressCurrent = ok;
+                archiveMessage.backupProgressTotal = (int)packages.size();
+                archiveMessage.backupProgressStageLabel = "Creating indexed backup archive";
+                postUiMessage(std::move(archiveMessage));
+                const std::filesystem::path archivePath = toFsPath(jobPath).parent_path() / (toFsPath(created).wstring() + L".zip");
+                std::string archiveError;
+                archiveOk = BackupArchive::createStore(toFsPath(jobPath), archivePath, archiveError);
+                if (archiveOk) {
+                    std::error_code removeEc;
+                    std::filesystem::remove_all(toFsPath(jobPath), removeEc);
+                    if (removeEc) LOG_ERROR("BackupManager", "Could not remove archived staging directory: " + removeEc.message());
+                    LOG_INFO("BackupManager", "Backup archive complete: " + pathToUtf8(archivePath));
+                } else {
+                    details += "Archive creation failed: " + archiveError + "\n";
+                    LOG_ERROR("BackupManager", "Backup archive creation failed: " + archiveError);
+                }
+            }
             if (cancelled && ok == 0) {
                 std::error_code removeEc;
                 std::filesystem::remove_all(toFsPath(jobPath), removeEc);
@@ -6163,7 +6826,7 @@ void App::startBackupManagerBackup() {
                     ? "Completed app backups were kept. Partial app files were removed."
                     : "No completed app backups were kept.");
                 message.notificationIsError = false;
-            } else if (ok == (int)packages.size()) {
+            } else if (ok == (int)packages.size() && archiveOk) {
                 message.notificationTitle = "Backup Complete";
                 message.notificationMessage = backupSummary + "\nAll selected apps were saved to the Backups folder.";
                 message.notificationIsError = false;
@@ -6216,6 +6879,18 @@ void App::startBackupManagerRestore() {
                 backups.push_back(row.record.backupPath);
                 continue;
             }
+            if (row.isArchive) {
+                BackupArchive archive;
+                std::string archiveError;
+                if (!archive.open(toFsPath(row.record.backupPath), archiveError)) continue;
+                for (const auto& entry : archive.entries()) {
+                    if (entry.name.size() < 11 || entry.name.compare(entry.name.size() - 11, 11, "backup.json") != 0) continue;
+                    std::string prefix = entry.name.substr(0, entry.name.size() - 11);
+                    while (!prefix.empty() && prefix.back() == '/') prefix.pop_back();
+                    backups.push_back(makeBackupArchiveReference(row.record.backupPath, prefix));
+                }
+                continue;
+            }
             std::filesystem::path appsRoot = toFsPath(row.record.backupPath) / "Apps";
             std::error_code ec;
             for (auto pkgIt = std::filesystem::directory_iterator(appsRoot, ec);
@@ -6261,6 +6936,8 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
     m_backupProgressStageTotal = 1;
     m_backupProgressBytes = 0;
     m_backupProgressTotalBytes = 0;
+    m_backupProgressBytesPerSecond = 0.0;
+    m_backupProgressEtaSeconds = -1.0;
     m_backupProgressPackage.clear();
     m_backupProgressStageLabel = "Starting restore";
     m_backupPauseRequested = false;
@@ -6272,8 +6949,9 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
         if (!row.app.appName.empty()) installedLabels[row.app.packageName] = row.app.appName;
     }
     for (const auto& backup : backups) {
-        std::ifstream mf(toFsPath(backup) / "backup.json", std::ios::binary);
-        nlohmann::json meta = nlohmann::json::parse(mf, nullptr, false);
+        nlohmann::json meta;
+        std::string metadataError;
+        readBackupMetadata(backup, meta, metadataError);
         std::string fallback = pathToUtf8(toFsPath(backup).filename());
         if (meta.is_discarded()) {
             m_backupProgressPackages.push_back(std::move(fallback));
@@ -6292,9 +6970,10 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
     m_backupAppActive.assign(backups.size(), false);
     m_backupDisplayedOverallProgress = 0.0f;
 
-    postAsync("Restoring backups...", [this, slot, serial, adbPath, backups, options, requiresRoot]() {
+    postAsync("Restoring backups...", [this, slot, serial, adbPath, backups, options, requiresRoot]() mutable {
         int ok = 0;
         std::string details;
+        const int requestedRestoreCount = (int)backups.size();
         try {
             DeviceClient restoreClient;
             if (!adbPath.empty()) restoreClient.setAdbPath(adbPath);
@@ -6341,11 +7020,280 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                     return;
                 }
             }
+            if (!slotClient.isServerRunning()) {
+                LOG_INFO("BackupManager", "Starting device helper for archive restore on " + serial);
+                if (!slotClient.startServer(serial, m_preferAdbForward, false)) {
+                    UiMessage message;
+                    message.hasBackupProgress = true;
+                    message.backupProgressActive = false;
+                    message.backupProgressIsRestore = true;
+                    message.hasNotification = true;
+                    message.notificationTitle = "Restore Failed";
+                    message.notificationMessage = "The device helper could not be started.\n\nDetails: " + slotClient.lastError();
+                    message.notificationIsError = true;
+                    postUiMessage(std::move(message));
+                    return;
+                }
+            }
             if (requiresRoot) {
                 m_prefs.setRootEnabledForSerial(serial, true);
                 m_prefs.save();
             }
             DeviceClient& restoreWorkClient = slotClient.isServerRunning() ? slotClient : restoreClient;
+
+            struct ArchiveRestoreItem {
+                int originalIndex = 0;
+                std::string prefix;
+                std::string metadataJson;
+            };
+            std::unordered_map<std::string, std::vector<ArchiveRestoreItem>> archiveGroups;
+            std::vector<std::string> directoryBackups;
+            for (size_t index = 0; index < backups.size(); ++index) {
+                std::string archivePath;
+                std::string prefix;
+                if (!splitBackupArchiveReference(backups[index], archivePath, prefix)) {
+                    directoryBackups.push_back(backups[index]);
+                    continue;
+                }
+                nlohmann::json metadata;
+                std::string metadataError;
+                if (!readBackupMetadata(backups[index], metadata, metadataError)) {
+                    details += backups[index] + ": " + metadataError + "\n";
+                    continue;
+                }
+                archiveGroups[archivePath].push_back({(int)index, prefix, metadata.dump()});
+            }
+
+            if (!archiveGroups.empty()) {
+                int restoredFromArchives = 0;
+                int failedFromArchives = 0;
+                for (const auto& group : archiveGroups) {
+                    if (m_backupCancelRequested.load()) break;
+                    std::vector<std::string> prefixes;
+                    std::vector<ArchiveRestoreSelection> selections;
+                    prefixes.reserve(group.second.size());
+                    selections.reserve(group.second.size());
+                    for (const auto& item : group.second) {
+                        prefixes.push_back(item.prefix);
+                        selections.push_back({item.prefix, item.metadataJson});
+                    }
+
+                    std::string archiveError;
+                    BackupArchive sourceArchive;
+                    bool sourceArchiveOpen = sourceArchive.open(toFsPath(group.first), archiveError);
+                    std::unordered_set<std::string> selectedPrefixes;
+                    for (auto prefix : prefixes) {
+                        while (!prefix.empty() && prefix.back() == '/') prefix.pop_back();
+                        selectedPrefixes.insert(std::move(prefix));
+                    }
+                    std::unordered_set<std::string> availablePrefixes;
+                    if (sourceArchiveOpen) {
+                        static constexpr std::string_view metadataSuffix = "/backup.json";
+                        for (const auto& entry : sourceArchive.entries()) {
+                            if (entry.name.size() <= metadataSuffix.size() ||
+                                entry.name.compare(entry.name.size() - metadataSuffix.size(),
+                                    metadataSuffix.size(), metadataSuffix) != 0) continue;
+                            availablePrefixes.insert(entry.name.substr(
+                                0, entry.name.size() - metadataSuffix.size()));
+                        }
+                    }
+                    bool restoreWholeArchive = sourceArchiveOpen && !availablePrefixes.empty();
+                    if (restoreWholeArchive) {
+                        for (const auto& prefix : availablePrefixes) {
+                            if (!selectedPrefixes.contains(prefix)) {
+                                restoreWholeArchive = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    std::filesystem::path uploadArchive = toFsPath(group.first);
+                    bool removeUploadArchive = false;
+                    if (restoreWholeArchive) {
+                        LOG_INFO("BackupManager", "All archive apps selected, uploading the original backup directly");
+                    } else {
+                        uploadArchive = std::filesystem::temp_directory_path() /
+                            (L"FastEnough-restore-selection-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                             std::to_wstring(GetTickCount64()) + L".zip");
+                        if (!BackupArchive::createSelection(toFsPath(group.first), prefixes, uploadArchive, archiveError)) {
+                            details += group.first + ": " + archiveError + "\n";
+                            failedFromArchives += (int)group.second.size();
+                            continue;
+                        }
+                        removeUploadArchive = true;
+                    }
+                    std::error_code sizeError;
+                    uint64_t archiveSize = std::filesystem::file_size(uploadArchive, sizeError);
+                    const std::string remoteArchive = "/data/local/tmp/afm-restore-job-" +
+                        std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()) + ".zip";
+                    if (sizeError || !restoreWorkClient.createFile(remoteArchive, archiveSize)) {
+                        details += group.first + ": Could not create the device restore archive: " +
+                            restoreWorkClient.lastError() + "\n";
+                        failedFromArchives += (int)group.second.size();
+                        if (removeUploadArchive) std::filesystem::remove(uploadArchive, sizeError);
+                        continue;
+                    }
+
+                    auto archiveChannels = buildArchiveTransportChannels(restoreWorkClient, slot, 6110);
+                    std::vector<DeviceClient*> uploadWorkers;
+                    for (auto& channel : archiveChannels) uploadWorkers.push_back(channel.dev);
+                    if (uploadWorkers.empty()) uploadWorkers.push_back(&restoreWorkClient);
+                    const int activeUsbPipes = (int)std::count_if(archiveChannels.begin(), archiveChannels.end(),
+                        [](const ArchiveTransportChannel& channel) { return channel.name.find("USB") != std::string::npos; });
+                    const int activeWifiPipes = (int)archiveChannels.size() - activeUsbPipes;
+                    const std::string activePipeSummary = std::to_string(activeUsbPipes) + " USB + " +
+                        std::to_string(activeWifiPipes) + " WiFi pipes";
+                    LOG_INFO("BackupManager", "Uploading selected restore archive over " + activePipeSummary);
+
+                    const uint64_t maximumStripeSize = archiveSize >= 8ull * 1024ull * 1024ull * 1024ull
+                        ? 128ull * 1024ull * 1024ull
+                        : 64ull * 1024ull * 1024ull;
+                    const uint64_t fairStripeSize = archiveSize /
+                        std::max<uint64_t>(1, (uint64_t)uploadWorkers.size() * 4);
+                    const uint64_t archiveStripeSize = std::clamp<uint64_t>(fairStripeSize,
+                        8ull * 1024ull * 1024ull, maximumStripeSize);
+                    const uint64_t stripeCount = (archiveSize + archiveStripeSize - 1) / archiveStripeSize;
+                    std::atomic<uint64_t> nextStripe{0};
+                    std::atomic<uint64_t> uploadedBytes{0};
+                    std::atomic<bool> uploadFailed{false};
+                    std::vector<uint64_t> channelBytes(uploadWorkers.size(), 0);
+                    std::vector<double> channelSeconds(uploadWorkers.size(), 0.0);
+                    const auto archiveTransferStart = std::chrono::steady_clock::now();
+                    auto uploadWorker = [&](DeviceClient* client, size_t channelIndex) {
+                        const auto channelStart = std::chrono::steady_clock::now();
+                        while (!uploadFailed.load()) {
+                            {
+                                std::unique_lock<std::mutex> lock(m_backupControlMutex);
+                                m_backupControlCV.wait(lock, [this]() {
+                                    return !m_backupPauseRequested.load() || m_backupCancelRequested.load();
+                                });
+                            }
+                            if (m_backupCancelRequested.load()) {
+                                uploadFailed = true;
+                                break;
+                            }
+                            uint64_t stripe = nextStripe.fetch_add(1);
+                            if (stripe >= stripeCount) break;
+                            uint64_t offset = stripe * archiveStripeSize;
+                            uint64_t length = std::min<uint64_t>(archiveStripeSize, archiveSize - offset);
+                            uint64_t written = client->writeRangeStreaming(remoteArchive, offset,
+                                pathToUtf8(uploadArchive), offset, length);
+                            if (written != length) {
+                                uploadFailed = true;
+                                break;
+                            }
+                            channelBytes[channelIndex] += length;
+                            uint64_t totalUploaded = uploadedBytes.fetch_add(length) + length;
+                            const double elapsedSeconds = std::max(0.001, std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - archiveTransferStart).count());
+                            const double bytesPerSecond = (double)totalUploaded / elapsedSeconds;
+                            UiMessage uploadMessage;
+                            uploadMessage.hasBackupProgress = true;
+                            uploadMessage.backupProgressActive = true;
+                            uploadMessage.backupProgressIsRestore = true;
+                            uploadMessage.backupProgressBytes = totalUploaded;
+                            uploadMessage.backupProgressTotalBytes = archiveSize;
+                            uploadMessage.backupProgressBytesPerSecond = bytesPerSecond;
+                            uploadMessage.backupProgressEtaSeconds = bytesPerSecond > 0.0
+                                ? (double)(archiveSize - totalUploaded) / bytesPerSecond
+                                : -1.0;
+                            uploadMessage.backupProgressStageLabel = "Uploading over " + activePipeSummary;
+                            postUiMessage(std::move(uploadMessage));
+                        }
+                        channelSeconds[channelIndex] = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - channelStart).count();
+                    };
+                    std::vector<std::thread> uploadThreads;
+                    for (size_t index = 0; index < uploadWorkers.size(); ++index)
+                        uploadThreads.emplace_back(uploadWorker, uploadWorkers[index], index);
+                    for (auto& thread : uploadThreads) thread.join();
+                    const double archiveTransferSeconds = std::max(0.001, std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - archiveTransferStart).count());
+                    for (size_t index = 0; index < uploadWorkers.size(); ++index) {
+                        const double seconds = std::max(0.001, channelSeconds[index]);
+                        LOG_INFO("BackupManager", "Archive upload channel " + std::to_string(index + 1) +
+                            " " + archiveChannels[index].name + ": " + formatSize(channelBytes[index]) +
+                            " at " + formatSpeed((double)channelBytes[index] / seconds));
+                    }
+                    LOG_INFO("BackupManager", "Archive upload aggregate: " + formatSize(uploadedBytes.load()) +
+                        " in " + std::to_string(archiveTransferSeconds) + " s, " +
+                        formatSpeed((double)uploadedBytes.load() / archiveTransferSeconds));
+                    closeArchiveTransportChannels(restoreWorkClient, archiveChannels);
+                    if (uploadFailed.load()) {
+                        restoreWorkClient.deleteFile(remoteArchive);
+                        details += group.first + ": Archive upload failed\n";
+                        failedFromArchives += (int)group.second.size();
+                        if (removeUploadArchive) std::filesystem::remove(uploadArchive, sizeError);
+                        continue;
+                    }
+
+                    std::vector<bool> restoredApps;
+                    std::string restoreOutput;
+                    auto archiveProgress = [this, &group](const AppInstallProgress& progress) {
+                        if (progress.backupIndex < 0 || progress.backupIndex >= (int)group.second.size()) return true;
+                        UiMessage message;
+                        message.hasBackupProgress = true;
+                        message.backupProgressActive = true;
+                        message.backupProgressIsRestore = true;
+                        message.backupProgressPackage = progress.packageName;
+                        message.backupProgressStageLabel = progress.stageLabel;
+                        message.backupProgressAppIndex = group.second[progress.backupIndex].originalIndex;
+                        message.backupProgressAppFraction = progress.appProgress;
+                        message.backupProgressCurrent = progress.completedApps;
+                        postUiMessage(std::move(message));
+                        return !m_backupCancelRequested.load();
+                    };
+                    restoreWorkClient.restoreStagedBackupArchive(remoteArchive, selections, options,
+                        restoredApps, restoreOutput, archiveProgress);
+                    for (bool restored : restoredApps) {
+                        if (restored) restoredFromArchives++;
+                        else failedFromArchives++;
+                    }
+                    if (!restoreOutput.empty()) details += restoreOutput;
+                    if (removeUploadArchive) std::filesystem::remove(uploadArchive, sizeError);
+                }
+
+                ok = restoredFromArchives;
+                if (directoryBackups.empty()) {
+                    bool cancelled = m_backupCancelRequested.load();
+                    LOG_INFO("BackupManager", "Archive restore finished. ok=" + std::to_string(ok) +
+                        " total=" + std::to_string(requestedRestoreCount));
+                    UiMessage message;
+                    message.refreshAppList = true;
+                    message.hasStatus = true;
+                    message.status = cancelled ? "Restore cancelled" : "Restored " + std::to_string(ok) + " backup(s)";
+                    message.hasBackupProgress = true;
+                    message.backupProgressActive = false;
+                    message.backupProgressIsRestore = true;
+                    message.backupProgressCurrent = ok;
+                    message.backupProgressTotal = requestedRestoreCount;
+                    message.backupProgressStageLabel = cancelled ? "Restore cancelled" : "Restore finished";
+                    message.hasNotification = true;
+                    if (cancelled) {
+                        message.notificationTitle = "Restore Cancelled";
+                        message.notificationMessage = "Restored " + std::to_string(ok) + " of " +
+                            std::to_string(requestedRestoreCount) + " selected app(s) before stopping.";
+                        message.notificationIsError = false;
+                    } else if (ok == requestedRestoreCount) {
+                        message.notificationTitle = "Restore Complete";
+                        message.notificationMessage = "All selected apps were restored from the device-local archive.";
+                        message.notificationIsError = false;
+                    } else {
+                        if (details.size() > 3000) details = details.substr(0, 3000) + "\nMore errors were omitted.";
+                        message.notificationTitle = "Restore Finished With Errors";
+                        const int failed = requestedRestoreCount - ok;
+                        message.notificationMessage = "Restored " + std::to_string(ok) + " of " +
+                            std::to_string(requestedRestoreCount) + " apps. " + std::to_string(failed) +
+                            (failed == 1 ? " app failed." : " apps failed.");
+                        if (!details.empty()) message.notificationMessage += "\n\n" + details;
+                        message.notificationIsError = true;
+                    }
+                    postUiMessage(std::move(message));
+                    return;
+                }
+                backups = std::move(directoryBackups);
+            }
+
             AppBackupOptions restoreOptions = options;
             std::vector<bool> apkInstalled(backups.size(), true);
             bool usedBatchInstall = options.includeApk && restoreWorkClient.isServerRunning() && restoreWorkClient.useRoot();
@@ -6404,93 +7352,130 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                 }
                 restoreOptions.includeApk = false;
             }
-            for (int backupIndex = 0; backupIndex < (int)backups.size(); backupIndex++) {
-                {
-                    std::unique_lock<std::mutex> lock(m_backupControlMutex);
-                    m_backupControlCV.wait(lock, [this]() {
-                        return !m_backupPauseRequested.load() || m_backupCancelRequested.load();
-                    });
+            std::vector<std::unique_ptr<DeviceClient>> restoreParallelClients;
+            std::vector<DeviceClient*> restoreWorkers;
+            if (restoreWorkClient.isServerRunning() && restoreWorkClient.useRoot()) {
+                std::vector<DeviceClient*> channelSources{ &restoreWorkClient };
+                if (slot == 0 && m_dualChannelAvailable && m_secondaryChannel.isServerRunning()) {
+                    channelSources.push_back(&m_secondaryChannel);
                 }
-                if (m_backupCancelRequested.load()) break;
-                const auto& backup = backups[backupIndex];
-                std::string out;
-                std::string packageName;
-                {
-                    std::ifstream mf(toFsPath(backup) / "backup.json", std::ios::binary);
-                    nlohmann::json meta = nlohmann::json::parse(mf, nullptr, false);
-                    if (!meta.is_discarded()) packageName = meta.value("packageName", "");
+                if (slot == 0) {
+                    for (auto& extra : m_extraChannels) {
+                        if (extra.dev && extra.dev->isServerRunning()) channelSources.push_back(extra.dev.get());
+                    }
                 }
-                UiMessage progressMessage;
-                progressMessage.hasBackupProgress = true;
-                progressMessage.backupProgressActive = true;
-                progressMessage.backupProgressIsRestore = true;
-                progressMessage.backupProgressCurrent = backupIndex;
-                progressMessage.backupProgressTotal = (int)backups.size();
-                progressMessage.backupProgressStage = 0;
-                progressMessage.backupProgressStageTotal = 1;
-                progressMessage.backupProgressPackage = packageName.empty() ? backup : packageName;
-                progressMessage.backupProgressStageLabel = "Restoring app";
-                postUiMessage(std::move(progressMessage));
-                LOG_INFO("BackupManager", "Starting restore: " + backup);
-                auto progressCb = [this, backupIndex, usedBatchInstall, totalBackups = (int)backups.size()](const AppBackupProgress& progress) {
+                int workerCount = std::min((int)channelSources.size(), (int)backups.size());
+                for (int i = 0; i < workerCount; ++i) {
+                    auto client = std::make_unique<DeviceClient>();
+                    if (!client->connectParallelFrom(*channelSources[i])) continue;
+                    restoreWorkers.push_back(client.get());
+                    restoreParallelClients.push_back(std::move(client));
+                }
+            }
+            if (restoreWorkers.empty()) restoreWorkers.push_back(&restoreWorkClient);
+            LOG_INFO("BackupManager", "Using " + std::to_string(restoreWorkers.size()) +
+                " active transport channel(s) for restore");
+
+            std::atomic<int> nextBackup{0};
+            std::atomic<int> restoredCount{0};
+            std::mutex restoreResultMutex;
+            auto restoreWorker = [&](DeviceClient* client) {
+                while (true) {
                     {
                         std::unique_lock<std::mutex> lock(m_backupControlMutex);
                         m_backupControlCV.wait(lock, [this]() {
                             return !m_backupPauseRequested.load() || m_backupCancelRequested.load();
                         });
                     }
-                    if (m_backupCancelRequested.load()) return false;
-                    float byteFraction = progress.bytesTotal > 0
-                        ? std::clamp((float)progress.bytesTransferred / (float)progress.bytesTotal, 0.0f, 1.0f)
-                        : 0.0f;
-                    float stageFraction = ((float)progress.stageIndex + byteFraction) /
-                        (float)std::max(1, progress.stageCount);
-                    float appFraction = usedBatchInstall
-                        ? 0.45f + std::clamp(stageFraction, 0.0f, 1.0f) * 0.55f
-                        : std::clamp(stageFraction, 0.0f, 1.0f);
-                    UiMessage message;
-                    message.hasBackupProgress = true;
-                    message.backupProgressActive = true;
-                    message.backupProgressIsRestore = true;
-                    message.backupProgressCurrent = backupIndex;
-                    message.backupProgressTotal = totalBackups;
-                    message.backupProgressStage = progress.stageIndex;
-                    message.backupProgressStageTotal = progress.stageCount;
-                    message.backupProgressBytes = progress.bytesTransferred;
-                    message.backupProgressTotalBytes = progress.bytesTotal;
-                    message.backupProgressPackage = progress.packageName;
-                    message.backupProgressStageLabel = progress.stageLabel;
-                    message.backupProgressAppIndex = backupIndex;
-                    message.backupProgressAppFraction = appFraction;
-                    postUiMessage(std::move(message));
-                    return true;
-                };
-                if (!apkInstalled[backupIndex]) {
-                    LOG_ERROR("BackupManager", "Skipping data restore because APK install failed: " + backup);
-                    continue;
+                    if (m_backupCancelRequested.load()) return;
+                    int backupIndex = nextBackup.fetch_add(1);
+                    if (backupIndex >= (int)backups.size()) return;
+                    const auto& backup = backups[backupIndex];
+                    if (!apkInstalled[backupIndex]) {
+                        LOG_ERROR("BackupManager", "Skipping data restore because APK install failed: " + backup);
+                        continue;
+                    }
+
+                    std::string out;
+                    std::string packageName;
+                    {
+                        std::ifstream mf(toFsPath(backup) / "backup.json", std::ios::binary);
+                        nlohmann::json meta = nlohmann::json::parse(mf, nullptr, false);
+                        if (!meta.is_discarded()) packageName = meta.value("packageName", "");
+                    }
+                    UiMessage progressMessage;
+                    progressMessage.hasBackupProgress = true;
+                    progressMessage.backupProgressActive = true;
+                    progressMessage.backupProgressIsRestore = true;
+                    progressMessage.backupProgressCurrent = restoredCount.load();
+                    progressMessage.backupProgressTotal = (int)backups.size();
+                    progressMessage.backupProgressStage = 0;
+                    progressMessage.backupProgressStageTotal = 1;
+                    progressMessage.backupProgressPackage = packageName.empty() ? backup : packageName;
+                    progressMessage.backupProgressStageLabel = "Restoring app";
+                    postUiMessage(std::move(progressMessage));
+                    LOG_INFO("BackupManager", "Starting restore: " + backup);
+                    auto progressCb = [this, backupIndex, usedBatchInstall, totalBackups = (int)backups.size()](const AppBackupProgress& progress) {
+                        {
+                            std::unique_lock<std::mutex> lock(m_backupControlMutex);
+                            m_backupControlCV.wait(lock, [this]() {
+                                return !m_backupPauseRequested.load() || m_backupCancelRequested.load();
+                            });
+                        }
+                        if (m_backupCancelRequested.load()) return false;
+                        float byteFraction = progress.bytesTotal > 0
+                            ? std::clamp((float)progress.bytesTransferred / (float)progress.bytesTotal, 0.0f, 1.0f)
+                            : 0.0f;
+                        float stageFraction = ((float)progress.stageIndex + byteFraction) /
+                            (float)std::max(1, progress.stageCount);
+                        float appFraction = usedBatchInstall
+                            ? 0.45f + std::clamp(stageFraction, 0.0f, 1.0f) * 0.55f
+                            : std::clamp(stageFraction, 0.0f, 1.0f);
+                        UiMessage message;
+                        message.hasBackupProgress = true;
+                        message.backupProgressActive = true;
+                        message.backupProgressIsRestore = true;
+                        message.backupProgressCurrent = backupIndex;
+                        message.backupProgressTotal = totalBackups;
+                        message.backupProgressStage = progress.stageIndex;
+                        message.backupProgressStageTotal = progress.stageCount;
+                        message.backupProgressBytes = progress.bytesTransferred;
+                        message.backupProgressTotalBytes = progress.bytesTotal;
+                        message.backupProgressPackage = progress.packageName;
+                        message.backupProgressStageLabel = progress.stageLabel;
+                        message.backupProgressAppIndex = backupIndex;
+                        message.backupProgressAppFraction = appFraction;
+                        postUiMessage(std::move(message));
+                        return true;
+                    };
+                    if (client->restoreAppBackup(serial, backup, restoreOptions, out, progressCb)) {
+                        int completed = restoredCount.fetch_add(1) + 1;
+                        UiMessage completeMessage;
+                        completeMessage.hasBackupProgress = true;
+                        completeMessage.backupProgressActive = true;
+                        completeMessage.backupProgressIsRestore = true;
+                        completeMessage.backupProgressCurrent = completed;
+                        completeMessage.backupProgressTotal = (int)backups.size();
+                        completeMessage.backupProgressPackage = packageName;
+                        completeMessage.backupProgressStageLabel = "App restored";
+                        completeMessage.backupProgressAppIndex = backupIndex;
+                        completeMessage.backupProgressAppFraction = 1.0f;
+                        postUiMessage(std::move(completeMessage));
+                        LOG_INFO("BackupManager", "Restore complete: " + backup);
+                    } else {
+                        std::lock_guard<std::mutex> lock(restoreResultMutex);
+                        details += backup + ":\n" + out + "\n";
+                        LOG_ERROR("BackupManager", "Restore failed: " + backup + ": " + out);
+                    }
                 }
-                if (restoreWorkClient.restoreAppBackup(serial, backup, restoreOptions, out, progressCb)) {
-                    ok++;
-                    UiMessage completeMessage;
-                    completeMessage.hasBackupProgress = true;
-                    completeMessage.backupProgressActive = true;
-                    completeMessage.backupProgressIsRestore = true;
-                    completeMessage.backupProgressCurrent = ok;
-                    completeMessage.backupProgressTotal = (int)backups.size();
-                    completeMessage.backupProgressPackage = packageName;
-                    completeMessage.backupProgressStageLabel = "App restored";
-                    completeMessage.backupProgressAppIndex = backupIndex;
-                    completeMessage.backupProgressAppFraction = 1.0f;
-                    postUiMessage(std::move(completeMessage));
-                    LOG_INFO("BackupManager", "Restore complete: " + backup);
-                } else {
-                    details += backup + ":\n" + out + "\n";
-                    LOG_ERROR("BackupManager", "Restore failed: " + backup + ": " + out);
-                }
-            }
+            };
+            std::vector<std::thread> restoreThreads;
+            for (DeviceClient* worker : restoreWorkers) restoreThreads.emplace_back(restoreWorker, worker);
+            for (auto& thread : restoreThreads) thread.join();
+            ok += restoredCount.load();
             bool cancelled = m_backupCancelRequested.load();
             LOG_INFO("BackupManager", std::string(cancelled ? "Restore cancelled. ok=" : "Restore finished. ok=") +
-                std::to_string(ok) + " total=" + std::to_string(backups.size()));
+                std::to_string(ok) + " total=" + std::to_string(requestedRestoreCount));
             UiMessage message;
             message.refreshAppList = true;
             message.hasStatus = true;
@@ -6499,11 +7484,11 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
             message.backupProgressActive = false;
             message.backupProgressIsRestore = true;
             message.backupProgressCurrent = ok;
-            message.backupProgressTotal = (int)backups.size();
+            message.backupProgressTotal = requestedRestoreCount;
             message.backupProgressStageLabel = "Restore finished";
             message.hasNotification = true;
             std::string restoreSummary = "Restored apps: " + std::to_string(ok) + " of " +
-                std::to_string(backups.size()) + "\n\nRequested content\n";
+                std::to_string(requestedRestoreCount) + "\n\nRequested content\n";
             if (options.includeApk) restoreSummary += "APK installation\n";
             if (options.includeData) restoreSummary += "App data\n";
             if (options.includeDeviceProtectedData) restoreSummary += "Device protected data\n";
@@ -6513,9 +7498,9 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
             if (cancelled) {
                 message.notificationTitle = "Restore Cancelled";
                 message.notificationMessage = "Restored " + std::to_string(ok) + " of " +
-                    std::to_string(backups.size()) + " selected app(s) before stopping.";
+                    std::to_string(requestedRestoreCount) + " selected app(s) before stopping.";
                 message.notificationIsError = false;
-            } else if (ok == (int)backups.size()) {
+            } else if (ok == requestedRestoreCount) {
                 message.notificationTitle = "Restore Complete";
                 message.notificationMessage = restoreSummary + "\nAll selected apps were restored successfully.";
                 message.notificationIsError = false;
@@ -7185,6 +8170,28 @@ void App::renderBackupManagerWindow() {
         "%s", statusText.c_str());
 
     if (showBackupProgress && !m_backupAppProgress.empty()) {
+        if (m_backupProgressTotalBytes > 0) {
+            const float uploadFraction = std::clamp(
+                (float)m_backupProgressBytes / (float)m_backupProgressTotalBytes, 0.0f, 1.0f);
+            ImGui::SetCursorPosX(8.0f);
+            ImGui::TextDisabled("Restore archive upload");
+            ImGui::SetCursorPosX(8.0f);
+            char uploadText[64];
+            snprintf(uploadText, sizeof(uploadText), "%.0f%%", uploadFraction * 100.0f);
+            ImGui::ProgressBar(uploadFraction, ImVec2(-8.0f, 22.0f), uploadText);
+
+            ImGui::SetCursorPosX(8.0f);
+            std::string uploadLine = m_backupProgressStageLabel;
+            if (!uploadLine.empty()) uploadLine += "  ";
+            uploadLine += formatSize(m_backupProgressBytes) + " / " +
+                formatSize(m_backupProgressTotalBytes);
+            if (m_backupProgressBytesPerSecond > 0.0) {
+                uploadLine += "  " + formatSpeed(m_backupProgressBytesPerSecond);
+                if (m_backupProgressEtaSeconds > 0.5)
+                    uploadLine += "  ETA " + formatETA(m_backupProgressEtaSeconds);
+            }
+            ImGui::TextDisabled("%s", uploadLine.c_str());
+        } else {
         float smoothing = std::clamp(ImGui::GetIO().DeltaTime * 7.0f, 0.0f, 1.0f);
         if (m_backupDisplayedAppProgress.size() != m_backupAppProgress.size())
             m_backupDisplayedAppProgress.assign(m_backupAppProgress.size(), 0.0f);
@@ -7230,6 +8237,7 @@ void App::renderBackupManagerWindow() {
         }
         ImGui::SetCursorPosX(8.0f);
         if (!m_backupProgressStageLabel.empty()) ImGui::TextDisabled("%s", m_backupProgressStageLabel.c_str());
+        }
     } else if (showBackupProgress) {
         int totalApps = std::max(1, m_backupProgressTotal);
         int stageTotal = std::max(1, m_backupProgressStageTotal);
@@ -7259,6 +8267,11 @@ void App::renderBackupManagerWindow() {
             if (!stageLine.empty()) stageLine += "  ";
             stageLine += formatSize(m_backupProgressBytes);
             if (m_backupProgressTotalBytes > 0) stageLine += " / " + formatSize(m_backupProgressTotalBytes);
+            if (m_backupProgressBytesPerSecond > 0.0) {
+                stageLine += "  " + formatSpeed(m_backupProgressBytesPerSecond);
+                if (m_backupProgressEtaSeconds > 0.5)
+                    stageLine += "  ETA " + formatETA(m_backupProgressEtaSeconds);
+            }
         }
         if (!stageLine.empty()) ImGui::TextDisabled("%s", stageLine.c_str());
     }

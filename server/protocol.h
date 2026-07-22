@@ -35,6 +35,8 @@ enum {
     CMD_ARCHIVE_PATH = 21, // payload: [4B exclude_cache][path string] - streams tar archive of directory
     CMD_EXTRACT_ARCHIVE = 22, // payload: [4B target_len][4B archive_len][target][archive_path]
     CMD_INSTALL_BATCH = 23, // payload: JSON manifest of staged APK groups
+    CMD_RESTORE_BACKUP_ARCHIVE = 24, // payload: JSON restore manifest for a staged ZIP64 store archive
+    CMD_CREATE_BACKUP_ARCHIVE = 25, // payload: JSON app selection, returns a device-local ZIP64 store archive
 };
 
 // Responses (server -> client)

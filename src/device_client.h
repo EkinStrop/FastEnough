@@ -55,6 +55,16 @@ struct AppInstallProgress {
     float appProgress = 0.0f;
 };
 
+struct ArchiveRestoreSelection {
+    std::string prefix;
+    std::string metadataJson;
+};
+
+struct ArchiveBackupApp {
+    std::string packageName;
+    std::string label;
+};
+
 struct DeviceFileEntry {
     std::string name;
     uint8_t type = 0;    // 0=file, 1=dir, 2=symlink
@@ -128,6 +138,21 @@ public:
                    BackupProgressCallback progress = nullptr);
     bool restoreAppBackup(const std::string& serial, const std::string& backupPath, const AppBackupOptions& options,
                           std::string& output, BackupProgressCallback progress = nullptr);
+    bool restoreStagedBackupArchive(const std::string& remoteArchive,
+                                    const std::vector<ArchiveRestoreSelection>& selections,
+                                    const AppBackupOptions& options,
+                                    std::vector<bool>& restored,
+                                    std::string& output,
+                                    InstallProgressCallback progress = nullptr);
+    bool createDeviceBackupArchive(const std::string& serial,
+                                   const std::string& created,
+                                   const std::vector<ArchiveBackupApp>& apps,
+                                   const AppBackupOptions& options,
+                                   std::string& remoteArchive,
+                                   uint64_t& archiveSize,
+                                   std::vector<bool>& backedUp,
+                                   std::string& output,
+                                   InstallProgressCallback progress = nullptr);
     bool archiveRemoteDirectory(const std::string& remotePath, const std::string& localTarPath, bool excludeCache,
                                 uint64_t& outFileSize, ProgressCallback progress = nullptr);
     bool extractRemoteArchive(const std::string& localTarPath, const std::string& remoteTarget,
