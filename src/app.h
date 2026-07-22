@@ -746,6 +746,7 @@ private:
     uint64_t m_backupProgressTotalBytes = 0;
     double m_backupProgressBytesPerSecond = 0.0;
     double m_backupProgressEtaSeconds = -1.0;
+    std::chrono::steady_clock::time_point m_backupProgressLastTransferUpdate{};
     std::string m_backupProgressPackage;
     std::string m_backupProgressStageLabel;
     std::vector<std::string> m_backupProgressPackages;

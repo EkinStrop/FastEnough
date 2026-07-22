@@ -63,6 +63,56 @@ static std::filesystem::path toFsPath(const std::string& utf8) {
 
 static constexpr const char* kBackupArchiveReferenceSeparator = "|fezip|";
 
+struct TransferRateSample {
+    double bytesPerSecond = 0.0;
+    double etaSeconds = -1.0;
+};
+
+class TransferRateEstimator {
+public:
+    TransferRateSample update(uint64_t transferred, uint64_t total) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        const double interval = std::chrono::duration<double>(now - m_lastSampleTime).count();
+        const double elapsed = std::chrono::duration<double>(now - m_started).count();
+        if (interval > 2.0) {
+            m_lastSampleTime = now;
+            m_lastBytes = transferred;
+            m_smoothedBytesPerSecond = 0.0;
+            m_stableSamples = 0;
+            return {};
+        }
+        if (interval >= 0.35 && transferred >= m_lastBytes) {
+            const double instantaneous = (double)(transferred - m_lastBytes) / interval;
+            if (m_smoothedBytesPerSecond <= 0.0) {
+                m_smoothedBytesPerSecond = instantaneous;
+                m_stableSamples = 0;
+            } else {
+                const double difference = std::abs(instantaneous - m_smoothedBytesPerSecond) /
+                    std::max(1.0, m_smoothedBytesPerSecond);
+                m_stableSamples = difference <= 0.25 ? m_stableSamples + 1 : 0;
+                m_smoothedBytesPerSecond = m_smoothedBytesPerSecond * 0.70 + instantaneous * 0.30;
+            }
+            m_lastSampleTime = now;
+            m_lastBytes = transferred;
+        }
+
+        TransferRateSample sample;
+        sample.bytesPerSecond = m_smoothedBytesPerSecond;
+        if (elapsed >= 2.0 && m_stableSamples >= 3 && m_smoothedBytesPerSecond > 0.0 && transferred < total)
+            sample.etaSeconds = (double)(total - transferred) / m_smoothedBytesPerSecond;
+        return sample;
+    }
+
+private:
+    std::mutex m_mutex;
+    std::chrono::steady_clock::time_point m_started = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point m_lastSampleTime = m_started;
+    uint64_t m_lastBytes = 0;
+    double m_smoothedBytesPerSecond = 0.0;
+    int m_stableSamples = 0;
+};
+
 static std::string makeBackupArchiveReference(const std::string& archivePath, const std::string& prefix) {
     return archivePath + kBackupArchiveReferenceSeparator + prefix;
 }
@@ -1442,6 +1492,8 @@ void App::drainUiMessages() {
             m_backupProgressTotalBytes = message.backupProgressTotalBytes;
             m_backupProgressBytesPerSecond = message.backupProgressBytesPerSecond;
             m_backupProgressEtaSeconds = message.backupProgressEtaSeconds;
+            if (message.backupProgressBytesPerSecond > 0.0)
+                m_backupProgressLastTransferUpdate = std::chrono::steady_clock::now();
             m_backupProgressPackage = std::move(message.backupProgressPackage);
             m_backupProgressStageLabel = std::move(message.backupProgressStageLabel);
             if (message.backupProgressAppIndex >= 0 &&
@@ -6326,6 +6378,7 @@ void App::startBackupManagerBackup() {
     m_backupProgressTotalBytes = 0;
     m_backupProgressBytesPerSecond = 0.0;
     m_backupProgressEtaSeconds = -1.0;
+    m_backupProgressLastTransferUpdate = {};
     m_backupProgressPackage.clear();
     m_backupProgressStageLabel = "Starting backup";
     m_backupPauseRequested = false;
@@ -6503,6 +6556,7 @@ void App::startBackupManagerBackup() {
             std::vector<uint64_t> channelBytes(downloadWorkers.size(), 0);
             std::vector<double> channelSeconds(downloadWorkers.size(), 0.0);
             const auto archiveTransferStart = std::chrono::steady_clock::now();
+            TransferRateEstimator transferRate;
             auto downloadWorker = [&](DeviceClient* client, size_t channelIndex) {
                 const auto channelStart = std::chrono::steady_clock::now();
                 HANDLE output = CreateFileW(temporaryArchivePath.c_str(), GENERIC_WRITE,
@@ -6535,13 +6589,17 @@ void App::startBackupManagerBackup() {
                             }
                             channelBytes[channelIndex] += byteCount;
                             uint64_t total = downloadedBytes.fetch_add(byteCount) + byteCount;
+                            const TransferRateSample rate = transferRate.update(total, remoteArchiveSize);
                             UiMessage message;
                             message.hasBackupProgress = true;
                             message.backupProgressActive = true;
+                            message.backupProgressIsRestore = false;
                             message.backupProgressCurrent = (int)std::count(backedUp.begin(), backedUp.end(), true);
                             message.backupProgressTotal = (int)packages.size();
                             message.backupProgressBytes = total;
                             message.backupProgressTotalBytes = remoteArchiveSize;
+                            message.backupProgressBytesPerSecond = rate.bytesPerSecond;
+                            message.backupProgressEtaSeconds = rate.etaSeconds;
                             message.backupProgressStageLabel = "Downloading over " + activePipeSummary;
                             postUiMessage(std::move(message));
                             return true;
@@ -6938,6 +6996,7 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
     m_backupProgressTotalBytes = 0;
     m_backupProgressBytesPerSecond = 0.0;
     m_backupProgressEtaSeconds = -1.0;
+    m_backupProgressLastTransferUpdate = {};
     m_backupProgressPackage.clear();
     m_backupProgressStageLabel = "Starting restore";
     m_backupPauseRequested = false;
@@ -7159,6 +7218,7 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                     std::vector<uint64_t> channelBytes(uploadWorkers.size(), 0);
                     std::vector<double> channelSeconds(uploadWorkers.size(), 0.0);
                     const auto archiveTransferStart = std::chrono::steady_clock::now();
+                    TransferRateEstimator transferRate;
                     auto uploadWorker = [&](DeviceClient* client, size_t channelIndex) {
                         const auto channelStart = std::chrono::steady_clock::now();
                         while (!uploadFailed.load()) {
@@ -7184,19 +7244,15 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                             }
                             channelBytes[channelIndex] += length;
                             uint64_t totalUploaded = uploadedBytes.fetch_add(length) + length;
-                            const double elapsedSeconds = std::max(0.001, std::chrono::duration<double>(
-                                std::chrono::steady_clock::now() - archiveTransferStart).count());
-                            const double bytesPerSecond = (double)totalUploaded / elapsedSeconds;
+                            const TransferRateSample rate = transferRate.update(totalUploaded, archiveSize);
                             UiMessage uploadMessage;
                             uploadMessage.hasBackupProgress = true;
                             uploadMessage.backupProgressActive = true;
                             uploadMessage.backupProgressIsRestore = true;
                             uploadMessage.backupProgressBytes = totalUploaded;
                             uploadMessage.backupProgressTotalBytes = archiveSize;
-                            uploadMessage.backupProgressBytesPerSecond = bytesPerSecond;
-                            uploadMessage.backupProgressEtaSeconds = bytesPerSecond > 0.0
-                                ? (double)(archiveSize - totalUploaded) / bytesPerSecond
-                                : -1.0;
+                            uploadMessage.backupProgressBytesPerSecond = rate.bytesPerSecond;
+                            uploadMessage.backupProgressEtaSeconds = rate.etaSeconds;
                             uploadMessage.backupProgressStageLabel = "Uploading over " + activePipeSummary;
                             postUiMessage(std::move(uploadMessage));
                         }
@@ -8173,24 +8229,77 @@ void App::renderBackupManagerWindow() {
         if (m_backupProgressTotalBytes > 0) {
             const float uploadFraction = std::clamp(
                 (float)m_backupProgressBytes / (float)m_backupProgressTotalBytes, 0.0f, 1.0f);
-            ImGui::SetCursorPosX(8.0f);
-            ImGui::TextDisabled("Restore archive upload");
+            const char* transferHeading = m_backupProgressIsRestore
+                ? "Restore archive upload"
+                : "Backup archive download";
+            const float headingWidth = ImGui::CalcTextSize(transferHeading).x;
+            ImGui::SetCursorPosX(std::max(8.0f, (ImGui::GetWindowWidth() - headingWidth) * 0.5f));
+            ImGui::TextColored(ImVec4(0.38f, 0.74f, 1.0f, 1.0f), "%s", transferHeading);
             ImGui::SetCursorPosX(8.0f);
             char uploadText[64];
             snprintf(uploadText, sizeof(uploadText), "%.0f%%", uploadFraction * 100.0f);
             ImGui::ProgressBar(uploadFraction, ImVec2(-8.0f, 22.0f), uploadText);
 
-            ImGui::SetCursorPosX(8.0f);
-            std::string uploadLine = m_backupProgressStageLabel;
-            if (!uploadLine.empty()) uploadLine += "  ";
-            uploadLine += formatSize(m_backupProgressBytes) + " / " +
-                formatSize(m_backupProgressTotalBytes);
-            if (m_backupProgressBytesPerSecond > 0.0) {
-                uploadLine += "  " + formatSpeed(m_backupProgressBytesPerSecond);
-                if (m_backupProgressEtaSeconds > 0.5)
-                    uploadLine += "  ETA " + formatETA(m_backupProgressEtaSeconds);
+            struct UploadChip {
+                std::string text;
+                ImU32 background;
+                ImU32 border;
+                ImU32 foreground;
+            };
+            std::vector<UploadChip> chips;
+            chips.push_back({m_backupProgressStageLabel,
+                IM_COL32(20, 55, 88, 235), IM_COL32(55, 135, 205, 230), IM_COL32(130, 204, 255, 255)});
+            chips.push_back({formatSize(m_backupProgressBytes) + " / " + formatSize(m_backupProgressTotalBytes),
+                IM_COL32(42, 45, 67, 235), IM_COL32(91, 101, 151, 220), IM_COL32(207, 215, 244, 255)});
+            const bool rateFresh = m_backupProgressLastTransferUpdate.time_since_epoch().count() != 0 &&
+                std::chrono::steady_clock::now() - m_backupProgressLastTransferUpdate < std::chrono::seconds(2) &&
+                !m_backupPauseRequested.load();
+            if (rateFresh && m_backupProgressBytesPerSecond > 0.0) {
+                chips.push_back({formatSpeed(m_backupProgressBytesPerSecond),
+                    IM_COL32(18, 67, 49, 240), IM_COL32(46, 163, 111, 230), IM_COL32(112, 238, 171, 255)});
+                if (m_backupProgressEtaSeconds > 0.5) {
+                    chips.push_back({"ETA " + formatETA(m_backupProgressEtaSeconds),
+                        IM_COL32(73, 57, 16, 240), IM_COL32(190, 143, 33, 230), IM_COL32(255, 207, 92, 255)});
+                }
             }
-            ImGui::TextDisabled("%s", uploadLine.c_str());
+
+            const float chipPaddingX = 11.0f;
+            const float chipHeight = 25.0f;
+            const float chipSpacing = 7.0f;
+            const float availableWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x - 16.0f);
+            ImVec2 rowOrigin = ImGui::GetCursorScreenPos();
+            rowOrigin.x += 8.0f;
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            std::vector<std::vector<size_t>> rows(1);
+            std::vector<float> rowWidths(1, 0.0f);
+            for (size_t index = 0; index < chips.size(); ++index) {
+                float width = ImGui::CalcTextSize(chips[index].text.c_str()).x + chipPaddingX * 2.0f;
+                float proposed = rowWidths.back() + (rows.back().empty() ? 0.0f : chipSpacing) + width;
+                if (!rows.back().empty() && proposed > availableWidth) {
+                    rows.emplace_back();
+                    rowWidths.push_back(0.0f);
+                }
+                if (!rows.back().empty()) rowWidths.back() += chipSpacing;
+                rows.back().push_back(index);
+                rowWidths.back() += width;
+            }
+            for (size_t row = 0; row < rows.size(); ++row) {
+                float x = rowOrigin.x + std::max(0.0f, (availableWidth - rowWidths[row]) * 0.5f);
+                float y = rowOrigin.y + (float)row * (chipHeight + 5.0f);
+                for (size_t index : rows[row]) {
+                    const UploadChip& chip = chips[index];
+                    ImVec2 textSize = ImGui::CalcTextSize(chip.text.c_str());
+                    float width = textSize.x + chipPaddingX * 2.0f;
+                    ImVec2 minimum(x, y);
+                    ImVec2 maximum(x + width, y + chipHeight);
+                    drawList->AddRectFilled(minimum, maximum, chip.background, 7.0f);
+                    drawList->AddRect(minimum, maximum, chip.border, 7.0f, 0, 1.0f);
+                    drawList->AddText(ImVec2(x + chipPaddingX, y + (chipHeight - textSize.y) * 0.5f),
+                                      chip.foreground, chip.text.c_str());
+                    x += width + chipSpacing;
+                }
+            }
+            ImGui::Dummy(ImVec2(0.0f, (float)rows.size() * (chipHeight + 5.0f)));
         } else {
         float smoothing = std::clamp(ImGui::GetIO().DeltaTime * 7.0f, 0.0f, 1.0f);
         if (m_backupDisplayedAppProgress.size() != m_backupAppProgress.size())
@@ -8267,7 +8376,10 @@ void App::renderBackupManagerWindow() {
             if (!stageLine.empty()) stageLine += "  ";
             stageLine += formatSize(m_backupProgressBytes);
             if (m_backupProgressTotalBytes > 0) stageLine += " / " + formatSize(m_backupProgressTotalBytes);
-            if (m_backupProgressBytesPerSecond > 0.0) {
+            const bool rateFresh = m_backupProgressLastTransferUpdate.time_since_epoch().count() != 0 &&
+                std::chrono::steady_clock::now() - m_backupProgressLastTransferUpdate < std::chrono::seconds(2) &&
+                !m_backupPauseRequested.load();
+            if (rateFresh && m_backupProgressBytesPerSecond > 0.0) {
                 stageLine += "  " + formatSpeed(m_backupProgressBytesPerSecond);
                 if (m_backupProgressEtaSeconds > 0.5)
                     stageLine += "  ETA " + formatETA(m_backupProgressEtaSeconds);
