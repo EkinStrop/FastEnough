@@ -1326,6 +1326,8 @@ App::App() {
 
     // Second device uses a different local port for ADB forward
     m_deviceSlots[1].setLocalPort(AFM_PORT + 1);
+    m_slot1WifiChannel.setLocalPort(AFM_PORT + 1);
+    m_slot1WifiChannel.setOwnsServer(false);
     // Secondary channel (dual-channel WiFi) uses a different port to avoid ADB forward collision
     m_secondaryChannel.setLocalPort(AFM_PORT + 2);
 
@@ -1959,7 +1961,8 @@ void App::render() {
                 m_compareDirty = true;
             });
         } else if (panel.isAndroid) {
-            if (m_selectedDevice < 0) return;
+            if (!m_slotConnected[panel.deviceSlot & 1] ||
+                !deviceForSlot(panel.deviceSlot).isServerRunning()) return;
             if (panel.refreshInProgress) return;
             panel.refreshInProgress = true;
             panel.needsRefresh = false;
@@ -2469,6 +2472,10 @@ void App::renderMenuBar() {
                     hasDevice = true;
                     curSerial = m_devices[m_selectedDevice].serial;
                 }
+            }
+            if (!hasDevice && m_slotConnected[0] && m_device.isServerRunning()) {
+                hasDevice = true;
+                curSerial = m_slotSerial[0];
             }
 
             if (m_device.isServerRunning()) {
@@ -3169,19 +3176,40 @@ void App::renderDeviceBar() {
             selSnap = m_selectedDevice;
         }
 
+        auto physicalIdentity = [&](const std::string& serial) {
+            for (const auto& saved : m_prefs.savedWifiDevices) {
+                if (saved.wifiIp.empty()) continue;
+                std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
+                if ((saved.serial == serial || wifiSerial == serial) &&
+                    !saved.serial.empty() && saved.serial != wifiSerial)
+                    return saved.serial;
+            }
+            return serial;
+        };
+        const int adbSnapshotCount = (int)devSnap.size();
+        for (int slot = 0; slot < 2; ++slot) {
+            if (!m_slotConnected[slot] || !m_deviceSlots[slot].isServerRunning()) continue;
+            std::string identity = physicalIdentity(m_slotSerial[slot]);
+            bool represented = false;
+            for (const auto& device : devSnap) {
+                if (physicalIdentity(device.serial) == identity) {
+                    represented = true;
+                    break;
+                }
+            }
+            if (represented) continue;
+            DeviceInfo connected;
+            connected.serial = m_slotSerial[slot];
+            connected.state = "device";
+            auto nameIt = m_deviceDisplayNames.find(connected.serial);
+            connected.model = nameIt != m_deviceDisplayNames.end() && !nameIt->second.empty()
+                ? nameIt->second : connected.serial;
+            devSnap.push_back(std::move(connected));
+        }
+
         if (devSnap.empty()) {
             ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "No device connected");
         } else {
-            auto physicalIdentity = [&](const std::string& serial) {
-                for (const auto& saved : m_prefs.savedWifiDevices) {
-                    if (saved.wifiIp.empty()) continue;
-                    std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
-                    if ((saved.serial == serial || wifiSerial == serial) &&
-                        !saved.serial.empty() && saved.serial != wifiSerial)
-                        return saved.serial;
-                }
-                return serial;
-            };
             std::vector<int> physicalDeviceIndices;
             std::map<std::string, int> physicalIndex;
             for (int i = 0; i < (int)devSnap.size(); ++i) {
@@ -3204,7 +3232,10 @@ void App::renderDeviceBar() {
                 return name + " (" + devSnap[idx].serial + ")";
             };
             int previewIndex = selSnap;
-            if (selSnap >= 0 && selSnap < (int)devSnap.size()) {
+            if (m_slotConnected[0] && m_device.isServerRunning()) {
+                auto current = physicalIndex.find(physicalIdentity(m_slotSerial[0]));
+                if (current != physicalIndex.end()) previewIndex = current->second;
+            } else if (selSnap >= 0 && selSnap < adbSnapshotCount) {
                 auto current = physicalIndex.find(physicalIdentity(devSnap[selSnap].serial));
                 if (current != physicalIndex.end()) previewIndex = current->second;
             }
@@ -3213,13 +3244,15 @@ void App::renderDeviceBar() {
             if (ImGui::BeginCombo("##DeviceCombo", preview.c_str())) {
                 for (int i : physicalDeviceIndices) {
                     std::string label = getDevName(i);
+                    bool itemIsPrimary = m_slotConnected[0] && m_device.isServerRunning() &&
+                        physicalIdentity(m_slotSerial[0]) == physicalIdentity(devSnap[i].serial);
                     if (devSnap[i].state != "device") {
                         label += " [" + devSnap[i].state + "]";
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,0.5f,0.5f,1));
                     }
-                    if (ImGui::Selectable(label.c_str(), i == selSnap)) {
+                    if (ImGui::Selectable(label.c_str(), itemIsPrimary)) {
                         std::string selectedSerial = devSnap[i].serial;
-                        bool alreadySelected = i == selSnap;
+                        bool alreadySelected = itemIsPrimary;
                         bool alreadyConnected = (m_slotConnected[0] &&
                             physicalIdentity(m_slotSerial[0]) == physicalIdentity(selectedSerial) &&
                             m_device.isServerRunning()) ||
@@ -3228,13 +3261,14 @@ void App::renderDeviceBar() {
                         if (alreadyConnected && !alreadySelected) {
                             m_statusMessage = "Device is already connected. Select it from an Android pane.";
                             m_statusTime = std::chrono::steady_clock::now();
-                        } else {
+                        } else if (i < adbSnapshotCount) {
                             std::lock_guard<std::mutex> lk(m_deviceMutex);
                             m_selectedDevice = i;
                             if (!alreadySelected)
                                 m_lastDeviceSerial.clear();
                         }
-                        if (devSnap[i].state == "device" && !alreadySelected && !alreadyConnected) {
+                        if (i < adbSnapshotCount && devSnap[i].state == "device" &&
+                            !alreadySelected && !alreadyConnected) {
                             postAsync("Connecting to " + selectedSerial + "...", [this, selectedSerial]() {
                                 connectDeviceBySerialNow(selectedSerial);
                             });
@@ -3250,20 +3284,18 @@ void App::renderDeviceBar() {
                 // Show connection mode - detect actual transport
                 ImGui::AlignTextToFramePadding();
                 if (m_device.isServerRunning()) {
-                    bool serialIsWifi = isWifiSerial(devSnap[selSnap].serial);
+                    bool primaryUsesWifi = m_device.isDirectConnection() || isWifiSerial(devSnap[selSnap].serial);
                     if (m_dualChannelAvailable) {
                         if (m_activeChannelCount >= 4)
                             ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "%d channels", m_activeChannelCount);
-                        else if (serialIsWifi)
-                            ImGui::TextColored(ImVec4(0.3f,0.8f,1,1), "WiFi (dual)");
+                        else if (primaryUsesWifi)
+                            ImGui::TextColored(ImVec4(0.3f,0.8f,1,1), "WiFi (%d channels)", m_activeChannelCount);
                         else if (m_secondaryChannelType == "USB")
                             ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "USB (dual)");
                         else
                             ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "USB + %s", m_secondaryChannelType.c_str());
-                    } else if (serialIsWifi) {
+                    } else if (primaryUsesWifi) {
                         ImGui::TextColored(ImVec4(0.3f,0.8f,1,1), "WiFi");
-                    } else if (m_device.isDirectConnection()) {
-                        ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "USB (Direct)");
                     } else {
                         ImGui::TextColored(ImVec4(0.7f,0.7f,0.7f,1), "USB");
                     }
@@ -3550,25 +3582,25 @@ void App::renderConnectionActivity() {
         auto nameIt = m_deviceDisplayNames.find(card.serial);
         card.name = nameIt != m_deviceDisplayNames.end() && !nameIt->second.empty()
             ? nameIt->second : card.serial;
-        bool primaryIsWifi = isWifiSerial(card.serial);
+        bool primaryIsWifi = client.isDirectConnection() || isWifiSerial(card.serial);
         bool companionTransportOnline = false;
         for (const auto& saved : m_prefs.savedWifiDevices) {
             if (saved.wifiIp.empty()) continue;
             std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
-            if (saved.serial == card.serial && onlineSerials.count(wifiSerial)) {
-                companionTransportOnline = true;
-                break;
-            }
-            if (wifiSerial == card.serial && saved.serial != wifiSerial &&
-                onlineSerials.count(saved.serial)) {
-                companionTransportOnline = true;
+            if (saved.serial == card.serial || wifiSerial == card.serial) {
+                bool usbOnline = saved.serial != wifiSerial && onlineSerials.count(saved.serial);
+                bool wifiAdbOnline = onlineSerials.count(wifiSerial);
+                companionTransportOnline = primaryIsWifi ? usbOnline : wifiAdbOnline;
                 break;
             }
         }
         bool activeTransferDual = card.slot == 0 && m_dualChannelAvailable &&
             ((primaryIsWifi && m_secondaryChannelType == "USB") ||
              (!primaryIsWifi && m_secondaryChannelType == "WiFi"));
-        card.dualTransport = card.connected && (companionTransportOnline || activeTransferDual);
+        bool slot1WifiStandby = card.slot == 1 && !primaryIsWifi &&
+            m_slot1WifiChannel.isServerRunning();
+        card.dualTransport = card.connected &&
+            (companionTransportOnline || activeTransferDual || slot1WifiStandby);
         if (card.connected) {
             card.stage = card.dualTransport ? "Connected over USB + WiFi" :
                 (primaryIsWifi ? "Connected over WiFi" : "Connected over USB");
@@ -4171,7 +4203,8 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
 
                 // Count online devices
                 int onlineCount = 0;
-                for (auto& d : m_devices) if (d.state == "device") onlineCount++;
+                for (int slot = 0; slot < 2; ++slot)
+                    if (m_slotConnected[slot] && m_deviceSlots[slot].isServerRunning()) onlineCount++;
 
                 // Helper: get friendly display name for a device slot
                 auto getSlotName = [&](int slot) -> std::string {
@@ -5568,7 +5601,8 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
     {
         std::lock_guard<std::mutex> lk(m_deviceMutex);
         int onlineCount = 0;
-        for (auto& d : m_devices) if (d.state == "device") onlineCount++;
+        for (int slot = 0; slot < 2; ++slot)
+            if (m_slotConnected[slot] && m_deviceSlots[slot].isServerRunning()) onlineCount++;
         auto getSlotName = [&](int slot) -> std::string {
             if (slot < 0 || slot >= 2 || !m_slotConnected[slot]) return "No device";
             auto it = m_deviceDisplayNames.find(m_slotSerial[slot]);
@@ -8501,6 +8535,118 @@ void App::renderCopyMoveDialog() {
     }
 }
 
+bool App::prepareSlot1WifiFallback(const std::string& serial) {
+    m_slot1WifiChannel.disconnectTcp();
+    m_slot1WifiIp.clear();
+    if (!m_prefs.wifiAutoConnect || serial.empty()) return false;
+    if (m_prefs.pipePreferencesFor(serial).wifiPipeCount < 1) return false;
+
+    std::string wlanOut = m_deviceSlots[1].runAdbCommand(
+        "-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
+    auto inetPos = wlanOut.find("inet ");
+    if (inetPos == std::string::npos) return false;
+    auto start = inetPos + 5;
+    auto slash = wlanOut.find('/', start);
+    if (slash == std::string::npos) return false;
+    std::string wifiIp = wlanOut.substr(start, slash - start);
+    int helperPort = m_deviceSlots[1].localPort();
+
+    m_slot1WifiChannel.setAdbPath(m_device.getAdbPath());
+    if (!m_slot1WifiChannel.connectTcp(wifiIp, helperPort) ||
+        !m_slot1WifiChannel.verifyConnection()) {
+        m_slot1WifiChannel.disconnectTcp();
+        LOG_WARN("Poll", "Second device WiFi standby failed at " + wifiIp + ":" +
+            std::to_string(helperPort));
+        return false;
+    }
+
+    m_slot1WifiIp = wifiIp;
+    LOG_INFO("Poll", "Second device WiFi standby ready at " + wifiIp + ":" +
+        std::to_string(helperPort));
+    return true;
+}
+
+bool App::recoverSecondarySlotConnection(const std::string& serial) {
+    if (serial.empty()) return false;
+
+    DeviceClient& slotClient = m_deviceSlots[1];
+    const int helperPort = slotClient.localPort();
+    std::string wifiIp = slotClient.deviceIp();
+    if (wifiIp.empty()) wifiIp = m_slot1WifiIp;
+
+    std::string physicalSerial = serial;
+    std::vector<std::string> adbCandidates{serial};
+    for (const auto& saved : m_prefs.savedWifiDevices) {
+        std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
+        if (saved.serial != serial && wifiSerial != serial) continue;
+        physicalSerial = saved.serial;
+        if (wifiIp.empty()) wifiIp = saved.wifiIp;
+        adbCandidates.push_back(saved.serial);
+        adbCandidates.push_back(wifiSerial);
+        break;
+    }
+
+    slotClient.disconnectTcp();
+    if (!wifiIp.empty()) {
+        LOG_INFO("Poll", "Reconnecting secondary directly over WiFi at " + wifiIp + ":" +
+            std::to_string(helperPort));
+        if (slotClient.connectDirectForSerial(physicalSerial, wifiIp, helperPort)) {
+            m_slotSerial[1] = physicalSerial;
+            m_slotConnected[1] = true;
+            m_secondaryRetrySerial.clear();
+            m_secondaryRetryAfter = {};
+            m_slot1WifiChannel.disconnectTcp();
+            forEachAndroidPanel([&](FilePanel& p) {
+                if (p.deviceSlot == 1) p.needsRefresh = true;
+            });
+            LOG_INFO("Poll", "Secondary slot recovered directly over WiFi: " + physicalSerial);
+            return true;
+        }
+    }
+
+    std::string adbSerial;
+    {
+        std::lock_guard<std::mutex> lk(m_deviceMutex);
+        for (const auto& candidate : adbCandidates) {
+            auto found = std::find_if(m_devices.begin(), m_devices.end(), [&](const DeviceInfo& device) {
+                return device.serial == candidate && device.state == "device";
+            });
+            if (found != m_devices.end()) {
+                adbSerial = candidate;
+                break;
+            }
+        }
+    }
+    if (adbSerial.empty()) {
+        LOG_WARN("Poll", "Secondary WiFi reconnect failed and no ADB transport is available: " +
+            physicalSerial);
+        return false;
+    }
+
+    bool useRoot = m_prefs.rootEnabledForSerial(physicalSerial);
+    bool started = slotClient.startServer(adbSerial, true, useRoot);
+    if (!started && useRoot) {
+        LOG_WARN("Poll", "Secondary root reconnect failed, retrying without root: " +
+            slotClient.lastError());
+        started = slotClient.startServer(adbSerial, true, false);
+    }
+    if (!started) return false;
+
+    m_slotSerial[1] = adbSerial;
+    m_slotStorageRoot[1] = slotClient.detectStoragePath();
+    m_slotVolumes[1].clear();
+    m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
+    m_slotConnected[1] = true;
+    m_secondaryRetrySerial.clear();
+    m_secondaryRetryAfter = {};
+    prepareSlot1WifiFallback(adbSerial);
+    forEachAndroidPanel([&](FilePanel& p) {
+        if (p.deviceSlot == 1) p.needsRefresh = true;
+    });
+    LOG_INFO("Poll", "Secondary slot reconnected through ADB: " + adbSerial);
+    return true;
+}
+
 void App::tryAutoWifiConnect(const std::string& serial) {
     if (m_wifiAutoSetupDone || m_dualChannelAvailable) return;
     if (!m_prefs.wifiAutoConnect) return; // user disabled WiFi auto-connect
@@ -10932,6 +11078,7 @@ void App::devicePollLoop() {
         m_pollBusy = true;
         std::string curSerial;
         bool primaryServerRunning = m_device.isServerRunning();
+        bool primaryListedOnline = false;
         {
             std::lock_guard<std::mutex> lk(m_deviceMutex);
             std::string previousSelectedSerial;
@@ -10968,30 +11115,29 @@ void App::devicePollLoop() {
             // browse slots, they must not cause slot 1 to be promoted to primary.
             int primaryIdx = -1;
             if (primaryServerRunning && m_slotConnected[0]) {
-                primaryIdx = findSerial(m_slotSerial[0]);
-                if (primaryIdx < 0) {
-                    std::string partner;
-                    if (isWifiSerial(m_slotSerial[0]) && m_slotSerial[0] == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
-                        partner = m_wifiToUsbSerial;
-                    else if (!isWifiSerial(m_slotSerial[0]) && m_slotSerial[0] == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
-                        partner = m_usbToWifiSerial;
-                    primaryIdx = findSerial(partner);
+                std::set<std::string> primaryTransports;
+                addKnownPrimarySerials(primaryTransports, m_slotSerial[0]);
+                if (!m_wifiToUsbSerial.empty() && !m_usbToWifiSerial.empty() &&
+                    (m_slotSerial[0] == m_wifiToUsbSerial || m_slotSerial[0] == m_usbToWifiSerial)) {
+                    primaryTransports.insert(m_wifiToUsbSerial);
+                    primaryTransports.insert(m_usbToWifiSerial);
+                }
+                for (const auto& transport : primaryTransports) {
+                    primaryIdx = findSerial(transport);
+                    if (primaryIdx >= 0) break;
                 }
             }
+            primaryListedOnline = primaryIdx >= 0;
 
             // During `adb tcpip`, Android briefly removes the USB serial before
             // publishing its WiFi serial. Keep the verified direct connection as
             // primary through that gap instead of promoting the other phone.
             bool retainingDirectWifiPrimary = false;
-            if (primaryIdx < 0 && primaryServerRunning && m_slotConnected[0] &&
-                m_device.isDirectConnection() && !isWifiSerial(m_slotSerial[0])) {
-                for (const auto& saved : m_prefs.savedWifiDevices) {
-                    if (saved.serial == m_slotSerial[0] && saved.wifiIp == m_device.deviceIp()) {
-                        retainingDirectWifiPrimary = true;
-                        break;
-                    }
-                }
-            }
+            if (primaryIdx < 0 && primaryServerRunning && m_slotConnected[0])
+                retainingDirectWifiPrimary = m_device.isDirectConnection() ||
+                    (m_dualChannelAvailable && m_secondaryChannelType == "WiFi" &&
+                     m_secondaryChannel.isServerRunning() &&
+                     m_secondaryChannel.connectedHost() != "127.0.0.1");
 
             if (primaryIdx >= 0) {
                 m_selectedDevice = primaryIdx;
@@ -11040,6 +11186,9 @@ void App::devicePollLoop() {
                 }
                 m_selectedDevice = (found >= 0) ? found : findOnline(true);
             }
+
+            if (retainingDirectWifiPrimary)
+                m_selectedDevice = -1;
 
             curSerial = retainingDirectWifiPrimary ? m_slotSerial[0] :
                 (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size()
@@ -11229,6 +11378,35 @@ void App::devicePollLoop() {
             }
         }
 
+        // A direct WiFi transfer channel remains independent of ADB. Promote it
+        // before treating an empty ADB device list as a full device disconnect.
+        if (!primaryListedOnline && !m_lastDeviceSerial.empty() && m_slotConnected[0] &&
+            !m_device.isDirectConnection() && !m_wifiTransitionActive &&
+            m_dualChannelAvailable && m_secondaryChannelType == "WiFi") {
+            const std::string wifiIp = m_secondaryChannel.connectedHost();
+            if (!wifiIp.empty() && wifiIp != "127.0.0.1") {
+                LOG_INFO("Poll", "USB disconnected, promoting direct WiFi channel at " + wifiIp);
+                if (m_device.connectDirectForSerial(m_lastDeviceSerial, wifiIp)) {
+                    curSerial = m_lastDeviceSerial;
+                    for (auto& channel : m_extraChannels) {
+                        if (channel.isUsb && channel.dev)
+                            channel.dev->disconnectTcp();
+                    }
+                    m_extraChannels.erase(
+                        std::remove_if(m_extraChannels.begin(), m_extraChannels.end(),
+                            [](const ExtraChannel& channel) { return channel.isUsb; }),
+                        m_extraChannels.end());
+                    m_activeChannelCount = 2 + (int)m_extraChannels.size();
+                    m_statusMessage = "USB disconnected, continuing over WiFi";
+                    m_statusTime = std::chrono::steady_clock::now();
+                    LOG_INFO("Poll", "WiFi failover complete with " +
+                        std::to_string(m_activeChannelCount) + " active channel(s)");
+                } else {
+                    LOG_WARN("Poll", "Direct WiFi promotion failed after USB disconnect");
+                }
+            }
+        }
+
         if (curSerial != m_lastDeviceSerial) {
             LOG_INFO("Poll", "Serial changed: '" + m_lastDeviceSerial + "' -> '" + curSerial + "'");
             bool handledSerialChange = false;
@@ -11236,7 +11414,9 @@ void App::devicePollLoop() {
             // A paired transport disappeared. The existing TCP client can still
             // report as running even when its ADB forward was tied to the removed
             // USB device, so reconnect it immediately through the surviving path.
-            bool knownPartnerFlip =
+            std::set<std::string> previousPrimaryTransports;
+            addKnownPrimarySerials(previousPrimaryTransports, m_lastDeviceSerial);
+            bool knownPartnerFlip = previousPrimaryTransports.count(curSerial) != 0 ||
                 (isWifiSerial(m_lastDeviceSerial) && curSerial == m_wifiToUsbSerial) ||
                 (!isWifiSerial(m_lastDeviceSerial) && curSerial == m_usbToWifiSerial);
             if (!curSerial.empty() && !m_lastDeviceSerial.empty() &&
@@ -11379,6 +11559,7 @@ void App::devicePollLoop() {
                     m_slotVolumes[1].clear();
                     m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
                     m_slotConnected[1] = true;
+                    prepareSlot1WifiFallback(serial2);
                     m_secondaryRetrySerial.clear();
                     LOG_INFO("Poll", "Secondary slot connected: " + serial2 + " storage: " + m_slotStorageRoot[1]);
                     // Navigate any slot-1 panels
@@ -11404,7 +11585,8 @@ void App::devicePollLoop() {
 
         // Disconnect secondary slot if that device went offline
         if (m_slotConnected[1]) {
-            bool slot1Online = false;
+            bool slot1Online = m_deviceSlots[1].isDirectConnection() &&
+                m_deviceSlots[1].isServerRunning();
             std::string wifiFallbackSerial;
             {
                 std::lock_guard<std::mutex> lk(m_deviceMutex);
@@ -11427,11 +11609,18 @@ void App::devicePollLoop() {
                 }
             }
             if (!slot1Online) {
-                if (!wifiFallbackSerial.empty()) {
-                    std::string wifiIp = wifiFallbackSerial.substr(0, wifiFallbackSerial.rfind(':'));
-                    LOG_INFO("Poll", "USB disconnected, failing over secondary directly to " + wifiFallbackSerial);
-                    if (m_deviceSlots[1].connectDirectForSerial(wifiFallbackSerial, wifiIp)) {
-                        m_slotSerial[1] = wifiFallbackSerial;
+                std::string wifiIp = m_slot1WifiIp;
+                if (!wifiFallbackSerial.empty())
+                    wifiIp = wifiFallbackSerial.substr(0, wifiFallbackSerial.rfind(':'));
+                if (!wifiIp.empty()) {
+                    std::string failoverSerial = wifiFallbackSerial.empty()
+                        ? m_slotSerial[1] : wifiFallbackSerial;
+                    LOG_INFO("Poll", "USB disconnected, failing over secondary directly to " +
+                        wifiIp + ":" + std::to_string(m_deviceSlots[1].localPort()));
+                    if (m_deviceSlots[1].connectDirectForSerial(
+                        failoverSerial, wifiIp, m_deviceSlots[1].localPort())) {
+                        m_slotSerial[1] = failoverSerial;
+                        m_slot1WifiChannel.disconnectTcp();
                         m_statusMessage = "USB disconnected, secondary device continuing over WiFi";
                         m_statusTime = std::chrono::steady_clock::now();
                         slot1Online = true;
@@ -11439,6 +11628,8 @@ void App::devicePollLoop() {
                 }
                 if (!slot1Online) {
                     LOG_INFO("Poll", "Secondary device disconnected: " + m_slotSerial[1]);
+                    m_slot1WifiChannel.disconnectTcp();
+                    m_slot1WifiIp.clear();
                     m_slotConnected[1] = false;
                     m_slotSerial[1].clear();
                     m_slotStorageRoot[1].clear();
@@ -11489,29 +11680,7 @@ void App::devicePollLoop() {
             if (sinceLast >= std::chrono::seconds(15) && !m_deviceSlots[1].verifyConnection()) {
                 std::string secondarySerial = m_slotSerial[1];
                 LOG_WARN("Poll", "Secondary health check failed, reconnecting: " + secondarySerial);
-                m_deviceSlots[1].disconnectTcp();
-                bool secondaryStarted = false;
-                if (!secondarySerial.empty()) {
-                    bool root = m_prefs.rootEnabledForSerial(secondarySerial);
-                    secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, root);
-                    if (!secondaryStarted && root) {
-                        LOG_WARN("Poll", "Secondary root reconnect failed, retrying without root: " + m_deviceSlots[1].lastError());
-                        m_prefs.setRootEnabledForSerial(secondarySerial, false);
-                        m_prefs.save();
-                        secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, false);
-                    }
-                }
-                if (secondaryStarted) {
-                    m_slotSerial[1] = secondarySerial;
-                    m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
-                    m_slotVolumes[1].clear();
-                    m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
-                    m_slotConnected[1] = true;
-                    forEachAndroidPanel([&](FilePanel& p) {
-                        if (p.deviceSlot == 1) p.needsRefresh = true;
-                    });
-                    LOG_INFO("Poll", "Secondary slot reconnected: " + secondarySerial);
-                } else {
+                if (!recoverSecondarySlotConnection(secondarySerial)) {
                     m_secondaryRetrySerial = secondarySerial;
                     m_secondaryRetryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(15);
                     m_slotConnected[1] = false;
@@ -11627,9 +11796,10 @@ void App::devicePollLoop() {
             setsockopt((SOCKET)trackSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&trackTimeout, sizeof(trackTimeout));
 
             while (!m_shutdownPoll) {
-                auto devices = m_device.readTrackDevicesUpdate(trackSock);
+                bool receivedUpdate = false;
+                auto devices = m_device.readTrackDevicesUpdate(trackSock, &receivedUpdate);
                 int err = WSAGetLastError();
-                if (devices.empty() && (err == WSAETIMEDOUT || err == 0)) {
+                if (devices.empty() && (receivedUpdate || err == WSAETIMEDOUT)) {
                     // Timeout or empty device list — run health checks with current state
                     std::string curSerial;
                     {
@@ -11638,8 +11808,11 @@ void App::devicePollLoop() {
                             && m_devices[m_selectedDevice].state == "device")
                             ? m_devices[m_selectedDevice].serial : "";
                     }
+                    if (curSerial.empty() && m_slotConnected[0] &&
+                        m_device.isDirectConnection() && m_device.isServerRunning())
+                        curSerial = m_slotSerial[0];
                     // If err == 0, this was a real "all devices disconnected" event
-                    if (err == 0 && !m_lastDeviceSerial.empty()) {
+                    if (receivedUpdate && !m_lastDeviceSerial.empty()) {
                         processDeviceUpdate({}); // process as empty device list
                     }
                     if (m_device.isServerRunning() && !curSerial.empty() && !m_tetheringInProgress && !m_wifiTransitionActive) {
@@ -11671,31 +11844,7 @@ void App::devicePollLoop() {
                             !m_deviceSlots[1].verifyConnection()) {
                             std::string secondarySerial = m_slotSerial[1];
                             LOG_WARN("Poll", "Secondary health check failed, reconnecting: " + secondarySerial);
-                            m_deviceSlots[1].disconnectTcp();
-                            bool secondaryStarted = false;
-                            if (!secondarySerial.empty()) {
-                                bool root = m_prefs.rootEnabledForSerial(secondarySerial);
-                                secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, root);
-                                if (!secondaryStarted && root) {
-                                    LOG_WARN("Poll", "Secondary root reconnect failed, retrying without root: " + m_deviceSlots[1].lastError());
-                                    m_prefs.setRootEnabledForSerial(secondarySerial, false);
-                                    m_prefs.save();
-                                    secondaryStarted = m_deviceSlots[1].startServer(secondarySerial, true /*ADB forward*/, false);
-                                }
-                            }
-                            if (secondaryStarted) {
-                                m_secondaryRetrySerial.clear();
-                                m_secondaryRetryAfter = {};
-                                m_slotSerial[1] = secondarySerial;
-                                m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
-                                m_slotVolumes[1].clear();
-                                m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
-                                m_slotConnected[1] = true;
-                                forEachAndroidPanel([&](FilePanel& p) {
-                                    if (p.deviceSlot == 1) p.needsRefresh = true;
-                                });
-                                LOG_INFO("Poll", "Secondary slot reconnected: " + secondarySerial);
-                            } else {
+                            if (!recoverSecondarySlotConnection(secondarySerial)) {
                                 m_secondaryRetrySerial = secondarySerial;
                                 m_secondaryRetryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(15);
                                 m_slotConnected[1] = false;
@@ -11995,6 +12144,7 @@ void App::onDeviceChanged() {
             m_slotVolumes[1].clear();
             m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
             m_slotConnected[1] = true;
+            prepareSlot1WifiFallback(candidateSerial);
             LOG_INFO("Poll", "Second device connected: " + candidateSerial + " storage: " + m_slotStorageRoot[1]);
 
             // Navigate slot-1 Android panels
@@ -12390,10 +12540,9 @@ void App::startTransfer(bool pullFromAndroid) {
         dstPtr = (srcPtr == &m_leftPanel) ? &m_rightPanel : &m_leftPanel;
     } else {
         // Mixed: need device
-        {
-            std::lock_guard<std::mutex> lk(m_deviceMutex);
-            if (m_selectedDevice < 0 || m_devices.empty()) return;
-        }
+        FilePanel& devicePanel = m_leftPanel.isAndroid ? m_leftPanel : m_rightPanel;
+        if (!m_slotConnected[devicePanel.deviceSlot & 1] ||
+            !deviceForSlot(devicePanel.deviceSlot).isServerRunning()) return;
         if (pullFromAndroid) {
             srcPtr = m_leftPanel.isAndroid ? &m_leftPanel : &m_rightPanel;
             dstPtr = !m_leftPanel.isAndroid ? &m_leftPanel : &m_rightPanel;
@@ -12544,8 +12693,8 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
     if (batch->files.empty()) return;
 
     if (!batch->isLocalCopy) {
-        std::lock_guard<std::mutex> lk(m_deviceMutex);
-        if (m_selectedDevice < 0 || m_devices.empty()) {
+        if (!m_slotConnected[target->deviceSlot & 1] ||
+            !deviceForSlot(target->deviceSlot).isServerRunning()) {
             m_statusMessage = "No device connected for transfer";
             m_statusTime = std::chrono::steady_clock::now();
             return;
@@ -12591,8 +12740,9 @@ void App::startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel) {
     bool isPull = srcPanel.isAndroid;
 
     if (!localCopy) {
-        std::lock_guard<std::mutex> lk(m_deviceMutex);
-        if (m_selectedDevice < 0 || m_devices.empty()) return;
+        const FilePanel& devicePanel = srcPanel.isAndroid ? srcPanel : dstPanel;
+        if (!m_slotConnected[devicePanel.deviceSlot & 1] ||
+            !deviceForSlot(devicePanel.deviceSlot).isServerRunning()) return;
     }
 
     auto batch = std::make_shared<TransferBatch>();
@@ -12800,7 +12950,7 @@ void App::processBatchQueue() {
                     m_nicLocalIps.clear();
                     for (int i = 0; i < (int)activeNics.size(); i++) {
                         auto ch = std::make_unique<DeviceClient>();
-                        if (ch->connectTcp(multiNicDeviceIp, AFM_PORT, activeNics[i].localIp) &&
+                        if (ch->connectTcp(multiNicDeviceIp, batchDev.localPort(), activeNics[i].localIp) &&
                             ch->verifyConnection()) {
                             multiNicDevPtrs.push_back(ch.get());
                             multiNicBindIps.push_back(activeNics[i].localIp);
@@ -12852,8 +13002,10 @@ void App::processBatchQueue() {
 
         if (batch->useParallelChannels && !batch->isLocalCopy && !batch->isCrossDevice && !useMultiNic) {
             std::string batchSerial = batchDev.connectedSerial();
-            bool primaryIsUsb = !batchSerial.empty() && !isWifiSerial(batchSerial);
-            if (primaryIsUsb) batchUsbSerial = batchSerial;
+            bool primaryUsesWifi = batchDev.isDirectConnection() || isWifiSerial(batchSerial);
+            bool primaryIsUsb = !batchSerial.empty() && !primaryUsesWifi;
+            if (!batchSerial.empty() && !isWifiSerial(batchSerial)) batchUsbSerial = batchSerial;
+            if (batchDev.isDirectConnection()) batchWifiIp = batchDev.deviceIp();
             if (isWifiSerial(batchSerial)) {
                 auto colon = batchSerial.rfind(':');
                 if (colon != std::string::npos) batchWifiIp = batchSerial.substr(0, colon);
@@ -12909,8 +13061,9 @@ void App::processBatchQueue() {
             runtimeChannels.push_back(std::move(primary));
 
             int usbChannels = primaryIsUsb ? 1 : 0;
-            int wifiChannels = primaryIsUsb ? 0 : 1;
+            int wifiChannels = primaryUsesWifi ? 1 : 0;
             int nextPort = 5840 + (batchDeviceSlot & 1) * 20;
+            int remoteHelperPort = batchDev.localPort();
 
             auto addUsbChannel = [&]() -> bool {
                 if (batchUsbSerial.empty()) return false;
@@ -12920,7 +13073,7 @@ void App::processBatchQueue() {
                     ch->setLocalPort(nextPort++);
                     int localPort = ch->localPort();
                     std::string fwd = batchDev.runAdbCommand("-s " + batchUsbSerial + " forward tcp:" +
-                        std::to_string(localPort) + " tcp:" + std::to_string(AFM_PORT));
+                        std::to_string(localPort) + " tcp:" + std::to_string(remoteHelperPort));
                     if (fwd.find("offline") != std::string::npos)
                         return false;
                     if (fwd.find("error") != std::string::npos) {
@@ -12930,8 +13083,10 @@ void App::processBatchQueue() {
                     }
                     if (!ch->connectTcp("127.0.0.1", localPort) || !ch->verifyConnection()) {
                         LOG_WARN("Transfer", "USB forward port " + std::to_string(localPort) +
-                            " connected but did not verify, trying next port");
-                        continue;
+                            " connected but did not verify");
+                        batchDev.runAdbCommand("-s " + batchUsbSerial + " forward --remove tcp:" +
+                            std::to_string(localPort));
+                        return false;
                     }
                     RuntimeChannel rc;
                     rc.dev = ch.get();
@@ -12951,7 +13106,7 @@ void App::processBatchQueue() {
                 auto ch = std::make_unique<DeviceClient>();
                 ch->setAdbPath(batchDev.getAdbPath());
                 ch->setLocalPort(nextPort++);
-                if (!ch->connectTcp(batchWifiIp, AFM_PORT) || !ch->verifyConnection())
+                if (!ch->connectTcp(batchWifiIp, remoteHelperPort) || !ch->verifyConnection())
                     return false;
                 RuntimeChannel rc;
                 rc.dev = ch.get();
@@ -14057,14 +14212,25 @@ void App::processBatchQueue() {
             std::string wifiIp;
             std::string usbSerial;
             std::string hwSerial;
-            bool primaryIsUsb = !serial.empty() && !isWifiSerial(serial);
-            if (primaryIsUsb) usbSerial = serial;
+            bool primaryUsesWifi = baseDev.isDirectConnection() || isWifiSerial(serial);
+            bool primaryIsUsb = !serial.empty() && !primaryUsesWifi;
+            if (!serial.empty() && !isWifiSerial(serial)) usbSerial = serial;
+            if (baseDev.isDirectConnection()) wifiIp = baseDev.deviceIp();
             if (isWifiSerial(serial)) {
                 auto colon = serial.rfind(':');
                 if (colon != std::string::npos) wifiIp = serial.substr(0, colon);
             }
 
+            bool serialAdbOnline = false;
             if (!serial.empty()) {
+                std::lock_guard<std::mutex> lk(m_deviceMutex);
+                serialAdbOnline = std::any_of(m_devices.begin(), m_devices.end(), [&](const DeviceInfo& device) {
+                    return device.serial == serial && device.state == "device";
+                });
+            }
+            if (!serialAdbOnline) usbSerial.clear();
+
+            if (serialAdbOnline) {
                 std::string hwOut = baseDev.runAdbCommand("-s " + serial + " shell getprop ro.serialno");
                 while (lastCharOr(hwOut) == '\n' || lastCharOr(hwOut) == '\r' || lastCharOr(hwOut) == ' ')
                     hwOut.pop_back();
@@ -14114,8 +14280,9 @@ void App::processBatchQueue() {
             out.push_back(std::move(primary));
 
             int usbChannels = primaryIsUsb ? 1 : 0;
-            int wifiChannels = primaryIsUsb ? 0 : 1;
+            int wifiChannels = primaryUsesWifi ? 1 : 0;
             int nextPort = portBase + (slot & 1) * 32;
+            int remoteHelperPort = baseDev.localPort();
 
             auto addUsbChannel = [&]() -> bool {
                 if (usbSerial.empty()) return false;
@@ -14125,7 +14292,7 @@ void App::processBatchQueue() {
                     ch->setLocalPort(nextPort++);
                     int localPort = ch->localPort();
                     std::string fwd = baseDev.runAdbCommand("-s " + usbSerial + " forward tcp:" +
-                        std::to_string(localPort) + " tcp:" + std::to_string(AFM_PORT));
+                        std::to_string(localPort) + " tcp:" + std::to_string(remoteHelperPort));
                     if (fwd.find("offline") != std::string::npos)
                         return false;
                     if (fwd.find("error") != std::string::npos) {
@@ -14135,8 +14302,10 @@ void App::processBatchQueue() {
                     }
                     if (!ch->connectTcp("127.0.0.1", localPort) || !ch->verifyConnection()) {
                         LOG_WARN("Transfer", "USB forward port " + std::to_string(localPort) +
-                            " connected but did not verify, trying next port");
-                        continue;
+                            " connected but did not verify");
+                        baseDev.runAdbCommand("-s " + usbSerial + " forward --remove tcp:" +
+                            std::to_string(localPort));
+                        return false;
                     }
                     RuntimeChannel rc;
                     rc.dev = ch.get();
@@ -14156,7 +14325,7 @@ void App::processBatchQueue() {
                 auto ch = std::make_unique<DeviceClient>();
                 ch->setAdbPath(baseDev.getAdbPath());
                 ch->setLocalPort(nextPort++);
-                if (!ch->connectTcp(wifiIp, AFM_PORT) || !ch->verifyConnection())
+                if (!ch->connectTcp(wifiIp, remoteHelperPort) || !ch->verifyConnection())
                     return false;
                 RuntimeChannel rc;
                 rc.dev = ch.get();

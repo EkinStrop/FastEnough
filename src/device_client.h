@@ -111,7 +111,7 @@ public:
     uintptr_t openTrackDevices();
     // Read one device update from a track-devices socket. Blocks until data arrives or error.
     // Returns parsed device list, or empty on error/disconnect.
-    std::vector<DeviceInfo> readTrackDevicesUpdate(uintptr_t sock);
+    std::vector<DeviceInfo> readTrackDevicesUpdate(uintptr_t sock, bool* receivedUpdate = nullptr);
     void closeTrackDevices(uintptr_t sock);
 
     // Server lifecycle
@@ -163,12 +163,14 @@ public:
     const std::string& connectedSerial() const { return m_serial; }
     bool isDirectConnection() const { return m_directConnection; }
     const std::string& deviceIp() const { return m_deviceIp; }
+    const std::string& connectedHost() const { return m_lastConnectHost; }
 
     // Try to upgrade from ADB forward to direct TCP (call anytime, even mid-session)
     bool tryUpgradeToDirect();
     // Reattach to an already-running helper through a known WiFi endpoint without
     // restarting the helper. Used for USB-to-WiFi failover.
-    bool connectDirectForSerial(const std::string& serial, const std::string& ip);
+    bool connectDirectForSerial(const std::string& serial, const std::string& ip,
+                                int port = AFM_PORT);
 
     // File operations via TCP server
     std::string detectStoragePath();
@@ -265,6 +267,7 @@ public:
     bool verifyConnection();
     bool connectDirect(const std::string& ip); // connect + verify + set state
     bool connectParallelFrom(const DeviceClient& source);
+    void setOwnsServer(bool owns) { m_ownsServer = owns; }
     void flushStaleData(); // drain any leftover data from TCP buffer after cancelled transfer
     bool tryEnableUsbTethering(const std::string& serial = ""); // attempt to enable tethering via adb shell
     std::string detectDeviceIp(const std::string& serial);

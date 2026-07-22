@@ -531,6 +531,8 @@ private:
     void renderWifiPairingDialog();
     void renderWifiBanner();
     void tryAutoWifiConnect(const std::string& serial);
+    bool prepareSlot1WifiFallback(const std::string& serial);
+    bool recoverSecondarySlotConnection(const std::string& serial);
     void renderCopyMoveDialog();
     void renderCrossDeviceDialog();
     void openAndroidFile(FilePanel& panel, int index);
@@ -636,6 +638,8 @@ private:
 
     // Parallel transfer: additional channels to same device
     DeviceClient m_secondaryChannel;
+    DeviceClient m_slot1WifiChannel;
+    std::string m_slot1WifiIp;
     struct ExtraChannel {
         std::unique_ptr<DeviceClient> dev;
         bool isUsb; // true=USB ADB forward, false=WiFi Direct

@@ -398,9 +398,10 @@ uintptr_t DeviceClient::openTrackDevices() {
     return (uintptr_t)sock;
 }
 
-std::vector<DeviceInfo> DeviceClient::readTrackDevicesUpdate(uintptr_t sockHandle) {
+std::vector<DeviceInfo> DeviceClient::readTrackDevicesUpdate(uintptr_t sockHandle, bool* receivedUpdate) {
     std::vector<DeviceInfo> devices;
     SOCKET sock = (SOCKET)sockHandle;
+    if (receivedUpdate) *receivedUpdate = false;
 
     std::string payload = adbProtoRecvPayload(sock);
     if (payload.empty()) {
@@ -409,11 +410,13 @@ std::vector<DeviceInfo> DeviceClient::readTrackDevicesUpdate(uintptr_t sockHandl
     }
 
     if (payload == " ") {
-        // Empty device list (all disconnected) — return empty but set no error
-        WSASetLastError(0);
+        // Empty device list is a valid update, not a socket failure.
+        if (receivedUpdate) *receivedUpdate = true;
         LOG_INFO("ADB", "track-devices: all devices disconnected");
         return devices;
     }
+
+    if (receivedUpdate) *receivedUpdate = true;
 
     // Parse lines: "serial\tstate\tattr1:val1 attr2:val2..."
     std::istringstream stream(payload);
@@ -1964,19 +1967,20 @@ bool DeviceClient::connectDirect(const std::string& ip) {
     return false;
 }
 
-bool DeviceClient::connectDirectForSerial(const std::string& serial, const std::string& ip) {
-    if (serial.empty() || ip.empty()) return false;
+bool DeviceClient::connectDirectForSerial(const std::string& serial, const std::string& ip, int port) {
+    if (serial.empty() || ip.empty() || port <= 0) return false;
     std::lock_guard<std::mutex> serverLk(m_serverMutex);
     disconnectTcp();
     m_serial = serial;
     m_directConnection = false;
     m_deviceIp.clear();
-    if (connectTcp(ip, AFM_PORT) && verifyConnection()) {
+    if (connectTcp(ip, port) && verifyConnection()) {
         m_connected = true;
         m_directConnection = true;
         m_deviceIp = ip;
         m_statusText = "Connected via WiFi failover";
-        LOG_INFO("Server", "Connected directly through WiFi failover: " + serial);
+        LOG_INFO("Server", "Connected directly through WiFi failover: " + serial +
+            " on helper port " + std::to_string(port));
         return true;
     }
     disconnectTcp();
