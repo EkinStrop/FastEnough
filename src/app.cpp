@@ -9159,7 +9159,7 @@ void App::renderAboutPopup() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        ImGui::Text("Version: 1.0.18");
+        ImGui::Text("Version: 1.0.19");
         ImGui::Text("Build date: %s", __DATE__);
         ImGui::Spacing();
         ImGui::Text("Made by: JohnTheFarmer");

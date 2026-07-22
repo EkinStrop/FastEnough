@@ -11,8 +11,8 @@ IDR_AFM_SERVER RCDATA "..\\server\\afm-server"
 IDR_APP_LABELS_DEX RCDATA "..\\server\\afm-labels.dex"
 
 1 VERSIONINFO
- FILEVERSION 1,0,18,0
- PRODUCTVERSION 1,0,18,0
+ FILEVERSION 1,0,19,0
+ PRODUCTVERSION 1,0,19,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -29,11 +29,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "EkinStrop"
             VALUE "FileDescription", "Fast Enough? - Android File Explorer"
-            VALUE "FileVersion", "1.0.18"
+            VALUE "FileVersion", "1.0.19"
             VALUE "InternalName", "Fast Enough - Android File Explorer"
             VALUE "OriginalFilename", "Fast Enough - Android File Explorer.exe"
             VALUE "ProductName", "Fast Enough"
-            VALUE "ProductVersion", "1.0.18"
+            VALUE "ProductVersion", "1.0.19"
         END
     END
     BLOCK "VarFileInfo"
