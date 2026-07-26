@@ -206,6 +206,49 @@ static std::string normalizeCompareName(std::string name) {
     return name;
 }
 
+static bool fileNameMatchesFilter(const std::string& name, const std::string& filter) {
+    if (filter.empty()) return true;
+    if (filter.find_first_of("*?") != std::string::npos)
+        return PathMatchSpecW(toWide(name).c_str(), toWide(filter).c_str()) == TRUE;
+
+    std::string normalizedName = normalizeCompareName(name);
+    std::string normalizedFilter = normalizeCompareName(filter);
+    return normalizedName.find(normalizedFilter) != std::string::npos;
+}
+
+static bool panelContainsName(const FilePanel& panel, const std::string& name, int excludedIndex) {
+    for (int i = 0; i < panel.entryCount(); ++i) {
+        if (i == excludedIndex) continue;
+        const std::string existingName = panel.entryName(i);
+        if (panel.isAndroid) {
+            if (existingName == name) return true;
+        } else if (_stricmp(existingName.c_str(), name.c_str()) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::string makeUniquePanelName(
+    const FilePanel& panel, const std::string& requestedName, int sourceIndex) {
+    if (!panelContainsName(panel, requestedName, sourceIndex)) return requestedName;
+
+    std::string base = requestedName;
+    std::string extension;
+    if (!panel.entryIsDir(sourceIndex)) {
+        const size_t dot = requestedName.find_last_of('.');
+        if (dot != std::string::npos && dot > 0) {
+            base = requestedName.substr(0, dot);
+            extension = requestedName.substr(dot);
+        }
+    }
+
+    for (int suffix = 1; ; ++suffix) {
+        std::string candidate = base + " (" + std::to_string(suffix) + ")" + extension;
+        if (!panelContainsName(panel, candidate, sourceIndex)) return candidate;
+    }
+}
+
 static std::string bytesToHex(const BYTE* data, DWORD len) {
     static const char* hex = "0123456789abcdef";
     std::string out;
@@ -1781,6 +1824,9 @@ void App::render() {
 
     // Global keyboard shortcuts
     bool anyModalOpen = ImGui::IsPopupOpen("Rename") || ImGui::IsPopupOpen("New Folder") || ImGui::IsPopupOpen("Confirm Delete");
+    ImGuiContext* imguiContext = ImGui::GetCurrentContext();
+    bool textInputActive = imguiContext && imguiContext->ActiveId != 0 &&
+        imguiContext->InputTextState.ID == imguiContext->ActiveId;
 
     if (ImGui::IsKeyPressed(ImGuiKey_F12)) m_showDebugWindow = !m_showDebugWindow;
     if (ImGui::IsKeyPressed(ImGuiKey_F5) && !anyModalOpen) {
@@ -1795,7 +1841,7 @@ void App::render() {
     if (ImGui::IsKeyPressed(ImGuiKey_F7) && !anyModalOpen) startTransfer(true);
 
     // Del / Shift+Del — delete selected files in the focused panel
-    if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !anyModalOpen) {
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !anyModalOpen && !textInputActive) {
         FilePanel* focused = m_lastFocusedPanel;
         if (focused && !focused->isApps && !focused->isConnections && !focused->selectedIndices.empty()) {
             m_contextPanel = focused;
@@ -1806,13 +1852,13 @@ void App::render() {
     }
 
     // Backspace — navigate up
-    if (ImGui::IsKeyPressed(ImGuiKey_Backspace) && !anyModalOpen) {
+    if (ImGui::IsKeyPressed(ImGuiKey_Backspace) && !anyModalOpen && !textInputActive) {
         if (m_lastFocusedPanel && !m_lastFocusedPanel->isApps && !m_lastFocusedPanel->isConnections)
             navigateUp(*m_lastFocusedPanel);
     }
 
     // Enter — open/navigate the focused item (same as double-click)
-    if (ImGui::IsKeyPressed(ImGuiKey_Enter) && !anyModalOpen) {
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter) && !anyModalOpen && !textInputActive) {
         FilePanel* focused = m_lastFocusedPanel;
         if (focused && !focused->isApps && !focused->isConnections &&
             focused->focusedIndex >= 0 && focused->validIndex(focused->focusedIndex)) {
@@ -1846,7 +1892,7 @@ void App::render() {
     }
 
     // Space — pause/resume active transfer
-    if (ImGui::IsKeyPressed(ImGuiKey_Space) && !anyModalOpen) {
+    if (ImGui::IsKeyPressed(ImGuiKey_Space) && !anyModalOpen && !textInputActive) {
         std::lock_guard<std::mutex> lk(m_batchMutex);
         for (auto& b : m_batchQueue) {
             auto s = b->state.load();
@@ -1856,7 +1902,7 @@ void App::render() {
     }
 
     // Ctrl+C — copy selected files to clipboard
-    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C) && !anyModalOpen) {
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C) && !anyModalOpen && !textInputActive) {
         FilePanel* focused = m_lastFocusedPanel;
         if (focused && !focused->isApps && !focused->isConnections && !focused->selectedIndices.empty()) {
             m_clipboardPaths.clear();
@@ -1875,7 +1921,7 @@ void App::render() {
     }
 
     // Ctrl+X — cut selected files to clipboard
-    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X) && !anyModalOpen) {
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X) && !anyModalOpen && !textInputActive) {
         FilePanel* focused = m_lastFocusedPanel;
         if (focused && !focused->isApps && !focused->isConnections && !focused->selectedIndices.empty()) {
             m_clipboardPaths.clear();
@@ -1894,7 +1940,7 @@ void App::render() {
     }
 
     // Ctrl+V — paste clipboard files into focused panel
-    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V) && !anyModalOpen) {
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V) && !anyModalOpen && !textInputActive) {
         FilePanel* focused = m_lastFocusedPanel;
         if (focused && !focused->isApps && !focused->isConnections && !m_clipboardPaths.empty()) {
             performClipboardPaste(*focused);
@@ -4384,7 +4430,8 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
 
     // Filter bar
     ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint(("##Filter" + std::string(label)).c_str(), "Search / filter...", panel.searchFilter, sizeof(panel.searchFilter));
+    ImGui::InputTextWithHint(("##Filter" + std::string(label)).c_str(),
+        "Search names or patterns, e.g. *.mp4", panel.searchFilter, sizeof(panel.searchFilter));
     ImGui::Separator();
 
     renderFavoritesBar(panel, side);
@@ -4426,7 +4473,9 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
     }
 
     // Ctrl+A — select all
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && ImGui::IsKeyPressed(ImGuiKey_A) && ImGui::GetIO().KeyCtrl) {
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+        ImGui::IsKeyPressed(ImGuiKey_A) && ImGui::GetIO().KeyCtrl &&
+        !ImGui::IsAnyItemActive()) {
         for (int i = 0; i < panel.entryCount(); i++) panel.selectedIndices.insert(i);
     }
 
@@ -4489,7 +4538,6 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         }
 
         std::string filter(panel.searchFilter);
-        std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
 
         // Track row screen positions for rubber-band selection
         struct RowInfo { int index; float yMin, yMax; };
@@ -4504,11 +4552,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         int count = panel.entryCount();
         for (int i = 0; i < count; i++) {
             std::string name = panel.entryName(i);
-            if (!filter.empty()) {
-                std::string nl = name;
-                std::transform(nl.begin(), nl.end(), nl.begin(), ::tolower);
-                if (nl.find(filter) == std::string::npos) continue;
-            }
+            if (!fileNameMatchesFilter(name, filter)) continue;
             if (!panel.showHidden && !panel.isAndroid) {
                 if (!name.empty() && name[0] == '.') continue;
                 if (i < (int)panel.windowsEntries.size() && panel.windowsEntries[i].isHidden) continue;
@@ -10527,14 +10571,35 @@ void App::renderRenamePopup() {
             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackAlways,
             renameCb, &m_renameNeedsSelect);
         if ((modernButton("Rename", ImVec2(120,0)) || enter) && m_contextPanel && m_contextPanel->validIndex(m_contextIndex)) {
-            std::string oldN = m_contextPanel->entryName(m_contextIndex), newN(m_renameBuf);
+            std::string oldN = m_contextPanel->entryName(m_contextIndex), requestedN(m_renameBuf);
+            std::string newN = makeUniquePanelName(*m_contextPanel, requestedN, m_contextIndex);
             if (!newN.empty() && newN != oldN) {
                 if (m_contextPanel->isAndroid && m_selectedDevice >= 0) {
                     std::string fromP = m_contextPanel->currentPath+"/"+oldN, toP = m_contextPanel->currentPath+"/"+newN;
-                    int slot = m_contextPanel->deviceSlot; postAsync("Renaming...", [this, fromP, toP, slot]() { deviceForSlot(slot).renameFile(fromP, toP); });
+                    int slot = m_contextPanel->deviceSlot;
+                    FilePanel* targetPanel = m_contextPanel;
+                    postAsync("Renaming...", [this, fromP, toP, newN, slot, targetPanel]() {
+                        DeviceClient& device = deviceForSlot(slot);
+                        UiMessage message;
+                        if (device.renameFile(fromP, toP)) {
+                            message.hasStatus = true;
+                            message.status = "Renamed to " + newN;
+                        } else {
+                            message.hasNotification = true;
+                            message.notificationTitle = "Rename Failed";
+                            message.notificationMessage = device.lastError();
+                            message.notificationIsError = true;
+                        }
+                        message.refreshFilePanel = targetPanel;
+                        postUiMessage(std::move(message));
+                    });
                 } else {
                     std::string bp = m_contextPanel->currentPath; appendPathSeparator(bp, '\\');
-                    try { std::filesystem::rename(toFsPath(bp+oldN), toFsPath(bp+newN)); } catch (const std::exception& e) {
+                    try {
+                        std::filesystem::rename(toFsPath(bp+oldN), toFsPath(bp+newN));
+                        m_statusMessage = "Renamed to " + newN;
+                        m_statusTime = std::chrono::steady_clock::now();
+                    } catch (const std::exception& e) {
                         m_statusMessage = std::string("Rename failed: ") + e.what(); m_statusTime = std::chrono::steady_clock::now();
                     }
                 }

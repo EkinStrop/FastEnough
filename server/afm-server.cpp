@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <sys/sendfile.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 
 #ifdef __aarch64__
@@ -47,6 +48,9 @@
 #include "protocol.h"
 
 #define BUF_SIZE AFM_CHUNK_SIZE
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0)
+#endif
 
 static int g_running = 1;
 
@@ -1912,7 +1916,32 @@ static void handle_rename(int fd, const void* payload, uint32_t payload_len) {
     memcpy(new_path, (const char*)payload + 4 + old_len, new_len);
     new_path[new_len] = '\0';
 
-    if (rename(old_path, new_path) != 0)
+    if (strcmp(old_path, new_path) == 0) {
+        send_ok(fd, NULL, 0);
+        return;
+    }
+
+    int rename_result;
+#if defined(SYS_renameat2)
+    rename_result = (int)syscall(
+        SYS_renameat2, AT_FDCWD, old_path, AT_FDCWD, new_path, RENAME_NOREPLACE);
+    if (rename_result != 0 &&
+        (errno == ENOSYS || errno == EINVAL || errno == EOPNOTSUPP)) {
+#endif
+        struct stat destination_stat;
+        if (lstat(new_path, &destination_stat) == 0) {
+            errno = EEXIST;
+            rename_result = -1;
+        } else if (errno != ENOENT) {
+            rename_result = -1;
+        } else {
+            rename_result = rename(old_path, new_path);
+        }
+#if defined(SYS_renameat2)
+    }
+#endif
+
+    if (rename_result != 0)
         send_error(fd, strerror(errno));
     else
         send_ok(fd, NULL, 0);
