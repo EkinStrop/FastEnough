@@ -9352,6 +9352,13 @@ void App::showNotification(const std::string& title, const std::string& message,
 
 void App::requestApkInstall(const std::string& apkPath) {
     if (apkPath.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(m_apkInstallMutex);
+        if (m_apkInstallState == ApkInstallDialogState::Installing) return;
+        m_apkInstallState = ApkInstallDialogState::Setup;
+        m_apkInstallResult.clear();
+        m_apkInstallStarted = {};
+    }
     m_pendingApkPath = apkPath;
     m_pendingApkDeviceIndex = 0;
     m_apkInstallGrantPermissions = false;
@@ -9371,21 +9378,122 @@ void App::renderApkInstallDialog() {
     float maxH = std::max(260.0f, viewport->WorkSize.y - 32.0f);
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSizeConstraints(ImVec2(420, 0), ImVec2(maxW, maxH));
-    if (ImGui::BeginPopupModal("Install APK", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (ImGui::BeginPopupModal("Install APK", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
         std::string apkName = m_pendingApkPath;
         auto slash = apkName.find_last_of("\\/");
         if (slash != std::string::npos) apkName = apkName.substr(slash + 1);
 
+        ApkInstallDialogState installState;
+        std::string installResult;
+        std::chrono::steady_clock::time_point installStarted;
+        {
+            std::lock_guard<std::mutex> lk(m_apkInstallMutex);
+            installState = m_apkInstallState;
+            installResult = m_apkInstallResult;
+            installStarted = m_apkInstallStarted;
+        }
+
         float wrapW = std::min(560.0f, maxW - ImGui::GetStyle().WindowPadding.x * 2.0f);
-        ImGui::SetNextItemWidth(wrapW);
+
+        if (installState == ApkInstallDialogState::Installing ||
+            installState == ApkInstallDialogState::Succeeded ||
+            installState == ApkInstallDialogState::Failed) {
+            const bool succeeded = installState == ApkInstallDialogState::Succeeded;
+            const bool failed = installState == ApkInstallDialogState::Failed;
+            const ImVec4 accent = succeeded ? ImVec4(0.25f, 0.90f, 0.55f, 1.0f) :
+                failed ? ImVec4(1.0f, 0.38f, 0.38f, 1.0f) : ImVec4(0.34f, 0.73f, 1.0f, 1.0f);
+            const float elapsed = installStarted.time_since_epoch().count() == 0 ? 0.0f :
+                (float)std::chrono::duration<double>(std::chrono::steady_clock::now() - installStarted).count();
+            // adb install does not expose transfer or package-manager progress. Advance through the
+            // usual transfer phase quickly, then keep the final portion for Android verification.
+            const float estimatedProgress = std::min(0.88f, 0.20f + 0.68f * (1.0f - std::exp(-elapsed / 1.75f)));
+            const float progress = installState == ApkInstallDialogState::Installing ? estimatedProgress : 1.0f;
+
+            ImGui::TextColored(accent, "%s", succeeded ? "APK installed" : failed ? "APK installation failed" : "Installing APK");
+            ImGui::TextDisabled("%s", apkName.c_str());
+            ImGui::Spacing();
+
+            const float cardH = 152.0f;
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.035f, 0.065f, 0.105f, 0.98f));
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(accent.x, accent.y, accent.z, 0.72f));
+            ImGui::BeginChild("##ApkInstallProgressCard", ImVec2(wrapW, cardH), ImGuiChildFlags_Borders,
+                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            ImVec2 cardPos = ImGui::GetWindowPos();
+            ImVec2 ringCenter(cardPos.x + 50.0f, cardPos.y + 60.0f);
+            drawList->AddCircle(ringCenter, 28.0f, IM_COL32(71, 94, 122, 255), 36, 5.0f);
+            if (installState == ApkInstallDialogState::Installing) {
+                float phase = (float)ImGui::GetTime() * 7.0f;
+                for (int i = 0; i < 12; ++i) {
+                    float angle = ((float)i / 12.0f) * 6.2831853f - 1.5707963f;
+                    float intensity = 0.20f + 0.80f * std::max(0.0f, std::cos(angle - phase));
+                    ImVec2 dot(ringCenter.x + std::cos(angle) * 28.0f, ringCenter.y + std::sin(angle) * 28.0f);
+                    drawList->AddCircleFilled(dot, 3.4f, IM_COL32(74, 174, 255, (int)(255.0f * intensity)));
+                }
+            } else {
+                drawList->AddCircleFilled(ringCenter, 23.0f, IM_COL32((int)(accent.x * 255), (int)(accent.y * 255), (int)(accent.z * 255), 255));
+                if (succeeded) {
+                    const ImU32 checkColor = IM_COL32(7, 28, 20, 255);
+                    drawList->AddLine(ImVec2(ringCenter.x - 11.0f, ringCenter.y - 1.0f),
+                        ImVec2(ringCenter.x - 3.0f, ringCenter.y + 8.0f), checkColor, 3.5f);
+                    drawList->AddLine(ImVec2(ringCenter.x - 3.0f, ringCenter.y + 8.0f),
+                        ImVec2(ringCenter.x + 12.0f, ringCenter.y - 8.0f), checkColor, 3.5f);
+                } else {
+                    const char* ringLabel = "Error";
+                    ImVec2 labelSize = ImGui::CalcTextSize(ringLabel);
+                    ImGui::SetCursorScreenPos(ImVec2(ringCenter.x - labelSize.x * 0.5f,
+                        ringCenter.y - labelSize.y * 0.5f));
+                    ImGui::TextColored(ImVec4(0.04f, 0.08f, 0.12f, 1.0f), "%s", ringLabel);
+                }
+            }
+
+            ImGui::SetCursorPos(ImVec2(96.0f, installState == ApkInstallDialogState::Installing ? 22.0f : 34.0f));
+            if (installState == ApkInstallDialogState::Installing) {
+                ImGui::TextColored(accent, "Sending and installing on Android");
+                ImGui::SetCursorPos(ImVec2(96.0f, 50.0f));
+                ImGui::TextDisabled("Keep the device connected until this finishes.");
+                ImGui::SetCursorPos(ImVec2(96.0f, 84.0f));
+                ImGui::ProgressBar(progress, ImVec2(wrapW - 112.0f, 12.0f), "");
+                ImGui::SetCursorPos(ImVec2(96.0f, 108.0f));
+                ImGui::TextDisabled("Estimated progress  %.0f%%", progress * 100.0f);
+            } else {
+                ImGui::TextColored(accent, "%s", succeeded ? "The app is ready on the selected device." : "Android could not install this APK.");
+                ImGui::SetCursorPos(ImVec2(96.0f, 60.0f));
+                ImGui::TextDisabled("%s", succeeded ? ("Device: " + installResult).c_str() : "See the Android response below.");
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleColor(2);
+
+            if (failed && !installResult.empty()) {
+                ImGui::Spacing();
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+                ImGui::TextDisabled("%s", installResult.c_str());
+                ImGui::PopTextWrapPos();
+            }
+            ImGui::Spacing();
+            if (installState != ApkInstallDialogState::Installing) {
+                float btnW = 110.0f;
+                ImGui::SetCursorPosX((ImGui::GetWindowSize().x - btnW) * 0.5f);
+                if (modernButton("Close", ImVec2(btnW, 0))) ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+            return;
+        }
+
         ImGui::TextColored(ImVec4(0.45f, 0.70f, 1.0f, 1), "Install APK");
+        ImGui::TextDisabled("Choose where to install this app");
         ImGui::Spacing();
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
-        ImGui::TextWrapped("%s", apkName.c_str());
-        ImGui::TextWrapped("%s", m_pendingApkPath.c_str());
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.035f, 0.065f, 0.105f, 0.98f));
+        ImGui::BeginChild("##ApkInstallFileCard", ImVec2(wrapW, 66.0f), ImGuiChildFlags_Borders,
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::SetCursorPos(ImVec2(14.0f, 12.0f));
+        ImGui::TextColored(ImVec4(0.45f, 0.70f, 1.0f, 1), "%s", apkName.c_str());
+        ImGui::SetCursorPos(ImVec2(14.0f, 35.0f));
+        ImGui::PushTextWrapPos(wrapW - 12.0f);
+        ImGui::TextDisabled("%s", m_pendingApkPath.c_str());
         ImGui::PopTextWrapPos();
-        ImGui::Spacing();
-        ImGui::Separator();
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
         ImGui::Spacing();
 
         std::vector<DeviceInfo> online;
@@ -9443,37 +9551,37 @@ void App::renderApkInstallDialog() {
             DeviceInfo target = online[m_pendingApkDeviceIndex];
             bool grant = m_apkInstallGrantPermissions;
             bool downgrade = m_apkInstallAllowDowngrade;
-            ImGui::CloseCurrentPopup();
+            {
+                std::lock_guard<std::mutex> lk(m_apkInstallMutex);
+                m_apkInstallState = ApkInstallDialogState::Installing;
+                m_apkInstallResult.clear();
+                m_apkInstallStarted = std::chrono::steady_clock::now();
+            }
             postAsync("Installing APK...", [this, apk, target, grant, downgrade]() {
                 std::string out;
-                bool ok = m_device.installApk(target.serial, apk, out, true, grant, downgrade);
-                std::string apkName = apk;
-                size_t slash = apkName.find_last_of("\\/");
-                if (slash != std::string::npos) apkName = apkName.substr(slash + 1);
-                std::string deviceName = target.model.empty() ? target.serial : target.model + " (" + target.serial + ")";
-                std::string flags = "-r";
-                if (grant) flags += " -g";
-                if (downgrade) flags += " -d";
-                std::string report =
-                    "APK: " + apkName + "\n"
-                    "Device: " + deviceName + "\n"
-                    "Serial: " + target.serial + "\n"
-                    "ADB command: install " + flags + "\n\n";
+                bool ok = false;
+                try {
+                    ok = m_device.installApk(target.serial, apk, out, true, grant, downgrade);
+                } catch (const std::exception& e) {
+                    out = e.what();
+                } catch (...) {
+                    out = "Unexpected error while starting the Android installer.";
+                }
+                std::string result = target.model.empty() ? target.serial : target.model + " (" + target.serial + ")";
                 if (ok) {
-                    report += "Result: Installed successfully.\n\n";
-                    report += out.empty() ? "ADB output: Success" : "ADB output:\n" + out;
-                    showNotification("APK Installed", report, false);
                     m_statusMessage = "APK installed";
                     m_leftPanel.needsRefresh = true;
                     m_rightPanel.needsRefresh = true;
                 } else {
-                    report += "Result: Install failed.\n\n";
-                    report += out.empty() ? "ADB did not return an error message." : "ADB output:\n" + out;
-                    report += "\n\nCommon causes include an older app version already installed, a signature mismatch, insufficient storage, device policy restrictions, or an APK built for an unsupported ABI or Android version.";
-                    showNotification("APK Install Failed", report, true);
+                    result = out.empty() ? "Android did not return an error message." : out;
                     m_statusMessage = "APK install failed";
                 }
                 m_statusTime = std::chrono::steady_clock::now();
+                {
+                    std::lock_guard<std::mutex> lk(m_apkInstallMutex);
+                    m_apkInstallResult = std::move(result);
+                    m_apkInstallState = ok ? ApkInstallDialogState::Succeeded : ApkInstallDialogState::Failed;
+                }
             });
         }
         ImGui::EndDisabled();

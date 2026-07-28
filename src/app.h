@@ -698,6 +698,11 @@ private:
     int m_pendingApkDeviceIndex = 0;
     bool m_apkInstallGrantPermissions = false;
     bool m_apkInstallAllowDowngrade = false;
+    enum class ApkInstallDialogState { Setup, Installing, Succeeded, Failed };
+    std::mutex m_apkInstallMutex;
+    ApkInstallDialogState m_apkInstallState = ApkInstallDialogState::Setup;
+    std::string m_apkInstallResult;
+    std::chrono::steady_clock::time_point m_apkInstallStarted{};
 
     bool m_showBackupManager = false;
     int m_backupManagerSlot = 0;
