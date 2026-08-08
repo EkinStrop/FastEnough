@@ -9203,7 +9203,7 @@ void App::renderAboutPopup() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        ImGui::Text("Version: 1.0.19");
+        ImGui::Text("Version: 1.0.20");
         ImGui::Text("Build date: %s", __DATE__);
         ImGui::Spacing();
         ImGui::Text("Made by: JohnTheFarmer");
@@ -13484,7 +13484,7 @@ void App::processBatchQueue() {
                     // Directories: just create, no transfer
                     workQueue.push_back({i, 0, 0, true, blockIdCounter++});
                     totalBlocksPerFile[i] = 1;
-                } else if (item.fileSize < 200 * MB) {
+                } else if (item.isMcrawVirtual || item.fileSize < 200 * MB) {
                     // Small files: transfer as whole file (pushFile/pullFile streaming)
                     workQueue.push_back({i, 0, item.fileSize, true, blockIdCounter++});
                     totalBlocksPerFile[i] = 1;
@@ -13846,11 +13846,16 @@ void App::processBatchQueue() {
                         // Whole file transfer
                         uint64_t outSize = 0;
                         if (batch->isPull) {
-                            ok = dev.pullFile(item.sourcePath, item.destPath, outSize, progressCb);
-                            // Capture inline CRC before next pullFile overwrites it
-                            if (ok && !batch->stopRequested.load()) {
-                                std::lock_guard<std::mutex> lk(crcMutex);
-                                wholeFileCrcs[item.destPath] = dev.getInlineCrc();
+                            if (item.isMcrawVirtual) {
+                                ok = dev.pullMcrawItem(item.mcrawPath, item.virtualName,
+                                                       item.destPath, outSize, progressCb);
+                            } else {
+                                ok = dev.pullFile(item.sourcePath, item.destPath, outSize, progressCb);
+                                // Capture inline CRC before next pullFile overwrites it
+                                if (ok && !batch->stopRequested.load()) {
+                                    std::lock_guard<std::mutex> lk(crcMutex);
+                                    wholeFileCrcs[item.destPath] = dev.getInlineCrc();
+                                }
                             }
                         } else {
                             ok = dev.pushFile(item.sourcePath, item.destPath, item.fileSize, progressCb);
@@ -14230,7 +14235,7 @@ void App::processBatchQueue() {
                 for (int fi = 0; fi < batch->totalFiles(); fi++) {
                     if (batch->stopRequested.load()) break;
                     auto& item = batch->files[fi];
-                    if (item.isDirectory) continue;
+                    if (item.isDirectory || item.isMcrawVirtual) continue;
 
                     // For pulls: sourcePath=Android, destPath=Windows
                     // For pushes: sourcePath=Windows, destPath=Android
