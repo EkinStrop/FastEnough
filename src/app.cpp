@@ -8496,8 +8496,17 @@ void App::openAndroidFile(FilePanel& panel, int index) {
         bool ok = deviceForSlot(slot).pullFile(remotePath, localPath, outSize, nullptr);
         if (ok) {
             LOG_INFO("UI", "Opening: " + localPath);
-            ShellExecuteA(nullptr, "open", localPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            m_statusMessage = "Opened: " + name;
+            const std::wstring wideLocalPath = toWide(localPath);
+            HINSTANCE launchResult = ShellExecuteW(
+                nullptr, L"open", wideLocalPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            if (reinterpret_cast<INT_PTR>(launchResult) > 32) {
+                m_statusMessage = "Opened: " + name;
+            } else {
+                LOG_ERROR("UI", "Failed to launch file: " + localPath +
+                    " (ShellExecute error " +
+                    std::to_string(reinterpret_cast<INT_PTR>(launchResult)) + ")");
+                m_statusMessage = "Failed to open: " + name;
+            }
         } else {
             LOG_ERROR("UI", "Failed to pull file: " + remotePath);
             m_statusMessage = "Failed to open: " + name;
