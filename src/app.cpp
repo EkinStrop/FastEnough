@@ -4671,8 +4671,10 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                         fp += name;
                         if (endsWithCI(name, ".apk"))
                             requestApkInstall(fp);
-                        else
-                            ShellExecuteA(nullptr, "open", fp.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                        else {
+                            const std::wstring widePath = toWide(fp);
+                            ShellExecuteW(nullptr, L"open", widePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                        }
                     } else {
                         // Double-clicked a file on Android side — pull to temp and open
                         openAndroidFile(panel, i);
