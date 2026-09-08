@@ -7,6 +7,7 @@
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <sstream>
+#include <charconv>
 #include <algorithm>
 #include <filesystem>
 #include <thread>
@@ -38,13 +39,16 @@ static std::filesystem::path toFsPath(const std::string& utf8) {
     return std::filesystem::path(toWide(utf8));
 }
 
-static std::string pathToUtf8(const std::filesystem::path& p) {
-    auto ws = p.wstring();
+static std::string wideToUtf8(const std::wstring& ws) {
     if (ws.empty()) return {};
     int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
     std::string utf8(len, '\0');
     WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), utf8.data(), len, nullptr, nullptr);
     return utf8;
+}
+
+static std::string pathToUtf8(const std::filesystem::path& p) {
+    return wideToUtf8(p.wstring());
 }
 
 static struct WsaInit {
@@ -53,6 +57,18 @@ static struct WsaInit {
 } g_wsaInit;
 
 static std::string sanitizeAdbOutput(std::string text);
+
+static std::string lastWin32ErrorText() {
+    DWORD error = GetLastError();
+    wchar_t* message = nullptr;
+    FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, error, 0, reinterpret_cast<LPWSTR>(&message), 0, nullptr);
+    std::string result = message ? wideToUtf8(message) :
+        "Windows error " + std::to_string(error);
+    if (message) LocalFree(message);
+    while (!result.empty() && (result.back() == '\r' || result.back() == '\n' || result.back() == '.')) result.pop_back();
+    return result;
+}
 
 DeviceClient::DeviceClient() {
     // Don't call findAdb() here - it runs a process which blocks
@@ -68,261 +84,101 @@ bool DeviceClient::findAdb() {
     auto tryPath = [&](const std::filesystem::path& p) -> bool {
         std::error_code ec;
         if (std::filesystem::is_regular_file(p, ec)) {
-            m_adbPath = p.string();
+            m_adbPath = pathToUtf8(p);
             return true;
         }
         return false;
     };
 
-    if (!m_adbPath.empty() && tryPath(std::filesystem::path(m_adbPath))) return true;
+    if (!m_adbPath.empty() && tryPath(toFsPath(m_adbPath))) return true;
     m_adbPath.clear();
 
     // Check bundled ADB first.
-    char exePath[MAX_PATH];
-    DWORD exePathLen = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-    if (exePathLen > 0 && exePathLen < MAX_PATH) {
+    wchar_t exePath[32768];
+    DWORD exePathLen = GetModuleFileNameW(nullptr, exePath, 32768);
+    if (exePathLen > 0 && exePathLen < 32768) {
         std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
         if (tryPath(exeDir / "platform-tools" / "adb.exe")) return true;
         if (tryPath(exeDir / "adb.exe")) return true;
     }
 
     // SDK paths
-    if (const char* la = std::getenv("LOCALAPPDATA"))
+    if (const wchar_t* la = _wgetenv(L"LOCALAPPDATA"))
         if (tryPath(std::filesystem::path(la) / "Android" / "Sdk" / "platform-tools" / "adb.exe")) return true;
-    if (const char* ah = std::getenv("ANDROID_HOME"))
+    if (const wchar_t* ah = _wgetenv(L"ANDROID_HOME"))
         if (tryPath(std::filesystem::path(ah) / "platform-tools" / "adb.exe")) return true;
-    if (const char* sr = std::getenv("ANDROID_SDK_ROOT"))
+    if (const wchar_t* sr = _wgetenv(L"ANDROID_SDK_ROOT"))
         if (tryPath(std::filesystem::path(sr) / "platform-tools" / "adb.exe")) return true;
 
-    std::string result = runProcess("where adb.exe");
-    if (!result.empty()) {
-        auto pos = result.find('\n');
-        std::string p = result.substr(0, pos);
-        while (!p.empty() && (p.back() == '\r' || p.back() == '\n' || p.back() == ' ')) p.pop_back();
-        if (tryPath(std::filesystem::path(p))) return true;
-    }
+    wchar_t searchPath[32768];
+    DWORD searchLength = SearchPathW(nullptr, L"adb.exe", nullptr, 32768, searchPath, nullptr);
+    if (searchLength > 0 && searchLength < 32768 && tryPath(searchPath)) return true;
     return false;
 }
 
 std::string DeviceClient::runProcess(const std::string& command) {
-    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
-    HANDLE hRead, hWrite;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return "";
-    STARTUPINFOA si{}; si.cb = sizeof(si);
-    si.hStdOutput = hWrite; si.hStdError = hWrite;
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi{};
-    std::string cmd = command;
-    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        CloseHandle(hRead); CloseHandle(hWrite); return "";
-    }
-    CloseHandle(hWrite);
-    std::string output; char buf[4096]; DWORD n;
-    while (ReadFile(hRead, buf, sizeof(buf)-1, &n, nullptr) && n > 0) { buf[n] = 0; output += buf; }
-    CloseHandle(hRead);
-    WaitForSingleObject(pi.hProcess, 30000);
-    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    return output;
-}
-
-static std::string lastWin32ErrorText() {
-    DWORD err = GetLastError();
-    if (err == 0) return "Windows process error";
-    char* msg = nullptr;
-    FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                   nullptr, err, 0, (LPSTR)&msg, 0, nullptr);
-    std::string out = msg ? msg : "Windows process error";
-    if (msg) LocalFree(msg);
-    while (!out.empty() && (out.back() == '\r' || out.back() == '\n' || out.back() == '.')) out.pop_back();
-    return out;
+    ProcessOptions options;
+    options.commandLine = toWide(command);
+    options.shouldCancel = [this]() { return m_cancelCommands.load(); };
+    auto result = runChildProcess(options);
+    if (!result.succeeded()) return "error: Command failed. " + result.diagnostics();
+    return result.standardOutput + result.standardError;
 }
 
 bool DeviceClient::runProcessToFile(const std::string& command, const std::string& outputPath, std::string& output,
                                     uint32_t timeoutMs, ProgressCallback progress, uint64_t totalBytes) {
-    output.clear();
-    LOG_INFO("Process", "Streaming command output to file: " + outputPath);
-    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
-    HANDLE hRead = nullptr, hWrite = nullptr;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
-        output = lastWin32ErrorText();
-        LOG_ERROR("Process", "CreatePipe failed: " + output);
-        return false;
-    }
-    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
-
-    HANDLE hErrRead = nullptr, hErrWrite = nullptr;
-    if (!CreatePipe(&hErrRead, &hErrWrite, &sa, 0)) {
-        output = lastWin32ErrorText();
-        LOG_ERROR("Process", "CreatePipe stderr failed: " + output);
-        CloseHandle(hRead); CloseHandle(hWrite);
-        return false;
-    }
-    SetHandleInformation(hErrRead, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOA si{}; si.cb = sizeof(si);
-    si.hStdOutput = hWrite;
-    si.hStdError = hErrWrite;
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi{};
-    std::string cmd = command;
-    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        output = lastWin32ErrorText();
-        LOG_ERROR("Process", "CreateProcess failed: " + output);
-        CloseHandle(hRead); CloseHandle(hWrite); CloseHandle(hErrRead); CloseHandle(hErrWrite);
-        return false;
-    }
-    CloseHandle(hWrite);
-    CloseHandle(hErrWrite);
-
-    HANDLE hOut = CreateFileW(toWide(outputPath).c_str(), GENERIC_WRITE, 0, nullptr,
-                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hOut == INVALID_HANDLE_VALUE) {
-        output = "Could not create output file: " + outputPath;
-        LOG_ERROR("Process", output);
-        TerminateProcess(pi.hProcess, 1);
-        CloseHandle(hRead); CloseHandle(hErrRead); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-        return false;
-    }
-
-    std::string errSample;
-    std::vector<char> buf(1024 * 1024);
-    DWORD n = 0;
-    uint64_t transferred = 0;
-    while (ReadFile(hRead, buf.data(), (DWORD)buf.size(), &n, nullptr) && n > 0) {
-        DWORD written = 0;
-        if (!WriteFile(hOut, buf.data(), n, &written, nullptr) || written != n) {
-            output = "Could not write output file: " + outputPath;
-            LOG_ERROR("Process", output);
-            TerminateProcess(pi.hProcess, 1);
-            break;
-        }
-        transferred += written;
-        if (progress && !progress(transferred, totalBytes)) {
-            output = "Operation cancelled.";
-            TerminateProcess(pi.hProcess, 1);
-            break;
-        }
-    }
-    CloseHandle(hOut);
-    CloseHandle(hRead);
-
-    char errBuf[4096];
-    DWORD errN = 0;
-    while (ReadFile(hErrRead, errBuf, sizeof(errBuf), &errN, nullptr) && errN > 0) {
-        if (errSample.size() < 8192) {
-            size_t take = std::min<size_t>(errN, 8192 - errSample.size());
-            errSample.append(errBuf, errBuf + take);
-        }
-    }
-    CloseHandle(hErrRead);
-
-    DWORD wait = WaitForSingleObject(pi.hProcess, timeoutMs ? timeoutMs : INFINITE);
-    DWORD exitCode = 1;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    if (wait == WAIT_TIMEOUT) {
-        TerminateProcess(pi.hProcess, 1);
-        output = "Command timed out.";
-        LOG_ERROR("Process", "Streaming command timed out: " + outputPath);
-        exitCode = 1;
-    } else if (exitCode != 0 && output.empty()) {
-        output = errSample.empty() ? ("Command failed with exit code " + std::to_string(exitCode)) : errSample;
-    }
-    if (exitCode != 0) LOG_ERROR("Process", "Streaming command failed for " + outputPath + ": " + sanitizeAdbOutput(output));
-    else LOG_INFO("Process", "Streaming command completed: " + outputPath);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return exitCode == 0;
+    ProcessOptions options;
+    options.commandLine = toWide(command);
+    options.outputPath = toWide(outputPath);
+    options.timeoutMs = timeoutMs ? timeoutMs : 30 * 60 * 1000;
+    options.shouldCancel = [this]() { return m_cancelCommands.load(); };
+    if (progress) options.progress = [progress, totalBytes](uint64_t bytes) { return progress(bytes, totalBytes); };
+    auto result = runChildProcess(options);
+    output = result.diagnostics();
+    if (!result.succeeded()) LOG_ERROR("Process", "Streaming command failed: " + sanitizeAdbOutput(output));
+    return result.succeeded();
 }
 
 bool DeviceClient::runProcessFromFile(const std::string& command, const std::string& inputPath, std::string& output,
                                       uint32_t timeoutMs) {
-    output.clear();
-    SECURITY_ATTRIBUTES sa{}; sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
-    HANDLE hChildStdoutRd = nullptr, hChildStdoutWr = nullptr;
-    if (!CreatePipe(&hChildStdoutRd, &hChildStdoutWr, &sa, 0)) {
-        output = lastWin32ErrorText();
-        return false;
-    }
-    SetHandleInformation(hChildStdoutRd, HANDLE_FLAG_INHERIT, 0);
-
-    HANDLE hInput = CreateFileW(toWide(inputPath).c_str(), GENERIC_READ, FILE_SHARE_READ, &sa,
-                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hInput == INVALID_HANDLE_VALUE) {
-        output = "Could not open input file: " + inputPath;
-        CloseHandle(hChildStdoutRd); CloseHandle(hChildStdoutWr);
-        return false;
-    }
-
-    STARTUPINFOA si{}; si.cb = sizeof(si);
-    si.hStdInput = hInput;
-    si.hStdOutput = hChildStdoutWr;
-    si.hStdError = hChildStdoutWr;
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi{};
-    std::string cmd = command;
-    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        output = lastWin32ErrorText();
-        CloseHandle(hInput); CloseHandle(hChildStdoutRd); CloseHandle(hChildStdoutWr);
-        return false;
-    }
-    CloseHandle(hInput);
-    CloseHandle(hChildStdoutWr);
-
-    char buf[4096];
-    DWORD n = 0;
-    while (ReadFile(hChildStdoutRd, buf, sizeof(buf) - 1, &n, nullptr) && n > 0) {
-        buf[n] = 0;
-        output += buf;
-        if (output.size() > 32768) output.erase(0, output.size() - 32768);
-    }
-    CloseHandle(hChildStdoutRd);
-
-    DWORD wait = WaitForSingleObject(pi.hProcess, timeoutMs ? timeoutMs : INFINITE);
-    DWORD exitCode = 1;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    if (wait == WAIT_TIMEOUT) {
-        TerminateProcess(pi.hProcess, 1);
-        output += "\nCommand timed out.";
-        exitCode = 1;
-    }
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return exitCode == 0;
+    ProcessOptions options;
+    options.commandLine = toWide(command);
+    options.inputPath = toWide(inputPath);
+    options.timeoutMs = timeoutMs ? timeoutMs : 30 * 60 * 1000;
+    options.shouldCancel = [this]() { return m_cancelCommands.load(); };
+    auto result = runChildProcess(options);
+    output = result.succeeded() ? result.standardOutput + result.standardError : result.diagnostics();
+    return result.succeeded();
 }
 
-std::string DeviceClient::runAdbCommand(const std::string& args) {
-    LOG_DEBUG("ADB", "$ adb " + args);
-    std::string result = runProcess("\"" + m_adbPath + "\" " + args);
-    std::string trimmed = result;
-    while (!trimmed.empty() && (trimmed.back() == '\r' || trimmed.back() == '\n')) trimmed.pop_back();
-    if (trimmed.size() > 200) trimmed = trimmed.substr(0, 200) + "...";
-    if (!trimmed.empty()) LOG_DEBUG("ADB", "  -> " + trimmed);
+ProcessResult DeviceClient::runAdbCommandResult(const std::string& args, uint32_t timeoutMs,
+                                               std::function<bool()> shouldCancel) {
+    const bool pairing = args.starts_with("pair ");
+    LOG_DEBUG("ADB", "$ adb " + (pairing ? std::string("pair [redacted]") : args));
+    ProcessOptions options;
+    options.commandLine = toWide("\"" + m_adbPath + "\" " + args);
+    options.timeoutMs = timeoutMs;
+    options.shouldCancel = [this, shouldCancel]() {
+        return m_cancelCommands.load() || (shouldCancel && shouldCancel());
+    };
+    auto result = runChildProcess(options);
+    std::string logged = result.succeeded() ? result.standardOutput + result.standardError : result.diagnostics();
+    while (!logged.empty() && (logged.back() == '\r' || logged.back() == '\n')) logged.pop_back();
+    if (logged.size() > 200) logged = logged.substr(0, 200) + "...";
+    if (!logged.empty() && !pairing) LOG_DEBUG("ADB", "  -> " + logged);
     return result;
 }
 
+std::string DeviceClient::runAdbCommand(const std::string& args, uint32_t timeoutMs) {
+    auto result = runAdbCommandResult(args, timeoutMs);
+    if (!result.succeeded()) return "error: Command failed. " + result.diagnostics();
+    if (result.outputTruncated) return "error: Command output exceeded the capture limit.";
+    return result.standardOutput + result.standardError;
+}
+
 std::vector<DeviceInfo> DeviceClient::getDevices() {
-    std::vector<DeviceInfo> devices;
-    if (m_adbPath.empty()) return devices;
-    std::string output = runAdbCommand("devices -l");
-    std::istringstream stream(output);
-    std::string line;
-    std::getline(stream, line); // skip header
-    while (std::getline(stream, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-        if (line.empty()) continue;
-        DeviceInfo d;
-        std::istringstream ls(line);
-        ls >> d.serial >> d.state;
-        auto mp = line.find("model:");
-        if (mp != std::string::npos) {
-            auto end = line.find(' ', mp);
-            d.model = line.substr(mp + 6, end - mp - 6);
-        } else d.model = d.serial;
-        if (!d.serial.empty()) devices.push_back(std::move(d));
-    }
-    return devices;
+    if (m_adbPath.empty()) return {};
+    return parseAdbDevices(runAdbCommand("devices -l"));
 }
 
 static bool adbProtoSend(SOCKET sock, const std::string& cmd) {
@@ -341,8 +197,13 @@ static bool adbProtoSend(SOCKET sock, const std::string& cmd) {
 
 static bool adbProtoRecvStatus(SOCKET sock) {
     char status[4];
-    int n = recv(sock, status, 4, 0);
-    return n == 4 && memcmp(status, "OKAY", 4) == 0;
+    int total = 0;
+    while (total < 4) {
+        int n = recv(sock, status + total, 4 - total, 0);
+        if (n <= 0) return false;
+        total += n;
+    }
+    return memcmp(status, "OKAY", 4) == 0;
 }
 
 static std::string adbProtoRecvPayload(SOCKET sock) {
@@ -351,17 +212,28 @@ static std::string adbProtoRecvPayload(SOCKET sock) {
     int total = 0;
     while (total < 4) {
         int n = recv(sock, lenBuf + total, 4 - total, 0);
-        if (n <= 0) return "";
+        if (n <= 0) {
+            // A partial frame cannot be resumed as a new length header.
+            if (n == 0 || total > 0) WSASetLastError(WSAECONNRESET);
+            return "";
+        }
         total += n;
     }
     unsigned len = 0;
-    sscanf(lenBuf, "%04x", &len);
+    auto [end, error] = std::from_chars(lenBuf, lenBuf + 4, len, 16);
+    if (error != std::errc{} || end != lenBuf + 4) {
+        WSASetLastError(WSAEPROTONOSUPPORT);
+        return "";
+    }
     if (len == 0) return " "; // empty device list (return non-empty to distinguish from error)
     std::string payload(len, '\0');
     total = 0;
     while ((unsigned)total < len) {
         int n = recv(sock, &payload[total], len - total, 0);
-        if (n <= 0) return "";
+        if (n <= 0) {
+            WSASetLastError(WSAECONNRESET);
+            return "";
+        }
         total += n;
     }
     return payload;
@@ -370,6 +242,9 @@ static std::string adbProtoRecvPayload(SOCKET sock) {
 uintptr_t DeviceClient::openTrackDevices() {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET) return (uintptr_t)INVALID_SOCKET;
+    DWORD handshakeTimeout = 3000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&handshakeTimeout, sizeof(handshakeTimeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&handshakeTimeout, sizeof(handshakeTimeout));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -418,23 +293,7 @@ std::vector<DeviceInfo> DeviceClient::readTrackDevicesUpdate(uintptr_t sockHandl
 
     if (receivedUpdate) *receivedUpdate = true;
 
-    // Parse lines: "serial\tstate\tattr1:val1 attr2:val2..."
-    std::istringstream stream(payload);
-    std::string line;
-    while (std::getline(stream, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-        if (line.empty()) continue;
-        DeviceInfo d;
-        std::istringstream ls(line);
-        ls >> d.serial >> d.state;
-        auto mp = line.find("model:");
-        if (mp != std::string::npos) {
-            auto end = line.find(' ', mp);
-            d.model = line.substr(mp + 6, end - mp - 6);
-        } else d.model = d.serial;
-        if (!d.serial.empty()) devices.push_back(std::move(d));
-    }
-    return devices;
+    return parseAdbDevices(payload);
 }
 
 void DeviceClient::closeTrackDevices(uintptr_t sock) {
@@ -836,7 +695,7 @@ bool DeviceClient::installApk(const std::string& serial, const std::string& apkP
     if (grantRuntimePermissions) args += " -g";
     if (allowDowngrade) args += " -d";
     args += " " + quoteCmdArg(apkPath);
-    output = runAdbCommand(args);
+    output = runAdbCommand(args, 10 * 60 * 1000);
     return isAdbSuccess(output);
 }
 
@@ -1581,7 +1440,7 @@ bool DeviceClient::restoreAppBackup(const std::string& serial, const std::string
             std::filesystem::path p = dir / apk.value("name", "");
             args += " " + quoteCmdArg(pathToUtf8(p));
         }
-        std::string installOut = runAdbCommand(args);
+        std::string installOut = runAdbCommand(args, 10 * 60 * 1000);
         output += installOut + "\n";
         if (!isAdbSuccess(installOut)) return false;
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -1624,7 +1483,8 @@ bool DeviceClient::restoreAppBackup(const std::string& serial, const std::string
             }
             emitProgress(std::string(label) + ": extracting archive", stageIndex, archiveSize, archiveSize);
         } else {
-            std::string pushOut = runAdbCommand("-s " + serial + " push " + quoteCmdArg(pathToUtf8(archive)) + " " + remote);
+            std::string pushOut = runAdbCommand("-s " + serial + " push " + quoteCmdArg(pathToUtf8(archive)) + " " + remote,
+                30 * 60 * 1000);
             output += pushOut + "\n";
             if (pushOut.find("error") != std::string::npos || pushOut.find("failed") != std::string::npos) return false;
             std::string cmd =
@@ -1632,7 +1492,7 @@ bool DeviceClient::restoreAppBackup(const std::string& serial, const std::string
                 " && rm -rf " + target + "/*" +
                 " && tar -xpf " + remote + " -C " + target +
                 " && rm -f " + remote;
-            std::string out = runAdbCommand("-s " + serial + " shell su -c " + quoteCmdArg(cmd));
+            std::string out = runAdbCommand("-s " + serial + " shell su -c " + quoteCmdArg(cmd), 30 * 60 * 1000);
             output += out + "\n";
             std::string low = out;
             std::transform(low.begin(), low.end(), low.begin(), ::tolower);
@@ -1645,7 +1505,7 @@ bool DeviceClient::restoreAppBackup(const std::string& serial, const std::string
             if (!owner.empty()) {
                 std::string fix = "chown -R " + owner + " " + target + " ; restorecon -RF " + target + " 2>/dev/null";
                 if (!context.empty() && context != "?") fix += " ; chcon -R -h " + context + " " + target + " 2>/dev/null";
-                output += runAdbCommand("-s " + serial + " shell su -c " + quoteCmdArg(fix)) + "\n";
+                output += runAdbCommand("-s " + serial + " shell su -c " + quoteCmdArg(fix), 30 * 60 * 1000) + "\n";
             }
         }
         emitProgress(std::string(label) + ": restored", stageIndex, archiveSize, archiveSize);
@@ -1756,14 +1616,9 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
             runAdbCommand("-s " + serial + " shell chmod 755 /data/local/tmp/afm-server");
             runAdbCommand("-s " + serial + " shell rm -f /data/local/tmp/afm-server.log");
             std::string launchInner = serverLaunchCommand(launchPort, m_useRoot);
-            std::string cmd = "\"" + m_adbPath + "\" -s " + serial +
-                " shell \"" + launchInner + "\"";
-            std::string cmdBuf = cmd;
-            STARTUPINFOA si2{}; si2.cb = sizeof(si2);
-            si2.dwFlags = STARTF_USESHOWWINDOW; si2.wShowWindow = SW_HIDE;
-            PROCESS_INFORMATION pi2{};
-            CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si2, &pi2);
-            if (pi2.hProcess) { WaitForSingleObject(pi2.hProcess, 3000); CloseHandle(pi2.hProcess); CloseHandle(pi2.hThread); }
+            auto launch = runAdbCommandResult("-s " + serial + " shell \"" + launchInner + "\"", 5000);
+            if (launch.cancelled) return false;
+            if (!launch.succeeded()) LOG_WARN("Server", "Helper launch: " + launch.diagnostics());
             std::this_thread::sleep_for(std::chrono::milliseconds(1500));
             LOG_INFO("Server", "Fresh server started after reconnect");
         }
@@ -1838,23 +1693,11 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
     runAdbCommand("-s " + serial + " shell rm -f /data/local/tmp/afm-server.log");
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    // Start server in background - use runProcess directly to avoid ADB shell hanging
+    // Bound the launcher separately from the helper readiness checks.
     std::string launchInner = serverLaunchCommand(launchPort, m_useRoot);
-    std::string cmd = "\"" + m_adbPath + "\" -s " + serial +
-        " shell \"" + launchInner + "\"";
-    LOG_DEBUG("Server", "Launch cmd: " + cmd);
-    STARTUPINFOA si{}; si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi{};
-    std::string cmdBuf = cmd; // mutable copy for CreateProcessA
-    BOOL cpOk = CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    if (!cpOk) { LOG_ERROR("Server", "CreateProcess failed: " + std::to_string(GetLastError())); }
-    if (pi.hProcess) {
-        DWORD waitResult = WaitForSingleObject(pi.hProcess, 3000);
-        DWORD exitCode = 0; GetExitCodeProcess(pi.hProcess, &exitCode);
-        LOG_INFO("Server", "Server launch process wait=" + std::to_string(waitResult) + " exit=" + std::to_string(exitCode));
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    }
+    auto launch = runAdbCommandResult("-s " + serial + " shell \"" + launchInner + "\"", 5000);
+    if (launch.cancelled) return false;
+    if (!launch.succeeded()) LOG_WARN("Server", "Helper launch: " + launch.diagnostics());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
@@ -1908,14 +1751,10 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
                     LOG_WARN("Server", "Server not running - restarting...");
                     m_statusText = "Server not running - restarting...";
                     runAdbCommand("-s " + serial + " shell rm -f /data/local/tmp/afm-server.log");
-                    std::string restartCmd = "\"" + m_adbPath + "\" -s " + serial +
-                        " shell \"" + serverLaunchCommand(launchPort, m_useRoot) + "\"";
-                    std::string restartBuf = restartCmd;
-                    STARTUPINFOA rsi{}; rsi.cb = sizeof(rsi);
-                    rsi.dwFlags = STARTF_USESHOWWINDOW; rsi.wShowWindow = SW_HIDE;
-                    PROCESS_INFORMATION rpi{};
-                    CreateProcessA(nullptr, restartBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &rsi, &rpi);
-                    if (rpi.hProcess) { WaitForSingleObject(rpi.hProcess, 3000); CloseHandle(rpi.hProcess); CloseHandle(rpi.hThread); }
+                    auto restart = runAdbCommandResult("-s " + serial + " shell \"" +
+                        serverLaunchCommand(launchPort, m_useRoot) + "\"", 5000);
+                    if (restart.cancelled) return false;
+                    if (!restart.succeeded()) LOG_WARN("Server", "Helper restart: " + restart.diagnostics());
                     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
                 }
             }

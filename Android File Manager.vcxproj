@@ -163,6 +163,8 @@
     <ClCompile Include="src\app.cpp" />
     <ClCompile Include="src\backup_archive.cpp" />
     <ClCompile Include="src\device_client.cpp" />
+    <ClCompile Include="src\adb_discovery.cpp" />
+    <ClCompile Include="src\process_runner.cpp" />
     <ClCompile Include="src\mcraw_local.cpp" />
     <ClCompile Include="src\mcraw_projfs.cpp" />
     <ClCompile Include="src\device_dokan.cpp" />
@@ -191,6 +193,9 @@
     <ClInclude Include="src\app.h" />
     <ClInclude Include="src\backup_archive.h" />
     <ClInclude Include="src\device_client.h" />
+    <ClInclude Include="src\adb_discovery.h" />
+    <ClInclude Include="src\process_runner.h" />
+    <ClInclude Include="src\transfer_coverage.h" />
     <ClInclude Include="src\protocol.h" />
     <ClInclude Include="src\mcraw_local.h" />
     <ClInclude Include="src\mcraw_projfs.h" />

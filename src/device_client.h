@@ -1,5 +1,7 @@
 #pragma once
 #include "protocol.h"
+#include "adb_discovery.h"
+#include "process_runner.h"
 #include <string>
 #include <vector>
 #include <functional>
@@ -73,12 +75,6 @@ struct DeviceFileEntry {
 
     bool isDirectory() const { return type == 1; }
     bool isSymlink() const { return type == 2; }
-};
-
-struct DeviceInfo {
-    std::string serial;
-    std::string model;
-    std::string state;
 };
 
 struct InstalledAppEntry {
@@ -271,7 +267,11 @@ public:
     void flushStaleData(); // drain any leftover data from TCP buffer after cancelled transfer
     bool tryEnableUsbTethering(const std::string& serial = ""); // attempt to enable tethering via adb shell
     std::string detectDeviceIp(const std::string& serial);
-    std::string runAdbCommand(const std::string& args);
+    std::string runAdbCommand(const std::string& args, uint32_t timeoutMs = 30000);
+    ProcessResult runAdbCommandResult(const std::string& args, uint32_t timeoutMs = 30000,
+                                      std::function<bool()> shouldCancel = {});
+    void cancelCommands() { m_cancelCommands = true; }
+    void resetCommandCancellation() { m_cancelCommands = false; }
 
     std::string getServerBinaryPath();
 
@@ -313,6 +313,7 @@ private:
                     uint32_t recvTimeoutMs = 0);
 
     std::string m_adbPath;
+    std::atomic<bool> m_cancelCommands{false};
     std::string m_serial;
     uintptr_t m_socket = ~(uintptr_t)0; // INVALID_SOCKET
     bool m_connected = false;

@@ -169,6 +169,7 @@ struct TransferBatch {
     std::atomic<bool> disconnected{false};  // set when connection lost mid-transfer
     std::atomic<bool> waitingForUserRetry{false}; // waiting for user to click retry or cancel
     std::atomic<bool> userRetryRequested{false};
+    std::atomic<uint64_t> retryGeneration{0};
     std::string errorMessage;
 
     // File conflict resolution
@@ -393,7 +394,7 @@ struct AppPreferences {
     bool autoDismissTransfer = false; // auto-close transfer overlay on success
     bool wifiAutoConnect = false;    // auto-setup WiFi ADB when USB connects (off until wizard completes)
     bool confirmOnClose = true;      // show yes/no dialog when pressing X (default ON)
-    bool killAdbOnClose = true;      // kill ADB server when app exits (default ON)
+    bool killAdbOnClose = false;
     std::vector<SavedWifiDevice> savedWifiDevices;
     bool enableMultiNic = false;
     std::vector<NicBinding> multiNicBindings;
@@ -465,6 +466,11 @@ private:
         bool notificationIsError = false;
         bool hasStatus = false;
         std::string status;
+        bool hasWizardProbe = false;
+        uint64_t wizardProbeGeneration = 0;
+        std::string wizardProbeSerial;
+        std::string wizardProbeIp;
+        std::string wizardProbeError;
         bool setBackupApps = false;
         std::vector<BackupManagerAppRow> backupApps;
         bool markBackupAppsFresh = false;
@@ -522,6 +528,7 @@ private:
     void showNotification(const std::string& title, const std::string& message, bool isError);
     void postUiMessage(UiMessage message);
     void drainUiMessages();
+    void requestWizardWifiProbe();
     void renderApkInstallDialog();
     void renderBackupManagerWindow();
     void registerApkAssociation();
@@ -805,6 +812,9 @@ private:
     std::string m_wizardWifiIp;
     std::string m_wizardSerial;     // which device the wizard is operating on
     bool m_wizardBusy = false;
+    std::atomic<uint64_t> m_wizardProbeGeneration{0};
+    bool m_wizardProbeBusy = false;
+    std::string m_wizardProbeError;
     char m_pairingIp[64] = {};
     char m_pairingCode[16] = {};
     char m_connectIp[64] = {};  // connect IP:port (different from pairing port)

@@ -4,6 +4,7 @@
 #include "mcraw_local.h"
 #include "mcraw_projfs.h"
 #include "device_dokan.h"
+#include "transfer_coverage.h"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
@@ -1021,11 +1022,8 @@ void App::performAndroidDragOut(FilePanel* src) {
     worker.detach();
 }
 
-// Check if a serial is a WiFi ADB connection (IP:port format like "192.168.x.x:5555")
 static bool isWifiSerial(const std::string& serial) {
-    auto colon = serial.rfind(':');
-    if (colon == std::string::npos || colon == 0) return false;
-    return serial.substr(0, colon).find('.') != std::string::npos;
+    return isWirelessAdbSerial(serial);
 }
 
 static bool endsWithCI(const std::string& s, const std::string& suffix) {
@@ -1401,6 +1399,9 @@ App::App() {
 App::~App() {
     m_shutdownTransfer = true;
     m_shutdownPoll = true;
+    for (auto& device : m_deviceSlots) device.cancelCommands();
+    m_secondaryChannel.cancelCommands();
+    m_slot1WifiChannel.cancelCommands();
     m_batchCV.notify_all();
     m_asyncCV.notify_all();
     if (m_batchThread.joinable()) m_batchThread.join();
@@ -1414,17 +1415,21 @@ App::~App() {
         m_wakeLockProcess = nullptr;
     }
 
-    // Stop the device server first (cleans up ADB forwarding, kills afm-server on device).
-    // This must happen before kill-server, because any adb command auto-starts the daemon.
-    m_device.stopServer();
-
     // Unmount all mounts
     DeviceMountManager::instance(0).unmount();
     DeviceMountManager::instance(1).unmount();
     McrawMountManager::instance().unmountAll();
 
-    // Kill ADB server last — after all ADB commands are done.
-    // DeviceClient::~DeviceClient() calls stopServer() again but it's a no-op (serial is cleared).
+    // Finish every client before the optional shared ADB shutdown.
+    m_extraChannels.clear();
+    m_nicChannels.clear();
+    m_secondaryChannel.disconnectTcp();
+    m_secondaryChannel.setOwnsServer(false);
+    m_slot1WifiChannel.disconnectTcp();
+    for (auto& device : m_deviceSlots) {
+        device.resetCommandCancellation();
+        device.stopServer();
+    }
     if (m_prefs.killAdbOnClose) {
         m_device.runAdbCommand("kill-server");
     }
@@ -1487,6 +1492,13 @@ void App::drainUiMessages() {
     }
 
     for (auto& message : messages) {
+        if (message.hasWizardProbe && m_showWifiWizard && m_wizardStep == 1 &&
+            message.wizardProbeGeneration == m_wizardProbeGeneration.load() &&
+            message.wizardProbeSerial == m_wizardSerial) {
+            m_wizardProbeBusy = false;
+            m_wizardWifiIp = std::move(message.wizardProbeIp);
+            m_wizardProbeError = std::move(message.wizardProbeError);
+        }
         if (message.setBackupApps) {
             m_backupManagerApps = std::move(message.backupApps);
             m_backupManagerAppSelectionAnchor = -1;
@@ -3876,8 +3888,8 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
 
     // The connection manager is a persistent pane mode. It is also used as the
     // setup fallback when an Android pane has no connected device.
-    bool connectionSetupActive = m_primaryReconnectActive || m_wifiTransitionActive || m_device.isConnecting() ||
-        m_deviceSlots[1].isConnecting();
+    bool connectionSetupActive = deviceFor(panel).isConnecting() ||
+        (panel.deviceSlot == 0 && (m_primaryReconnectActive || m_wifiTransitionActive));
     if (panel.isConnections || (panel.isAndroid &&
         (!deviceFor(panel).isServerRunning() || connectionSetupActive))) {
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 1.0f);
@@ -3910,7 +3922,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         ImGui::Spacing();
 
         if (connectionSetupActive) {
-            std::string status = m_device.statusText();
+            std::string status = deviceFor(panel).statusText();
             if (status.empty()) status = "Preparing USB and WiFi connections...";
             float progressCardWidth = std::min(contentW, availW);
 
@@ -5266,7 +5278,11 @@ void App::renderTransferOverlay() {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.20f, 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.50f, 0.28f, 1));
         if (modernButton("Force Retry Now", ImVec2(140, 0))) {
-            // Signal the reconnection loop to try immediately
+            {
+                std::lock_guard<std::mutex> lk(m_batchMutex);
+                ++batch->retryGeneration;
+            }
+            m_batchCV.notify_all();
             batch->errorMessage = "User requested retry...";
         }
         ImGui::PopStyleColor(2);
@@ -8838,8 +8854,46 @@ void App::renderWifiBanner() {
     ImGui::PopStyleColor();
 }
 
+void App::requestWizardWifiProbe() {
+    const auto generation = ++m_wizardProbeGeneration;
+    const std::string serial = m_wizardSerial;
+    const std::string adbPath = m_device.getAdbPath();
+    m_wizardProbeBusy = true;
+    m_wizardWifiIp.clear();
+    m_wizardProbeError.clear();
+    postAsync("Checking phone WiFi...", [this, generation, serial, adbPath]() {
+        DeviceClient probe;
+        probe.setOwnsServer(false);
+        probe.setAdbPath(adbPath);
+        auto result = probe.runAdbCommandResult("-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"",
+            10000, [this, generation]() { return m_shutdownPoll || m_wizardProbeGeneration.load() != generation; });
+        UiMessage message;
+        message.hasWizardProbe = true;
+        message.wizardProbeGeneration = generation;
+        message.wizardProbeSerial = serial;
+        if (result.succeeded()) {
+            const auto& output = result.standardOutput;
+            auto inet = output.find("inet ");
+            if (inet != std::string::npos) {
+                auto start = inet + 5;
+                auto slash = output.find('/', start);
+                if (slash != std::string::npos) message.wizardProbeIp = output.substr(start, slash - start);
+            }
+        } else if (!result.cancelled) {
+            message.wizardProbeError = "Could not check this phone. " + result.diagnostics();
+        }
+        postUiMessage(std::move(message));
+    });
+}
+
 void App::renderWifiWizard() {
-    if (!m_showWifiWizard) return;
+    if (!m_showWifiWizard) {
+        if (m_wizardProbeBusy) {
+            ++m_wizardProbeGeneration;
+            m_wizardProbeBusy = false;
+        }
+        return;
+    }
 
     ImGui::OpenPopup("WiFi Setup Wizard");
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
@@ -8886,7 +8940,10 @@ void App::renderWifiWizard() {
 
                 ImGui::Spacing();
                 if (!m_wizardSerial.empty()) {
-                    if (modernButton("Next", ImVec2(120, 0))) m_wizardStep = 1;
+                    if (modernButton("Next", ImVec2(120, 0))) {
+                        m_wizardStep = 1;
+                        requestWizardWifiProbe();
+                    }
                 } else {
                     ImGui::TextDisabled("Click a device above to select it.");
                 }
@@ -8913,17 +8970,9 @@ void App::renderWifiWizard() {
             ImGui::Spacing();
 
             std::string serial = m_wizardSerial;
-            std::string wlanOut = m_device.runAdbCommand("-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
-            m_wizardWifiIp.clear();
-            auto inetPos = wlanOut.find("inet ");
-            if (inetPos != std::string::npos) {
-                auto start = inetPos + 5;
-                auto slash = wlanOut.find('/', start);
-                if (slash != std::string::npos)
-                    m_wizardWifiIp = wlanOut.substr(start, slash - start);
-            }
-
-            if (!m_wizardWifiIp.empty()) {
+            if (m_wizardProbeBusy) {
+                ImGui::TextDisabled("Checking this phone's WiFi connection...");
+            } else if (!m_wizardWifiIp.empty()) {
                 ImGui::TextColored(ImVec4(0.3f, 1, 0.5f, 1), "WiFi connected: %s", m_wizardWifiIp.c_str());
                 ImGui::Spacing();
                 if (modernButton("Set Up Wireless Connection", ImVec2(250, 0))) {
@@ -8982,13 +9031,20 @@ void App::renderWifiWizard() {
                     });
                 }
             } else {
-                ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Phone is not connected to WiFi.");
-                ImGui::TextDisabled("Connect your phone to a WiFi network,\nthen click Check Again.");
+                if (!m_wizardProbeError.empty()) ImGui::TextWrapped("%s", m_wizardProbeError.c_str());
+                else {
+                    ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Phone is not connected to WiFi.");
+                    ImGui::TextDisabled("Connect your phone to a WiFi network,\nthen click Check Again.");
+                }
                 ImGui::Spacing();
-                if (modernButton("Check Again", ImVec2(120, 0))) {} // re-renders, re-checks
+                if (modernButton("Check Again", ImVec2(120, 0))) requestWizardWifiProbe();
             }
             ImGui::SameLine();
-            if (modernButton("Back", ImVec2(80, 0))) m_wizardStep = 0;
+            if (modernButton("Back", ImVec2(80, 0))) {
+                ++m_wizardProbeGeneration;
+                m_wizardProbeBusy = false;
+                m_wizardStep = 0;
+            }
         } else if (m_wizardStep == 2) {
             // Step 3: Setting up
             ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Step 3: Setting Up");
@@ -11979,12 +12035,17 @@ void App::devicePollLoop() {
             DWORD trackTimeout = 10000; // 10s — wake up periodically for health checks
             setsockopt((SOCKET)trackSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&trackTimeout, sizeof(trackTimeout));
 
+            AdbDeviceSnapshot snapshot;
             while (!m_shutdownPoll) {
                 bool receivedUpdate = false;
                 auto devices = m_device.readTrackDevicesUpdate(trackSock, &receivedUpdate);
                 int err = WSAGetLastError();
-                if (devices.empty() && (receivedUpdate || err == WSAETIMEDOUT)) {
-                    // Timeout or empty device list — run health checks with current state
+                if (receivedUpdate) {
+                    if (snapshot.update(devices)) processDeviceUpdate(devices);
+                    continue;
+                }
+                if (err == WSAETIMEDOUT) {
+                    // An idle stream still needs periodic connection health checks.
                     std::string curSerial;
                     {
                         std::lock_guard<std::mutex> lk(m_deviceMutex);
@@ -11995,10 +12056,6 @@ void App::devicePollLoop() {
                     if (curSerial.empty() && m_slotConnected[0] &&
                         m_device.isDirectConnection() && m_device.isServerRunning())
                         curSerial = m_slotSerial[0];
-                    // If err == 0, this was a real "all devices disconnected" event
-                    if (receivedUpdate && !m_lastDeviceSerial.empty()) {
-                        processDeviceUpdate({}); // process as empty device list
-                    }
                     if (m_device.isServerRunning() && !curSerial.empty() && !m_tetheringInProgress && !m_wifiTransitionActive) {
                         auto sinceLast = std::chrono::steady_clock::now() - m_lastTransferActivity;
                         if (!isBatchActive() && sinceLast >= std::chrono::seconds(15)) {
@@ -12121,25 +12178,6 @@ void App::devicePollLoop() {
                     break;
                 }
 
-                // Got a real device update — debounce by checking if the device set actually changed
-                {
-                    // Build a sorted set of "device"-state serials to detect actual changes
-                    std::vector<std::string> onlineSerials;
-                    for (auto& d : devices)
-                        if (d.state == "device") onlineSerials.push_back(d.serial);
-                    std::sort(onlineSerials.begin(), onlineSerials.end());
-
-                    static std::vector<std::string> lastOnlineSerials;
-                    if (onlineSerials == lastOnlineSerials) {
-                        // Same set of devices — skip redundant processing
-                        continue;
-                    }
-                    lastOnlineSerials = onlineSerials;
-
-                    std::string firstSerial = onlineSerials.empty() ? "" : onlineSerials[0];
-                    LOG_INFO("Poll", "track-devices: " + std::to_string(devices.size()) + " device(s), active serial: '" + firstSerial + "'");
-                }
-                processDeviceUpdate(devices);
             }
 
             m_device.closeTrackDevices(trackSock);
@@ -13020,6 +13058,20 @@ void App::processBatchQueue() {
         }
         if (!batch) continue;
 
+        auto waitForRetry = [&](std::chrono::milliseconds delay, uint64_t& seenGeneration) {
+            const auto deadline = std::chrono::steady_clock::now() + delay;
+            std::unique_lock<std::mutex> lk(m_batchMutex);
+            while (!m_shutdownTransfer && !batch->stopRequested.load() &&
+                   batch->retryGeneration.load() == seenGeneration) {
+                auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) break;
+                m_batchCV.wait_until(lk, std::min(deadline, now + std::chrono::milliseconds(100)));
+            }
+            seenGeneration = batch->retryGeneration.load();
+            return !m_shutdownTransfer && !batch->stopRequested.load();
+        };
+        uint64_t singleRetryGeneration = 0;
+
         // Single-device transfers use whichever panel is Android:
         // pulls read from the Android source slot, pushes write to the Android destination slot.
         int batchDeviceSlot = batch->isPull ? batch->srcDeviceSlot : batch->dstDeviceSlot;
@@ -13391,6 +13443,8 @@ void App::processBatchQueue() {
                 int retries = 0;    // how many times this block has been requeued after failure
             };
 
+            std::vector<bool> skippedFileIndices(batch->totalFiles(), false);
+            std::vector<bool> existingDestination(batch->totalFiles(), false);
             // --- File conflict check for parallel transfers ---
             for (int fi = 0; fi < batch->totalFiles() && !m_shutdownTransfer; fi++) {
                 if (batch->stopRequested.load()) break;
@@ -13406,6 +13460,7 @@ void App::processBatchQueue() {
                     destExists = (remoteSize > 0);
                 }
 
+                existingDestination[fi] = destExists;
                 if (destExists) {
                     ConflictAction action = batch->conflictAllDecision;
                     if (action == ConflictAction::None) {
@@ -13441,9 +13496,7 @@ void App::processBatchQueue() {
 
                     if (action == ConflictAction::Skip) {
                         batch->skippedFiles++;
-                        // Remove this file from the batch so it's not queued
-                        item.fileSize = 0;
-                        item.isDirectory = true; // mark as dir so workers skip it
+                        skippedFileIndices[fi] = true;
                         continue;
                     }
                 }
@@ -13451,7 +13504,12 @@ void App::processBatchQueue() {
             if (batch->stopRequested.load()) { batch->state = BatchState::Stopped; continue; }
 
             // Recalculate total after skips
-            { uint64_t newTotal = 0; for (auto& f : batch->files) newTotal += f.fileSize; batch->totalBytes = newTotal; }
+            {
+                uint64_t newTotal = 0;
+                for (int fi = 0; fi < batch->totalFiles(); ++fi)
+                    if (!skippedFileIndices[fi]) newTotal += batch->files[fi].fileSize;
+                batch->totalBytes = newTotal;
+            }
 
             // Build the work queue
             std::deque<WorkBlock> workQueue;
@@ -13459,10 +13517,28 @@ void App::processBatchQueue() {
             int blockIdCounter = 0;
 
             // Track per-file block completion for partial cleanup on cancel
-            std::vector<int> totalBlocksPerFile(batch->totalFiles(), 0);
-            std::vector<int> completedBlocksPerFile(batch->totalFiles(), 0);
-            std::vector<uint64_t> completedBytesPerFile(batch->totalFiles(), 0);
             std::set<int> completedFileIndices;
+
+            std::vector<TransferCoverage> coverage;
+            for (int fi = 0; fi < batch->totalFiles(); ++fi) {
+                coverage.emplace_back(batch->files[fi].isDirectory ? 0 : batch->files[fi].fileSize);
+                if (skippedFileIndices[fi]) coverage.back().skip();
+            }
+            auto failFile = [&](int fileIndex) {
+                bool firstFailure = false;
+                {
+                    std::lock_guard<std::mutex> lk(workMutex);
+                    firstFailure = !coverage[fileIndex].failed();
+                    coverage[fileIndex].fail();
+                    completedFileIndices.erase(fileIndex);
+                    std::erase_if(workQueue, [&](const WorkBlock& pending) { return pending.fileIndex == fileIndex; });
+                }
+                if (firstFailure) {
+                    ++batch->errorSkippedFiles;
+                    std::lock_guard<std::mutex> lk(batch->errorSkippedMutex);
+                    batch->errorSkippedNames.push_back(batch->files[fileIndex].displayName);
+                }
+            };
 
             // Pre-create output files for split files (both channels write via OVERLAPPED)
             struct SplitFileHandle {
@@ -13491,14 +13567,13 @@ void App::processBatchQueue() {
             schedulingChannels = std::max(1, schedulingChannels);
             for (int i = 0; i < batch->totalFiles(); i++) {
                 auto& item = batch->files[i];
+                if (skippedFileIndices[i]) continue;
                 if (item.isDirectory) {
                     // Directories: just create, no transfer
                     workQueue.push_back({i, 0, 0, true, blockIdCounter++});
-                    totalBlocksPerFile[i] = 1;
                 } else if (item.isMcrawVirtual || item.fileSize < 200 * MB) {
                     // Small files: transfer as whole file (pushFile/pullFile streaming)
                     workQueue.push_back({i, 0, item.fileSize, true, blockIdCounter++});
-                    totalBlocksPerFile[i] = 1;
                 } else {
                     // Large file: split into blocks (size scales with file size)
                     uint64_t remaining = item.fileSize;
@@ -13512,7 +13587,6 @@ void App::processBatchQueue() {
                         remaining -= blockLen;
                         blockCount++;
                     }
-                    totalBlocksPerFile[i] = blockCount;
                     if (batch->isPull) {
                         // Ensure parent directory exists before creating the split file
                         // (directory batch items haven't been processed by workers yet)
@@ -13647,6 +13721,7 @@ void App::processBatchQueue() {
                               bool preferUsb) {
                 auto chStart = std::chrono::steady_clock::now();
                 uint64_t chBytesCompleted = 0;
+                uint64_t retryGeneration = 0;
                 uint64_t lastSpeedBytes = 0;
                 auto lastSpeedTime = chStart;
                 // Capture original serial and whether this channel uses ADB forward at start,
@@ -13763,6 +13838,7 @@ void App::processBatchQueue() {
                         if (workQueue.empty()) break;
                         block = workQueue.front();
                         workQueue.pop_front();
+                        if (coverage[block.fileIndex].failed()) continue;
                         if (!block.isWholeFile && block.length > 0) {
                             auto& queuedItem = batch->files[block.fileIndex];
                             uint64_t assignLen = assignmentSliceFor(
@@ -13779,11 +13855,19 @@ void App::processBatchQueue() {
 
                     auto& item = batch->files[block.fileIndex];
                     if (item.isDirectory) {
-                        if (batch->isPull)
-                            try { std::filesystem::create_directories(item.destPath); } catch (...) {}
-                        else
-                            dev.createDirectory(item.destPath);
-                        ch.filesCompleted++;
+                        bool created = false;
+                        if (batch->isPull) {
+                            std::error_code error;
+                            std::filesystem::create_directories(toFsPath(item.destPath), error);
+                            created = !error;
+                        } else created = dev.createDirectory(item.destPath);
+                        if (!created) failFile(block.fileIndex);
+                        else {
+                            std::lock_guard<std::mutex> lk(workMutex);
+                            coverage[block.fileIndex].record(0, 0);
+                            completedFileIndices.insert(block.fileIndex);
+                            ch.filesCompleted++;
+                        }
                         continue;
                     }
 
@@ -13802,7 +13886,7 @@ void App::processBatchQueue() {
                         auto now = std::chrono::steady_clock::now();
                         double dt = std::chrono::duration<double>(now - lastSpeedTime).count();
                         if (dt >= 0.5) {
-                            double delta = (double)(ch.bytesTransferred.load() - lastSpeedBytes);
+                            double delta = (double)ch.bytesTransferred.load() - (double)lastSpeedBytes;
                             double instant = delta / dt;
                             // Cap instant speed to 10 GB/s to avoid overflow spikes during recovery
                             if (instant > 10e9) instant = 0;
@@ -13819,15 +13903,13 @@ void App::processBatchQueue() {
                         uint64_t tb = batch->totalBytes.load();
                         if (tb > 0 && combined > tb)
                             combined = tb;
-                        uint64_t currentTotal = batch->totalTransferred.load();
-                        if (combined < currentTotal) combined = currentTotal;
                         batch->totalTransferred = combined;
                         if (tb > 0) batch->totalProgress = (float)((double)combined / (double)tb);
 
                         auto totalNow = std::chrono::steady_clock::now();
                         double totalDt = std::chrono::duration<double>(totalNow - aggregateLastTime).count();
                         if (totalDt >= 0.5) {
-                            double instant = (double)(combined - aggregateLastBytes) / totalDt;
+                            double instant = ((double)combined - (double)aggregateLastBytes) / totalDt;
                             if (instant < 0 || instant > 10e9) instant = 0;
                             double prev = batch->speedBytesPerSec.load();
                             double effectiveSpeed = prev > 0 ? prev * 0.8 + instant * 0.2 : instant;
@@ -13974,65 +14056,27 @@ void App::processBatchQueue() {
                                             errMsg.find("Not a directory") != std::string::npos);
 
                         if (isFileError) {
-                            LOG_WARN("Transfer", ch.channelName + " skipping: " + item.displayName +
-                                     " - " + errMsg);
-                            batch->errorSkippedFiles++;
-                            {
-                                std::lock_guard<std::mutex> lk(batch->errorSkippedMutex);
-                                // Avoid duplicate entries (split files may skip multiple blocks)
-                                auto& names = batch->errorSkippedNames;
-                                if (names.empty() || names.back() != item.displayName)
-                                    names.push_back(item.displayName);
-                            }
-                            // Mark the block as completed so the file doesn't stall the transfer
-                            chBytesCompleted += block.length;
+                            LOG_WARN("Transfer", ch.channelName + " failed: " + item.displayName + " - " + errMsg);
+                            failFile(block.fileIndex);
                             ch.bytesTransferred = chBytesCompleted;
-                            ch.filesCompleted++;
-                            {
-                                std::lock_guard<std::mutex> lk(workMutex);
-                                completedBlocksPerFile[block.fileIndex]++;
-                                completedBytesPerFile[block.fileIndex] += block.length;
-                                if (block.isWholeFile || item.isDirectory) {
-                                    if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
-                                        completedFileIndices.insert(block.fileIndex);
-                                } else if (completedBytesPerFile[block.fileIndex] >= item.fileSize) {
-                                    completedFileIndices.insert(block.fileIndex);
-                                }
-                            }
-                            continue; // grab next block from queue
+                            ch.curBlockTransferred = 0;
+                            continue;
                         }
 
-                        block.retries++;
+                        ++block.retries;
                         if (block.retries >= 3) {
-                            // Too many retries for this block, skip it
                             LOG_WARN("Transfer", ch.channelName + " giving up after " +
-                                     std::to_string(block.retries) + " retries: " + item.displayName);
-                            batch->errorSkippedFiles++;
-                            {
-                                std::lock_guard<std::mutex> lk(batch->errorSkippedMutex);
-                                auto& names = batch->errorSkippedNames;
-                                if (std::find(names.begin(), names.end(), item.displayName) == names.end())
-                                    names.push_back(item.displayName);
-                            }
-                            chBytesCompleted += block.length;
+                                std::to_string(block.retries) + " retries: " + item.displayName);
+                            failFile(block.fileIndex);
                             ch.bytesTransferred = chBytesCompleted;
-                            ch.filesCompleted++;
-                            {
-                                std::lock_guard<std::mutex> lk(workMutex);
-                                completedBlocksPerFile[block.fileIndex]++;
-                                completedBytesPerFile[block.fileIndex] += block.length;
-                                if (block.isWholeFile || item.isDirectory) {
-                                    if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
-                                        completedFileIndices.insert(block.fileIndex);
-                                } else if (completedBytesPerFile[block.fileIndex] >= item.fileSize) {
-                                    completedFileIndices.insert(block.fileIndex);
-                                }
-                            }
+                            ch.curBlockTransferred = 0;
                             continue;
                         }
 
                         LOG_WARN("Transfer", ch.channelName + " channel lost: " + item.displayName +
                                  " - " + errMsg);
+                        ch.bytesTransferred = chBytesCompleted;
+                        ch.curBlockTransferred = 0;
                         ch.speed = 0;
                         ch.currentFile = "(reconnecting...)";
 
@@ -14047,7 +14091,7 @@ void App::processBatchQueue() {
                         bool recovered = false;
                         // Use the serial captured at worker start to reconnect to the same transport
                         std::string serial = origSerial;
-                        for (int retry = 1; !batch->stopRequested.load(); retry++) {
+                        for (int retry = 1; !m_shutdownTransfer && !batch->stopRequested.load(); retry++) {
                             // Check if there are still blocks left to process
                             {
                                 std::lock_guard<std::mutex> lk(workMutex);
@@ -14055,7 +14099,7 @@ void App::processBatchQueue() {
                             }
                             ch.currentFile = "(reconnecting #" + std::to_string(retry) + ")";
                             LOG_INFO("Transfer", ch.channelName + " reconnect attempt " + std::to_string(retry));
-                            std::this_thread::sleep_for(std::chrono::seconds(3));
+                            if (!waitForRetry(std::chrono::seconds(3), retryGeneration)) break;
 
                             // Disconnect old socket
                             dev.disconnectTcp();
@@ -14105,6 +14149,7 @@ void App::processBatchQueue() {
                                         }
                                     }
                                     for (auto& cand : candidates) {
+                                        if (cand != serial && deviceHwSerial.empty()) continue;
                                         if (!deviceHwSerial.empty()) {
                                             std::string hwCheck = dev.runAdbCommand("-s " + cand + " shell getprop ro.serialno");
                                             while (lastCharOr(hwCheck) == '\n' || lastCharOr(hwCheck) == '\r' || lastCharOr(hwCheck) == ' ')
@@ -14158,22 +14203,22 @@ void App::processBatchQueue() {
                         continue; // grab next block from queue
                     }
 
+                    if (!ok || batch->stopRequested.load() || m_shutdownTransfer) break;
+                    bool accepted = false;
+                    {
+                        std::lock_guard<std::mutex> lk(workMutex);
+                        if (coverage[block.fileIndex].failed()) continue;
+                        accepted = coverage[block.fileIndex].record(block.offset, block.length);
+                        if (coverage[block.fileIndex].complete()) completedFileIndices.insert(block.fileIndex);
+                    }
+                    if (!accepted) {
+                        failFile(block.fileIndex);
+                        ch.bytesTransferred = chBytesCompleted;
+                        continue;
+                    }
                     chBytesCompleted += block.length;
                     ch.bytesTransferred = chBytesCompleted;
                     ch.filesCompleted++;
-
-                    // Track per-file completion for partial cleanup on cancel
-                    {
-                        std::lock_guard<std::mutex> lk(workMutex);
-                        completedBlocksPerFile[block.fileIndex]++;
-                        completedBytesPerFile[block.fileIndex] += block.length;
-                        if (block.isWholeFile || item.isDirectory) {
-                            if (completedBlocksPerFile[block.fileIndex] >= totalBlocksPerFile[block.fileIndex])
-                                completedFileIndices.insert(block.fileIndex);
-                        } else if (completedBytesPerFile[block.fileIndex] >= item.fileSize) {
-                            completedFileIndices.insert(block.fileIndex);
-                        }
-                    }
 
                     if (block.isWholeFile)
                         LOG_INFO("Transfer", ch.channelName + " done: " + item.displayName);
@@ -14212,6 +14257,21 @@ void App::processBatchQueue() {
                 if (sh.handle != INVALID_HANDLE_VALUE) CloseHandle(sh.handle);
             }
 
+            uint64_t copiedBytes = 0;
+            int copiedFiles = 0;
+            int incompleteFiles = 0;
+            for (int fi = 0; fi < batch->totalFiles(); ++fi) {
+                if (coverage[fi].skipped()) continue;
+                if (coverage[fi].complete()) {
+                    copiedBytes += coverage[fi].copiedBytes();
+                    if (!batch->files[fi].isDirectory) ++copiedFiles;
+                } else ++incompleteFiles;
+            }
+            batch->totalTransferred = copiedBytes;
+            batch->totalProgress = batch->totalBytes.load() > 0 ?
+                (float)((double)copiedBytes / (double)batch->totalBytes.load()) :
+                (incompleteFiles == 0 ? 1.0f : 0.0f);
+
             // --- CRC verification for parallel transfers ---
             if (batch->state.load() != BatchState::Failed && !batch->stopRequested.load() &&
                 m_prefs.enableCrcVerification) {
@@ -14230,6 +14290,7 @@ void App::processBatchQueue() {
                     for (auto& bc : allBlockCrcs) fileBlocks[bc.fileIndex].push_back(&bc);
 
                     for (auto& [fi, blocks] : fileBlocks) {
+                        if (!coverage[fi].complete()) continue;
                         if (blocks.size() <= 1) continue;
                         // Chain combine: crc = combine(crc, next_block_crc, next_block_len)
                         uint32_t combined = blocks[0]->crc;
@@ -14246,7 +14307,7 @@ void App::processBatchQueue() {
                 for (int fi = 0; fi < batch->totalFiles(); fi++) {
                     if (batch->stopRequested.load()) break;
                     auto& item = batch->files[fi];
-                    if (item.isDirectory || item.isMcrawVirtual) continue;
+                    if (item.isDirectory || item.isMcrawVirtual || !coverage[fi].complete()) continue;
 
                     // For pulls: sourcePath=Android, destPath=Windows
                     // For pushes: sourcePath=Windows, destPath=Android
@@ -14308,8 +14369,6 @@ void App::processBatchQueue() {
                 bool anyCrcFail = false;
                 for (auto& r : batch->crcResults) if (!r.passed) anyCrcFail = true;
 
-                batch->totalProgress = 1.0f;
-                batch->totalTransferred = batch->totalBytes.load();
                 auto totalTime = std::chrono::steady_clock::now() - parallelStart;
                 double wallSec = std::chrono::duration<double>(totalTime).count();
                 if (wallSec < 0.1) wallSec = 0.1;
@@ -14319,7 +14378,11 @@ void App::processBatchQueue() {
                 batch->speedBytesPerSec = 0;
                 batch->etaSeconds = -1;
 
-                if (anyCrcFail) {
+                if (incompleteFiles > 0) {
+                    batch->state = BatchState::Failed;
+                    batch->errorMessage = std::to_string(incompleteFiles) + " item(s) could not be copied. " +
+                        std::to_string(copiedFiles) + " file(s) copied successfully.";
+                } else if (anyCrcFail) {
                     batch->state = BatchState::Failed;
                     batch->errorMessage = "CRC verification failed — file(s) may be corrupted";
                 } else {
@@ -14328,7 +14391,8 @@ void App::processBatchQueue() {
                                         wallSec, avgSpeed);
                 }
 
-                m_statusMessage = "Parallel done: " + std::to_string(batch->totalFiles()) + " files, " +
+                m_statusMessage = (batch->state.load() == BatchState::Completed ? "Copied: " : "Transfer failed. Copied: ") +
+                    std::to_string(copiedFiles) + " files, " +
                     formatSize(batch->totalTransferred.load()) + " @ " + formatSpeed(avgSpeed) +
                     (useMultiNic ? " (" + std::to_string(numCh) + " NICs)" :
                         " (" + std::to_string(numCh) + " channels)");
@@ -14346,6 +14410,8 @@ void App::processBatchQueue() {
                 for (int fi = 0; fi < batch->totalFiles(); fi++) {
                     auto& item = batch->files[fi];
                     if (item.isDirectory) continue;
+                    if (skippedFileIndices[fi]) continue;
+                    if (existingDestination[fi]) continue;
                     if (completedFileIndices.count(fi)) continue; // fully transferred, keep it
                     if (batch->isPull) {
                         try {
@@ -15661,7 +15727,7 @@ void App::processBatchQueue() {
                     // Wait for device to come back and reconnect (up to 2 minutes)
                     bool reconnected = false;
                     for (int wait = 0; wait < 120 && !m_shutdownTransfer && !batch->stopRequested.load(); wait++) {
-                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        if (!waitForRetry(std::chrono::seconds(2), singleRetryGeneration)) break;
 
                         batch->errorMessage = "Waiting for device... (" + std::to_string(wait * 2) + "s)";
 
@@ -15676,7 +15742,7 @@ void App::processBatchQueue() {
 
                         batch->errorMessage = "Device found (" + foundSerial + ") - connecting...";
                         LOG_INFO("Transfer", "Device found: " + foundSerial + " - reconnecting");
-                        std::this_thread::sleep_for(std::chrono::seconds(3)); // let device settle
+                        if (!waitForRetry(std::chrono::seconds(3), singleRetryGeneration)) break;
 
                         // Wait for tethering to finish if poll thread is doing it
                         while (m_tetheringInProgress && !m_shutdownTransfer && !batch->stopRequested.load()) {
