@@ -8,8 +8,6 @@ Pre-built signed releases are published on the [Releases page](https://github.co
 >
 > You are welcome to take it, modify it, and adapt it to your own needs under the GPL-3.0 license. If you build on top of it, please be fair and credit the project. As far as I can tell, nobody else has put in the work to actually replace MTP on Android, and that took some real thought to get right.
 
-![Main window](docs/screenshots/main-window.png)
-
 ## What it does
 
 * Dual-pane file browser for one or two connected Android devices.
@@ -148,8 +146,6 @@ The 4-pipe mode lights up when:
 * The phone and host share a WiFi 6E or WiFi 7 network on the 6 GHz band with a clear path to the access point.
 
 On flagship hardware that meets both conditions (for example a Snapdragon 8 Gen 3 / 8 Elite phone with UFS 4.0 storage paired with a WiFi 7 router and a USB 3.2 host port), a single large file can push at sustained rates near **800 MB/s**, with the bottleneck moving to the device's internal storage rather than to either transport.
-
-![4-channel transfer at ~800 MB/s](docs/screenshots/transfer-4-channel.png)
 
 Throughput scales sub-linearly: each added pipe adds bandwidth but also adds CPU and memory pressure on the phone, so 2 pipes on a midrange device may already be the sweet spot. The app monitors per-channel speed and falls back gracefully if a channel stalls or disconnects mid-transfer.
 
