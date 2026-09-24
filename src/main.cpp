@@ -225,20 +225,26 @@ static std::string GetLaunchApkPath() {
     return apk;
 }
 
-static std::string GetExeSidePath(const char* fileName) {
-    char exePath[MAX_PATH] = {};
-    DWORD len = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) return fileName;
-    std::string path(exePath, len);
-    size_t slash = path.find_last_of("\\/");
-    if (slash == std::string::npos) return fileName;
-    return path.substr(0, slash + 1) + fileName;
+static std::string GetLogPath(const wchar_t* fileName) {
+    PWSTR localAppData=nullptr;
+    std::filesystem::path folder;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData,0,nullptr,&localAppData))) {
+        folder=localAppData;
+        CoTaskMemFree(localAppData);
+    } else {
+        folder=std::filesystem::temp_directory_path();
+    }
+    folder/=L"FastEnough\\Logs";
+    std::error_code error;
+    std::filesystem::create_directories(folder,error);
+    return WideToUtf8((folder/fileName).wstring());
 }
 
 static std::string g_crashLogPath;
 
 static LONG WINAPI UnhandledCrashLogger(EXCEPTION_POINTERS* info) {
-    std::ofstream f(g_crashLogPath.empty() ? "Fast Enough - Android File Explorer.log" : g_crashLogPath, std::ios::app);
+    const std::string path=g_crashLogPath.empty()?"FastEnough-crash.log":g_crashLogPath;
+    std::ofstream f(std::filesystem::path(std::u8string(path.begin(),path.end())),std::ios::app);
     if (f) {
         auto now = std::chrono::system_clock::now();
         auto tt = std::chrono::system_clock::to_time_t(now);
@@ -253,11 +259,6 @@ static LONG WINAPI UnhandledCrashLogger(EXCEPTION_POINTERS* info) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-    g_crashLogPath = GetExeSidePath("Fast Enough - Android File Explorer.log");
-    DebugLog::instance().setFilePath(g_crashLogPath);
-    SetUnhandledExceptionFilter(UnhandledCrashLogger);
-    LOG_INFO("Startup", "Application starting. Log file: " + g_crashLogPath);
-
     std::string launchApkPath = GetLaunchApkPath();
 
     // Single instance — if already running, bring existing window to front
@@ -279,6 +280,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         CloseHandle(hMutex);
         return 0;
     }
+
+    g_crashLogPath = GetLogPath(L"crash.log");
+    DebugLog::instance().setFilePath(GetLogPath(L"activity.log"));
+    SetUnhandledExceptionFilter(UnhandledCrashLogger);
+    LOG_INFO("Startup", "Application starting. Activity log: " + DebugLog::instance().filePath());
 
     // Enable DPI awareness BEFORE creating any windows
     EnableDpiAwareness();
@@ -337,7 +343,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     // Font size scales with Windows DPI setting so it looks correct on any PC.
     // 16px at 100% scaling -> 24px at 150% -> 32px at 200%, etc.
-    float fontSize = 16.0f * dpiScale;
+    float fontSize = 14.0f * dpiScale;
 
     ImFontConfig fontCfg;
     fontCfg.OversampleH = 3;

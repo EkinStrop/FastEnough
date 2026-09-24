@@ -18,69 +18,7 @@
 #include <fstream>
 #include <iomanip>
 
-// ---- Debug Log System ----
-enum class LogLevel { Debug, Info, Warn, Error };
-
-struct LogEntry {
-    std::chrono::steady_clock::time_point time;
-    std::chrono::system_clock::time_point wallTime; // real clock time for display
-    LogLevel level;
-    std::string tag;
-    std::string message;
-};
-
-class DebugLog {
-public:
-    static DebugLog& instance() { static DebugLog s; return s; }
-
-    void log(LogLevel level, const std::string& tag, const std::string& msg) {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        auto wallTime = std::chrono::system_clock::now();
-        m_entries.push_back({ std::chrono::steady_clock::now(), wallTime, level, tag, msg });
-        if (m_entries.size() > 5000) m_entries.erase(m_entries.begin(), m_entries.begin() + 1000);
-        m_scrollToBottom = true;
-        if (!m_filePath.empty()) {
-            std::ofstream f(m_filePath, std::ios::app);
-            if (f) {
-                auto tt = std::chrono::system_clock::to_time_t(wallTime);
-                std::tm tm{};
-                localtime_s(&tm, &tt);
-                const char* levelText = "INFO";
-                if (level == LogLevel::Debug) levelText = "DEBUG";
-                else if (level == LogLevel::Warn) levelText = "WARN";
-                else if (level == LogLevel::Error) levelText = "ERROR";
-                f << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << " [" << levelText << "] "
-                  << tag << ": " << msg << "\n";
-            }
-        }
-    }
-
-    void clear() { std::lock_guard<std::mutex> lk(m_mutex); m_entries.clear(); }
-    void setFilePath(const std::string& path) {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        m_filePath = path;
-    }
-
-    // Returns a snapshot for rendering (thread-safe)
-    std::vector<LogEntry> snapshot() {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        return m_entries;
-    }
-
-    bool m_scrollToBottom = false;
-
-private:
-    DebugLog() = default;
-    std::mutex m_mutex;
-    std::vector<LogEntry> m_entries;
-    std::string m_filePath;
-};
-
-// Convenience macros
-#define LOG_DEBUG(tag, msg) DebugLog::instance().log(LogLevel::Debug, tag, msg)
-#define LOG_INFO(tag, msg)  DebugLog::instance().log(LogLevel::Info,  tag, msg)
-#define LOG_WARN(tag, msg)  DebugLog::instance().log(LogLevel::Warn,  tag, msg)
-#define LOG_ERROR(tag, msg) DebugLog::instance().log(LogLevel::Error, tag, msg)
+#include "activity_log.h"
 
 // Taskbar progress (implemented in main.cpp)
 void updateTaskbarProgress(float fraction, bool active);
@@ -116,6 +54,18 @@ enum class BatchState { Queued, Running, Paused, Verifying, Completed, Failed, S
 enum class ConflictAction { None, Overwrite, Skip, OverwriteAll, SkipAll };
 
 struct TransferBatch {
+    inline static std::atomic<uint64_t> nextLogId{0};
+    const uint64_t logId=++nextLogId;
+    void logEvent(LogLevel level, const std::string& message) const {
+        DebugLog::instance().log(level,"Transfer","#"+std::to_string(logId)+" "+message);
+    }
+    void logQueued() const {
+        logEvent(LogLevel::Info,std::string(isMove?"Move":"Copy")+" queued, "+std::to_string(files.size())+" items, route="+
+            (isLocalCopy?"PC to PC":isCrossDevice?"Android slot "+std::to_string(srcDeviceSlot)+" to slot "+std::to_string(dstDeviceSlot):
+             isPull?"Android slot "+std::to_string(srcDeviceSlot)+" to PC":"PC to Android slot "+std::to_string(dstDeviceSlot)));
+        for (const auto& file:files) logEvent(LogLevel::Debug,"Source: "+file.sourcePath+" -> Destination: "+file.destPath);
+    }
+
     std::vector<BatchFileItem> files;
     bool isPull = true;      // Android -> Windows
     bool isLocalCopy = false; // Windows -> Windows (no device involved)
@@ -214,8 +164,9 @@ struct TransferBatch {
 };
 
 // --- Drag payload ---
+struct FilePanel;
 struct DragPayload {
-    bool isAndroid;
+    FilePanel* sourcePanel;
 };
 
 enum class PanelSide { Left, Right };
@@ -245,6 +196,7 @@ struct FilePanel {
     char searchFilter[256] = {};
     int appTypeFilter = 0; // 0=all, 1=user, 2=system
     bool editingPath = false;
+    bool pathFocusRequested = false;
     bool showHidden = false;
 
     // MCRAW virtual directory state
@@ -389,6 +341,9 @@ struct BackupManagerJobAppRow {
 };
 
 struct AppPreferences {
+    float paneSplit = 0.5f;
+    bool compactRows = false;
+    bool transferDockExpanded = true;
     bool restartAdbOnLaunch = false;  // default OFF
     bool enableCrcVerification = true;
     bool autoDismissTransfer = false; // auto-close transfer overlay on success
@@ -507,6 +462,17 @@ private:
     };
 
     void setupStyle();
+    void renderWorkspaceHeader();
+    void renderWorkspaceToolbar();
+    void renderPaneHeader(FilePanel& panel, PanelSide side);
+    void renderPaneNavigation(FilePanel& panel);
+    void renderTransferDock(float height);
+    float transferDockHeight();
+    void renderWorkspaceDrawer();
+    std::string deviceDisplayName(int slot) const;
+    std::string panelDisplayName(const FilePanel& panel) const;
+    bool panelAvailable(const FilePanel& panel) const;
+    void startWorkspaceTransfer(bool move);
     bool modernButton(const char* label, const ImVec2& size = ImVec2(0, 0));
     bool modernSmallButton(const char* label);
     void renderMenuBar();
@@ -567,8 +533,9 @@ private:
     void switchPanelToConnections(FilePanel& panel);
     void forEachAndroidPanel(std::function<void(FilePanel&)> fn);
     void forEachDevicePanel(std::function<void(FilePanel&)> fn);
-    void startTransfer(bool pullFromAndroid);
+    void startTransfer(bool pullFromAndroid, bool move = false);
     void startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel);
+    void queuePanelTransfer(FilePanel& srcPanel, FilePanel& dstPanel, bool move);
     void processBatchQueue();
 
     std::string queryDeviceDisplayName(const std::string& serial);
@@ -712,6 +679,16 @@ private:
     std::chrono::steady_clock::time_point m_apkInstallStarted{};
 
     bool m_showBackupManager = false;
+    bool m_showAppsWorkspace = false;
+    bool m_showConnectionsWorkspace = false;
+    FilePanel m_appsWorkspacePanel;
+    FilePanel m_connectionsWorkspacePanel;
+    int m_workspaceDrawer = 0;
+    int m_detailsDeviceSlot = 0;
+    bool m_showDeviceSettings = false;
+    bool m_showTransferChannels = false;
+    std::weak_ptr<TransferBatch> m_transferDetailsBatch;
+    std::weak_ptr<TransferBatch> m_lastDockBatch;
     int m_backupManagerSlot = 0;
     char m_backupManagerSearch[256] = {};
     char m_backupManagerBackupSearch[256] = {};
@@ -901,7 +878,7 @@ private:
     bool m_showDebugWindow = false;
     bool m_debugAutoScroll = true;
     int m_debugLevelFilter = 0; // 0=All, 1=Info+, 2=Warn+, 3=Error only
-    char m_debugTagFilter[64] = {};
+    char m_debugTagFilter[256] = {};
     void renderDebugWindow();
 
 };

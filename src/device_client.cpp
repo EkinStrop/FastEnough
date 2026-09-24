@@ -2288,15 +2288,16 @@ std::string DeviceClient::detectStoragePath() {
 
 std::vector<DeviceFileEntry> DeviceClient::listDirectory(const std::string& path) {
     std::vector<DeviceFileEntry> entries;
-    if (!m_connected) return entries;
+    if (!m_connected) { LOG_ERROR("Files","List folder failed: "+path+": device not connected"); return entries; }
 
     MsgHeader hdr; std::vector<char> payload;
-    if (!runSmallOp(CMD_LIST, path.data(), (uint32_t)path.size(), hdr, payload)) return entries;
+    if (!runSmallOp(CMD_LIST, path.data(), (uint32_t)path.size(), hdr, payload)) { LOG_ERROR("Files","List folder failed: "+path+": "+m_lastError); return entries; }
     if (hdr.cmd == RSP_ERROR) {
         m_lastError = std::string(payload.data(), payload.size());
+        LOG_ERROR("Files","List folder failed: "+path+": "+m_lastError);
         return entries;
     }
-    if (hdr.cmd != RSP_OK || payload.size() < 4) return entries;
+    if (hdr.cmd != RSP_OK || payload.size() < 4) { LOG_ERROR("Files","Invalid folder listing response: "+path); return entries; }
 
     uint32_t count;
     memcpy(&count, payload.data(), 4);
@@ -3959,6 +3960,7 @@ bool DeviceClient::getRemoteSha256(const std::string& remotePath, std::string& o
 }
 
 bool DeviceClient::deleteFile(const std::string& path) {
+    auto perform=[&]() -> bool {
     if (!m_connected) { m_lastError = "Not connected"; return false; }
     MsgHeader hdr; std::vector<char> payload;
     if (!runSmallOp(CMD_DELETE, path.data(), (uint32_t)path.size(), hdr, payload)) return false;
@@ -3967,17 +3969,27 @@ bool DeviceClient::deleteFile(const std::string& path) {
         return false;
     }
     return hdr.cmd == RSP_OK;
+    };
+    bool ok=perform();
+    DebugLog::instance().log(ok?LogLevel::Info:LogLevel::Error,"Files",std::string("Delete ")+(ok?"completed: ":"failed: ")+path+(ok?"":": "+m_lastError));
+    return ok;
 }
 
 bool DeviceClient::createDirectory(const std::string& path) {
+    auto perform=[&]() -> bool {
     if (!m_connected) { m_lastError = "Not connected"; return false; }
     MsgHeader hdr; std::vector<char> payload;
     if (!runSmallOp(CMD_MKDIR, path.data(), (uint32_t)path.size(), hdr, payload)) return false;
     if (hdr.cmd == RSP_ERROR) { m_lastError = std::string(payload.data(), payload.size()); return false; }
     return hdr.cmd == RSP_OK;
+    };
+    bool ok=perform();
+    DebugLog::instance().log(ok?LogLevel::Info:LogLevel::Error,"Files",std::string("Create folder ")+(ok?"completed: ":"failed: ")+path+(ok?"":": "+m_lastError));
+    return ok;
 }
 
 bool DeviceClient::renameFile(const std::string& oldPath, const std::string& newPath) {
+    auto perform=[&]() -> bool {
     if (!m_connected) { m_lastError = "Not connected"; return false; }
     uint32_t oldLen = (uint32_t)oldPath.size();
     std::vector<char> payload(4 + oldPath.size() + newPath.size());
@@ -3988,6 +4000,10 @@ bool DeviceClient::renameFile(const std::string& oldPath, const std::string& new
     if (!runSmallOp(CMD_RENAME, payload.data(), (uint32_t)payload.size(), hdr, resp)) return false;
     if (hdr.cmd == RSP_ERROR) { m_lastError = std::string(resp.data(), resp.size()); return false; }
     return hdr.cmd == RSP_OK;
+    };
+    bool ok=perform();
+    DebugLog::instance().log(ok?LogLevel::Info:LogLevel::Error,"Files",std::string("Rename ")+(ok?"completed: ":"failed: ")+oldPath+" -> "+newPath+(ok?"":": "+m_lastError));
+    return ok;
 }
 
 uint64_t DeviceClient::getFileSize(const std::string& path) {

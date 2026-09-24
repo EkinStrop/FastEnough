@@ -161,6 +161,7 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\app.cpp" />
+    <ClCompile Include="src\app_workspace.cpp" />
     <ClCompile Include="src\backup_archive.cpp" />
     <ClCompile Include="src\device_client.cpp" />
     <ClCompile Include="src\adb_discovery.cpp" />
@@ -191,6 +192,9 @@
   <!-- Header Files -->
   <ItemGroup>
     <ClInclude Include="src\app.h" />
+    <ClInclude Include="src\ui_widgets.h" />
+    <ClInclude Include="src\activity_log.h" />
+    <ClInclude Include="src\local_copy.h" />
     <ClInclude Include="src\backup_archive.h" />
     <ClInclude Include="src\device_client.h" />
     <ClInclude Include="src\adb_discovery.h" />

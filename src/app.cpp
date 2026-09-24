@@ -1,4 +1,6 @@
 #include "app.h"
+#include "ui_widgets.h"
+#include "local_copy.h"
 #include "backup_archive.h"
 #include "imgui_internal.h"
 #include "mcraw_local.h"
@@ -11,6 +13,8 @@
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <shellapi.h>
+#include <dwmapi.h>
+#include <commdlg.h>
 #include <shobjidl.h>
 #include <shlobj.h>
 #include <wincrypt.h>
@@ -37,6 +41,8 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 // Safe UTF-8 path-to-string helper (avoids ANSI code page issues with .string())
 static std::string pathToUtf8(const std::filesystem::path& p) {
@@ -1047,6 +1053,9 @@ void AppPreferences::save() {
     std::ofstream f(path);
     if (!f) return;
     f << "[Preferences]\n";
+    f << "paneSplit=" << paneSplit << "\n";
+    f << "compactRows=" << compactRows << "\n";
+    f << "transferDockExpanded=" << transferDockExpanded << "\n";
     f << "restartAdbOnLaunch=" << (restartAdbOnLaunch ? 1 : 0) << "\n";
     f << "enableCrcVerification=" << (enableCrcVerification ? 1 : 0) << "\n";
     f << "autoDismissTransfer=" << (autoDismissTransfer ? 1 : 0) << "\n";
@@ -1134,7 +1143,14 @@ void AppPreferences::load() {
     bool pipeSettingsV2 = false;
     bool repairedSavedWifiName = false;
     while (std::getline(f, line)) {
-        if (line.find("restartAdbOnLaunch=") == 0)
+        if (line.find("paneSplit=") == 0) {
+            try { paneSplit = std::clamp(std::stof(line.substr(10)), 0.3f, 0.7f); } catch (...) { paneSplit = 0.5f; }
+            if (!std::isfinite(paneSplit)) paneSplit = 0.5f;
+        } else if (line.find("compactRows=") == 0)
+            compactRows = lastCharOr(line) == '1';
+        else if (line.find("transferDockExpanded=") == 0)
+            transferDockExpanded = lastCharOr(line) == '1';
+        else if (line.find("restartAdbOnLaunch=") == 0)
             restartAdbOnLaunch = (lastCharOr(line) == '1');
         else if (line.find("enableCrcVerification=") == 0)
             enableCrcVerification = (lastCharOr(line) == '1');
@@ -1474,7 +1490,19 @@ void App::postAsync(const std::string& statusMsg, std::function<void()> action) 
     {
         std::lock_guard<std::mutex> lk(m_asyncMutex);
         m_asyncStatus = statusMsg;
-        m_asyncQueue.push_back(std::move(action));
+        m_asyncQueue.push_back([statusMsg,action=std::move(action)]() {
+            if (!statusMsg.empty()) LOG_INFO("Activity", "Started: "+statusMsg);
+            try {
+                action();
+                if (!statusMsg.empty()) LOG_DEBUG("Activity", "Task returned: "+statusMsg);
+            } catch (const std::exception& error) {
+                LOG_ERROR("Activity", statusMsg+": "+error.what());
+                throw;
+            } catch (...) {
+                LOG_ERROR("Activity", statusMsg+": unexpected exception");
+                throw;
+            }
+        });
     }
     m_asyncCV.notify_one();
 }
@@ -1629,189 +1657,97 @@ static bool windowsUsesLightAppTheme() {
 }
 
 void App::setupStyle() {
+    ImGui::GetStyle() = ImGuiStyle();
     m_resolvedLightTheme = m_theme.mode == 2 || (m_theme.mode == 0 && windowsUsesLightAppTheme());
+    BOOL darkTitle = !m_resolvedLightTheme;
+    if (g_mainHwnd) DwmSetWindowAttribute(g_mainHwnd, 20, &darkTitle, sizeof(darkTitle));
+    if (m_resolvedLightTheme) ImGui::StyleColorsLight(); else ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 12.0f;
-    style.ChildRounding = 10.0f;
-    style.FrameRounding = 8.0f;
-    style.PopupRounding = 10.0f;
-    style.GrabRounding = 8.0f;
-    style.TabRounding = 8.0f;
-    style.ScrollbarRounding = 10.0f;
-    style.WindowBorderSize = 1.0f;
-    style.ChildBorderSize = 1.0f;
-    style.FrameBorderSize = 1.0f;
-    style.PopupBorderSize = 1.0f;
+    style.WindowRounding = 8;
+    style.ChildRounding = 8;
+    style.FrameRounding = 5;
+    style.PopupRounding = 7;
+    style.GrabRounding = 4;
+    style.ScrollbarRounding = 6;
+    style.TabRounding = 5;
+    style.WindowBorderSize = style.ChildBorderSize = style.PopupBorderSize = 1;
+    style.FrameBorderSize = 1;
     style.WindowPadding = ImVec2(12, 12);
-    style.FramePadding = ImVec2(11, 6);
-    style.ItemSpacing = ImVec2(9, 8);
-    style.ItemInnerSpacing = ImVec2(7, 5);
-    style.CellPadding = ImVec2(11, 8);
-    style.TouchExtraPadding = ImVec2(1, 1);
-    style.IndentSpacing = 20.0f;
-    style.ScrollbarSize = 12.0f;
-    style.GrabMinSize = 12.0f;
-    style.DisabledAlpha = 0.46f;
-    style.Alpha = 1.0f;
-    style.AntiAliasedLines = true;
-    style.AntiAliasedFill = true;
-
-    // Layered graphite surfaces with a cool blue accent.
-    ImVec4* c = style.Colors;
-    c[ImGuiCol_Text]                 = ImVec4(0.86f, 0.91f, 0.98f, 1.00f);
-    c[ImGuiCol_TextDisabled]         = ImVec4(0.46f, 0.52f, 0.64f, 1.00f);
-    c[ImGuiCol_WindowBg]             = ImVec4(0.018f, 0.022f, 0.032f, 1.00f);
-    c[ImGuiCol_ChildBg]              = ImVec4(0.027f, 0.033f, 0.047f, 1.00f);
-    c[ImGuiCol_PopupBg]              = ImVec4(0.035f, 0.043f, 0.061f, 0.99f);
-    c[ImGuiCol_Border]               = ImVec4(0.13f, 0.18f, 0.27f, 0.90f);
-    c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.32f);
-    c[ImGuiCol_FrameBg]              = ImVec4(0.050f, 0.061f, 0.086f, 1.00f);
-    c[ImGuiCol_FrameBgHovered]       = ImVec4(0.075f, 0.102f, 0.150f, 1.00f);
-    c[ImGuiCol_FrameBgActive]        = ImVec4(0.090f, 0.137f, 0.220f, 1.00f);
-    c[ImGuiCol_TitleBg]              = ImVec4(0.022f, 0.028f, 0.041f, 1.00f);
-    c[ImGuiCol_TitleBgActive]        = ImVec4(0.035f, 0.052f, 0.080f, 1.00f);
-    c[ImGuiCol_TitleBgCollapsed]     = c[ImGuiCol_TitleBg];
-    c[ImGuiCol_MenuBarBg]            = ImVec4(0.026f, 0.033f, 0.047f, 1.00f);
-    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.020f, 0.025f, 0.036f, 0.75f);
-    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.14f, 0.19f, 0.28f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.22f, 0.32f, 0.48f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.31f, 0.52f, 0.82f, 1.00f);
-    c[ImGuiCol_CheckMark]            = ImVec4(0.34f, 0.72f, 1.00f, 1.00f);
-    c[ImGuiCol_SliderGrab]           = ImVec4(0.28f, 0.57f, 0.88f, 1.00f);
-    c[ImGuiCol_SliderGrabActive]     = ImVec4(0.38f, 0.76f, 1.00f, 1.00f);
-    c[ImGuiCol_Button]               = ImVec4(0.075f, 0.098f, 0.145f, 1.00f);
-    c[ImGuiCol_ButtonHovered]        = ImVec4(0.105f, 0.190f, 0.315f, 1.00f);
-    c[ImGuiCol_ButtonActive]         = ImVec4(0.115f, 0.330f, 0.570f, 1.00f);
-    c[ImGuiCol_Header]               = ImVec4(0.075f, 0.110f, 0.165f, 0.88f);
-    c[ImGuiCol_HeaderHovered]        = ImVec4(0.105f, 0.205f, 0.345f, 0.92f);
-    c[ImGuiCol_HeaderActive]         = ImVec4(0.125f, 0.355f, 0.610f, 0.95f);
-    c[ImGuiCol_Separator]            = ImVec4(0.11f, 0.15f, 0.23f, 0.85f);
-    c[ImGuiCol_SeparatorHovered]     = ImVec4(0.24f, 0.47f, 0.76f, 1.00f);
-    c[ImGuiCol_SeparatorActive]      = ImVec4(0.34f, 0.68f, 1.00f, 1.00f);
-    c[ImGuiCol_ResizeGrip]           = ImVec4(0.18f, 0.28f, 0.44f, 0.45f);
-    c[ImGuiCol_ResizeGripHovered]    = ImVec4(0.27f, 0.50f, 0.78f, 0.75f);
-    c[ImGuiCol_ResizeGripActive]     = ImVec4(0.34f, 0.68f, 1.00f, 0.95f);
-    c[ImGuiCol_Tab]                  = ImVec4(0.045f, 0.060f, 0.088f, 1.00f);
-    c[ImGuiCol_TabHovered]           = ImVec4(0.11f, 0.23f, 0.39f, 1.00f);
-    c[ImGuiCol_TabSelected]          = ImVec4(0.09f, 0.18f, 0.31f, 1.00f);
-    c[ImGuiCol_TableHeaderBg]        = ImVec4(0.045f, 0.057f, 0.080f, 1.00f);
-    c[ImGuiCol_TableBorderStrong]    = ImVec4(0.12f, 0.16f, 0.24f, 0.90f);
-    c[ImGuiCol_TableBorderLight]     = ImVec4(0.075f, 0.095f, 0.14f, 0.80f);
-    c[ImGuiCol_TableRowBg]           = ImVec4(0.025f, 0.031f, 0.044f, 0.55f);
-    c[ImGuiCol_TableRowBgAlt]        = ImVec4(0.045f, 0.056f, 0.080f, 0.62f);
-    c[ImGuiCol_TextSelectedBg]       = ImVec4(0.18f, 0.46f, 0.76f, 0.48f);
-    c[ImGuiCol_DragDropTarget]       = ImVec4(0.36f, 0.78f, 1.00f, 0.95f);
-    c[ImGuiCol_NavHighlight]         = ImVec4(0.32f, 0.68f, 1.00f, 0.90f);
-    c[ImGuiCol_NavWindowingHighlight]= ImVec4(0.50f, 0.76f, 1.00f, 0.70f);
-    c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0.00f, 0.01f, 0.02f, 0.76f);
-
-    auto mix = [](const ImVec4& a, const ImVec4& b, float amount) {
-        return ImVec4(a.x + (b.x - a.x) * amount, a.y + (b.y - a.y) * amount,
-            a.z + (b.z - a.z) * amount, a.w + (b.w - a.w) * amount);
-    };
-    ImVec4 primary = m_theme.gradientPrimary;
-    ImVec4 secondary = m_theme.gradientSecondary;
-    float strength = m_theme.gradientStrength;
-    if (m_resolvedLightTheme) {
-        ImVec4 canvas(0.935f, 0.950f, 0.975f, 1.0f);
-        ImVec4 surface(0.975f, 0.982f, 0.995f, 1.0f);
-        ImVec4 raised(1.0f, 1.0f, 1.0f, 1.0f);
-        ImVec4 ink(0.075f, 0.105f, 0.160f, 1.0f);
-        c[ImGuiCol_Text] = ink;
-        c[ImGuiCol_TextDisabled] = ImVec4(0.36f, 0.42f, 0.52f, 1.0f);
-        c[ImGuiCol_WindowBg] = canvas;
-        c[ImGuiCol_ChildBg] = surface;
-        c[ImGuiCol_PopupBg] = raised;
-        c[ImGuiCol_MenuBarBg] = ImVec4(0.955f, 0.968f, 0.990f, 1.0f);
-        c[ImGuiCol_TitleBg] = c[ImGuiCol_MenuBarBg];
-        c[ImGuiCol_TitleBgActive] = raised;
-        c[ImGuiCol_Border] = mix(ImVec4(0.72f, 0.77f, 0.85f, 1.0f), primary, 0.10f * strength);
-        c[ImGuiCol_BorderShadow] = ImVec4(0.15f, 0.22f, 0.34f, 0.12f);
-        c[ImGuiCol_FrameBg] = ImVec4(0.915f, 0.935f, 0.970f, 1.0f);
-        c[ImGuiCol_FrameBgHovered] = mix(c[ImGuiCol_FrameBg], primary, 0.13f * strength);
-        c[ImGuiCol_FrameBgActive] = mix(c[ImGuiCol_FrameBg], primary, 0.22f * strength);
-        c[ImGuiCol_Button] = ImVec4(0.885f, 0.915f, 0.960f, 1.0f);
-        c[ImGuiCol_Header] = ImVec4(0.875f, 0.910f, 0.960f, 0.92f);
-        c[ImGuiCol_TableHeaderBg] = ImVec4(0.865f, 0.895f, 0.945f, 1.0f);
-        c[ImGuiCol_TableRowBg] = ImVec4(0.985f, 0.990f, 1.0f, 0.82f);
-        c[ImGuiCol_TableRowBgAlt] = ImVec4(0.925f, 0.945f, 0.980f, 0.72f);
-        c[ImGuiCol_TableBorderStrong] = ImVec4(0.72f, 0.77f, 0.85f, 0.85f);
-        c[ImGuiCol_TableBorderLight] = ImVec4(0.80f, 0.84f, 0.90f, 0.75f);
-        c[ImGuiCol_Separator] = ImVec4(0.72f, 0.77f, 0.85f, 0.75f);
-        c[ImGuiCol_ScrollbarBg] = ImVec4(0.88f, 0.91f, 0.95f, 0.70f);
-        c[ImGuiCol_ScrollbarGrab] = ImVec4(0.62f, 0.69f, 0.79f, 0.85f);
-        c[ImGuiCol_Tab] = ImVec4(0.89f, 0.92f, 0.96f, 1.0f);
-        c[ImGuiCol_ModalWindowDimBg] = ImVec4(0.12f, 0.17f, 0.25f, 0.38f);
-    }
-
-    ImVec4 interactiveBase = c[ImGuiCol_Button];
-    c[ImGuiCol_ButtonHovered] = mix(interactiveBase, primary, 0.30f + 0.18f * strength);
-    c[ImGuiCol_ButtonActive] = mix(interactiveBase, primary, 0.52f + 0.22f * strength);
-    c[ImGuiCol_HeaderHovered] = mix(c[ImGuiCol_Header], primary, 0.34f + 0.14f * strength);
-    c[ImGuiCol_HeaderActive] = mix(c[ImGuiCol_Header], secondary, 0.40f + 0.18f * strength);
-    c[ImGuiCol_CheckMark] = primary;
-    c[ImGuiCol_SliderGrab] = mix(primary, secondary, 0.18f);
-    c[ImGuiCol_SliderGrabActive] = mix(primary, secondary, 0.42f);
-    c[ImGuiCol_SeparatorHovered] = mix(primary, secondary, 0.24f);
-    c[ImGuiCol_SeparatorActive] = primary;
-    c[ImGuiCol_TextSelectedBg] = ImVec4(primary.x, primary.y, primary.z, 0.38f);
-    c[ImGuiCol_DragDropTarget] = mix(primary, secondary, 0.25f);
-    c[ImGuiCol_NavHighlight] = primary;
+    style.FramePadding = ImVec2(9, 6);
+    style.ItemSpacing = ImVec2(7, 6);
+    style.ItemInnerSpacing = ImVec2(6, 4);
+    style.CellPadding = ImVec2(10, 5);
+    style.ScrollbarSize = 10;
+    style.GrabMinSize = 10;
+    style.DisabledAlpha = 0.45f;
+    style.Alpha = 1;
+    style.AntiAliasedLines = style.AntiAliasedFill = true;
+    auto color = [](int r, int g, int b, float a = 1.0f) { return ImVec4(r/255.0f,g/255.0f,b/255.0f,a); };
+    bool light = m_resolvedLightTheme;
+    ImVec4 canvas = light ? color(240,244,250) : color(7,11,18);
+    ImVec4 surface = light ? color(255,255,255) : color(13,20,30);
+    ImVec4 raised = light ? color(235,241,249) : color(21,32,47);
+    ImVec4 hover = light ? color(223,233,246) : color(29,44,63);
+    ImVec4 selected = light ? color(218,234,255) : color(25,49,79);
+    ImVec4 border = light ? color(204,215,230) : color(36,51,71);
+    ImVec4 accent = m_theme.gradientPrimary;
+    auto* c = style.Colors;
+    c[ImGuiCol_Text] = light ? color(32,43,61) : color(231,234,240);
+    c[ImGuiCol_TextDisabled] = light ? color(86,103,127) : color(147,167,193);
+    c[ImGuiCol_WindowBg] = canvas;
+    c[ImGuiCol_ChildBg] = surface;
+    c[ImGuiCol_PopupBg] = light ? surface : color(18,28,42);
+    c[ImGuiCol_Border] = border;
+    c[ImGuiCol_BorderShadow] = color(0,0,0,0);
+    c[ImGuiCol_FrameBg] = canvas;
+    c[ImGuiCol_FrameBgHovered] = hover;
+    c[ImGuiCol_FrameBgActive] = selected;
+    c[ImGuiCol_TitleBg] = surface;
+    c[ImGuiCol_TitleBgActive] = raised;
+    c[ImGuiCol_TitleBgCollapsed] = surface;
+    c[ImGuiCol_MenuBarBg] = canvas;
+    c[ImGuiCol_Button] = raised;
+    c[ImGuiCol_ButtonHovered] = hover;
+    c[ImGuiCol_ButtonActive] = selected;
+    c[ImGuiCol_Header] = selected;
+    c[ImGuiCol_HeaderHovered] = hover;
+    c[ImGuiCol_HeaderActive] = selected;
+    c[ImGuiCol_Separator] = border;
+    c[ImGuiCol_SeparatorHovered] = accent;
+    c[ImGuiCol_SeparatorActive] = accent;
+    c[ImGuiCol_TableHeaderBg] = raised;
+    c[ImGuiCol_TableBorderStrong] = border;
+    c[ImGuiCol_TableBorderLight] = color(0,0,0,0);
+    c[ImGuiCol_TableRowBg] = color(0,0,0,0);
+    c[ImGuiCol_TableRowBgAlt] = light ? color(235,241,249,0.35f) : color(21,32,47,0.22f);
+    c[ImGuiCol_CheckMark] = accent;
+    c[ImGuiCol_SliderGrab] = accent;
+    c[ImGuiCol_SliderGrabActive] = accent;
+    c[ImGuiCol_ScrollbarBg] = surface;
+    c[ImGuiCol_ScrollbarGrab] = border;
+    c[ImGuiCol_ScrollbarGrabHovered] = c[ImGuiCol_TextDisabled];
+    c[ImGuiCol_ScrollbarGrabActive] = accent;
+    c[ImGuiCol_Tab] = raised;
+    c[ImGuiCol_TabSelected] = selected;
+    c[ImGuiCol_TabHovered] = hover;
+    c[ImGuiCol_TextSelectedBg] = selected;
+    c[ImGuiCol_NavHighlight] = accent;
+    c[ImGuiCol_DragDropTarget] = accent;
+    c[ImGuiCol_PlotHistogram] = accent;
+    c[ImGuiCol_ModalWindowDimBg] = color(0,0,0,light?0.2f:0.5f);
 }
 
 bool App::modernButton(const char* label, const ImVec2& requestedSize) {
-    ImGuiStyle& style = ImGui::GetStyle();
-    ImVec2 textSize = ImGui::CalcTextSize(label, nullptr, true);
-    ImVec2 size = requestedSize;
-    if (size.x == 0.0f) size.x = textSize.x + style.FramePadding.x * 2.0f;
-    else if (size.x < 0.0f) size.x = std::max(4.0f, ImGui::GetContentRegionAvail().x + size.x);
-    if (size.y == 0.0f) size.y = textSize.y + style.FramePadding.y * 2.0f;
-
-    ImGuiID id = ImGui::GetID(label);
-    bool pressed = ImGui::InvisibleButton(label, size);
-    bool hovered = ImGui::IsItemHovered();
-    bool held = ImGui::IsItemActive();
-    float target = hovered ? 1.0f : 0.0f;
-    float& animation = m_buttonHoverAnimation[id];
-    float response = 1.0f - expf(-ImGui::GetIO().DeltaTime * 14.0f);
-    animation += (target - animation) * response;
-
-    ImVec4 base = style.Colors[ImGuiCol_Button];
-    ImVec4 hover = style.Colors[ImGuiCol_ButtonHovered];
-    ImVec4 active = style.Colors[ImGuiCol_ButtonActive];
-    auto blend = [](const ImVec4& a, const ImVec4& b, float t) {
-        return ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
-            a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t);
-    };
-    ImVec4 fill = held ? active : blend(base, hover, animation);
-    fill.w *= style.Alpha;
-    ImVec2 min = ImGui::GetItemRectMin();
-    ImVec2 max = ImGui::GetItemRectMax();
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-    float rounding = style.FrameRounding;
-    draw->AddRectFilled(ImVec2(min.x, min.y + 2.0f), ImVec2(max.x, max.y + 2.0f),
-        IM_COL32(0, 0, 0, (int)(55 * style.Alpha)), rounding);
-    draw->AddRectFilled(min, max, ImGui::ColorConvertFloat4ToU32(fill), rounding);
-    ImVec4 border = blend(style.Colors[ImGuiCol_Border], m_theme.gradientPrimary, animation * 0.72f);
-    border.w *= style.Alpha;
-    draw->AddRect(min, max, ImGui::ColorConvertFloat4ToU32(border), rounding, 0, 1.0f);
-
-    const char* marker = strstr(label, "##");
-    std::string visibleLabel = marker ? std::string(label, marker) : std::string(label);
-    ImVec2 visibleSize = ImGui::CalcTextSize(visibleLabel.c_str());
-    ImVec2 textPos(min.x + (size.x - visibleSize.x) * 0.5f,
-        min.y + (size.y - visibleSize.y) * 0.5f);
-    ImVec4 textColor = style.Colors[ImGuiCol_Text];
-    textColor.w *= style.Alpha;
-    draw->AddText(textPos, ImGui::ColorConvertFloat4ToU32(textColor), visibleLabel.c_str());
-    return pressed;
+    return ImGui::Button(label, requestedSize);
 }
 
 bool App::modernSmallButton(const char* label) {
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-        ImVec2(ImGui::GetStyle().FramePadding.x * 0.78f, ImGui::GetStyle().FramePadding.y * 0.62f));
-    bool pressed = modernButton(label);
-    ImGui::PopStyleVar();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6*ui::scale(), 3*ui::scale()));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
+    bool pressed = ImGui::Button(label);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
     return pressed;
 }
 
@@ -1835,7 +1771,7 @@ void App::render() {
         m_isDragging = false;
 
     // Global keyboard shortcuts
-    bool anyModalOpen = ImGui::IsPopupOpen("Rename") || ImGui::IsPopupOpen("New Folder") || ImGui::IsPopupOpen("Confirm Delete");
+    bool anyModalOpen = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) || m_workspaceDrawer != 0 || m_showBackupManager || m_showAppsWorkspace || m_showConnectionsWorkspace;
     ImGuiContext* imguiContext = ImGui::GetCurrentContext();
     bool textInputActive = imguiContext && imguiContext->ActiveId != 0 &&
         imguiContext->InputTextState.ID == imguiContext->ActiveId;
@@ -1851,6 +1787,11 @@ void App::render() {
     if (ImGui::IsKeyPressed(ImGuiKey_F6) && !anyModalOpen) startTransfer(false);
     // F7 — copy selected files to Windows (pull)
     if (ImGui::IsKeyPressed(ImGuiKey_F7) && !anyModalOpen) startTransfer(true);
+
+    if (ImGui::IsKeyPressed(ImGuiKey_F2) && !anyModalOpen && !textInputActive && m_lastFocusedPanel && panelAvailable(*m_lastFocusedPanel) && m_lastFocusedPanel->selectedIndices.size()==1) {
+        m_contextPanel=m_lastFocusedPanel;m_contextIndex=*m_contextPanel->selectedIndices.begin();
+        if(m_contextPanel->validIndex(m_contextIndex)){strcpy_s(m_renameBuf,m_contextPanel->entryName(m_contextIndex).c_str());m_showRenamePopup=true;}
+    }
 
     // Del / Shift+Del — delete selected files in the focused panel
     if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !anyModalOpen && !textInputActive) {
@@ -1904,12 +1845,12 @@ void App::render() {
     }
 
     // Space — pause/resume active transfer
-    if (ImGui::IsKeyPressed(ImGuiKey_Space) && !anyModalOpen && !textInputActive) {
+    if (ImGui::IsKeyPressed(ImGuiKey_Space) && !anyModalOpen && !textInputActive && !ImGui::IsAnyItemFocused()) {
         std::lock_guard<std::mutex> lk(m_batchMutex);
         for (auto& b : m_batchQueue) {
             auto s = b->state.load();
-            if (s == BatchState::Running) { b->pauseRequested = true; break; }
-            if (s == BatchState::Paused)  { b->pauseRequested = false; m_batchCV.notify_all(); break; }
+            if (s == BatchState::Running) { b->pauseRequested = true; b->logEvent(LogLevel::Info,"Pause requested"); break; }
+            if (s == BatchState::Paused)  { b->pauseRequested = false; b->logEvent(LogLevel::Info,"Resume requested"); m_batchCV.notify_all(); break; }
         }
     }
 
@@ -1965,6 +1906,8 @@ void App::render() {
 
     // Escape — cancel confirm dialogs
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        if(m_workspaceDrawer) m_workspaceDrawer=0;
+        else if(!anyModalOpen && !textInputActive && m_lastFocusedPanel) m_lastFocusedPanel->selectedIndices.clear();
         if (m_confirmStopTransfer) m_confirmStopTransfer = false;
         else if (m_showDeleteConfirm) m_showDeleteConfirm = false;
         else if (m_showNewFolderPopup) m_showNewFolderPopup = false;
@@ -2074,113 +2017,110 @@ void App::render() {
     };
     refreshPanel(m_leftPanel);
     refreshPanel(m_rightPanel);
+    if(m_showAppsWorkspace) refreshPanel(m_appsWorkspacePanel);
     if (m_compareEnabled && (m_compareDirty || panelsRefreshed)) {
         updateCompareHighlights();
         m_compareDirty = false;
     }
 
-    // --- Main full-screen window ---
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    float entranceResponse = 1.0f - expf(-io.DeltaTime * 4.5f);
-    m_shellEntranceAnimation += (1.0f - m_shellEntranceAnimation) * entranceResponse;
-    ImDrawList* background = ImGui::GetBackgroundDrawList();
-    ImVec4 baseA = m_resolvedLightTheme ? ImVec4(0.945f, 0.960f, 0.985f, 1.0f)
-        : ImVec4(0.014f, 0.018f, 0.028f, 1.0f);
-    ImVec4 baseB = m_resolvedLightTheme ? ImVec4(0.900f, 0.930f, 0.975f, 1.0f)
-        : ImVec4(0.025f, 0.032f, 0.052f, 1.0f);
-    auto tint = [](const ImVec4& base, const ImVec4& accent, float amount) {
-        return ImVec4(base.x + (accent.x - base.x) * amount,
-            base.y + (accent.y - base.y) * amount,
-            base.z + (accent.z - base.z) * amount, 1.0f);
-    };
-    float gradientAmount = (m_resolvedLightTheme ? 0.055f : 0.10f) *
-        m_theme.gradientStrength * m_shellEntranceAnimation;
-    ImVec4 topLeft = tint(baseA, m_theme.gradientPrimary, gradientAmount);
-    ImVec4 topRight = tint(baseA, m_theme.gradientSecondary, gradientAmount * 0.85f);
-    ImVec4 bottomLeft = tint(baseB, m_theme.gradientSecondary, gradientAmount * 0.42f);
-    ImVec4 bottomRight = tint(baseB, m_theme.gradientPrimary, gradientAmount * 0.35f);
-    background->AddRectFilledMultiColor(vp->WorkPos,
-        ImVec2(vp->WorkPos.x + vp->WorkSize.x, vp->WorkPos.y + vp->WorkSize.y),
-        ImGui::ColorConvertFloat4ToU32(topLeft), ImGui::ColorConvertFloat4ToU32(topRight),
-        ImGui::ColorConvertFloat4ToU32(bottomRight), ImGui::ColorConvertFloat4ToU32(bottomLeft));
+    const float s = ui::scale();
+    m_shellEntranceAnimation = 1.0f;
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
     ImGuiWindowFlags mainFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_MenuBar;
-
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0,0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0,0));
     ImGui::Begin("##MainWindow", nullptr, mainFlags);
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar(3);
-
-    renderMenuBar();
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 12));
-
-    renderDeviceBar();
-    renderWifiBanner();
-
-    if (m_showBackupManager) {
-        ImGui::SetCursorPosX(8.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
-        ImGui::BeginChild("##BackupManagerOuter", ImVec2(-16.0f, -8.0f), ImGuiChildFlags_Borders);
-        renderBackupManagerWindow();
-        ImGui::EndChild();
-        ImGui::PopStyleVar();
-    } else {
-        ImGui::SetCursorPosX(8.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 10.0f));
-        ImGui::BeginChild("##FileManagerOuter", ImVec2(-16.0f, -8.0f), ImGuiChildFlags_Borders);
-        renderCompareToolbar();
-
-        float availW = ImGui::GetContentRegionAvail().x;
-        float availH = ImGui::GetContentRegionAvail().y;
-        float statusBarH = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2.0f;
-        float panelHeight = availH - statusBarH - ImGui::GetStyle().ItemSpacing.y;
-        float panelGap = 12.0f;
-        float panelWidth = (availW - panelGap) * 0.5f;
-
-        // Left panel
-        ImGui::BeginChild("##LeftPanel", ImVec2(panelWidth, panelHeight), ImGuiChildFlags_Borders);
-        m_leftPanelMin = ImGui::GetWindowPos();
-        m_leftPanelMax = ImVec2(m_leftPanelMin.x + ImGui::GetWindowSize().x, m_leftPanelMin.y + ImGui::GetWindowSize().y);
-        renderPanel(m_leftPanel, PanelSide::Left);
-        // Drop target — accept drops from the other panel
-        if (ImGui::BeginDragDropTarget()) {
-            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_DRAG")) {
-                startTransferFromDrag(m_rightPanel, m_leftPanel);
-            }
-            ImGui::EndDragDropTarget();
+    ImGui::PopStyleVar(4);
+    renderWorkspaceHeader();
+    ImGui::SetCursorPosY(48*s);
+    if (!m_showBackupManager && !m_showAppsWorkspace && !m_showConnectionsWorkspace) {
+        renderWorkspaceToolbar();
+        ImGui::SetCursorPosY(92*s);
+        if (m_compareEnabled) {
+            ImGui::BeginChild("##CompareControls", ImVec2(0, 72*s));
+            renderCompareToolbar();
+            ImGui::EndChild();
         }
-        ImGui::EndChild();
-
-        ImGui::SameLine(0, panelGap);
-
-        // Right panel
-        ImGui::BeginChild("##RightPanel", ImVec2(panelWidth, panelHeight), ImGuiChildFlags_Borders);
-        m_rightPanelMin = ImGui::GetWindowPos();
-        m_rightPanelMax = ImVec2(m_rightPanelMin.x + ImGui::GetWindowSize().x, m_rightPanelMin.y + ImGui::GetWindowSize().y);
-        renderPanel(m_rightPanel, PanelSide::Right);
-        if (ImGui::BeginDragDropTarget()) {
-            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_DRAG")) {
-                startTransferFromDrag(m_leftPanel, m_rightPanel);
-            }
-            ImGui::EndDragDropTarget();
-        }
-        ImGui::EndChild();
-
-        renderStatusBar();
-        ImGui::EndChild();
-        ImGui::PopStyleVar();
     }
-
-    ImGui::PopStyleVar();
+    float dockHeight = transferDockHeight();
+    float statusHeight = 28*s;
+    float bodyY = ImGui::GetCursorPosY()+8*s;
+    float bodyHeight = std::max(120*s, vp->WorkSize.y-bodyY-dockHeight-statusHeight-8*s);
+    ImGui::SetCursorPosY(bodyY);
+    ImGui::SetCursorPosX(14*s);
+    if (m_showBackupManager || m_showAppsWorkspace || m_showConnectionsWorkspace) {
+        ImGui::BeginChild("##WorkspacePage",ImVec2(-14*s,bodyHeight),ImGuiChildFlags_Borders);
+        if (m_showBackupManager) renderBackupManagerWindow();
+        else if (m_showAppsWorkspace) renderAppsPanel(m_appsWorkspacePanel,PanelSide::Left);
+        else renderPanel(m_connectionsWorkspacePanel,PanelSide::Left);
+        ImGui::EndChild();
+    } else {
+        float width = ImGui::GetContentRegionAvail().x-14*s;
+        float gap=12*s;
+        float leftWidth=std::clamp((width-gap)*m_prefs.paneSplit, std::min(240*s,width*0.3f), std::max(width*0.7f,width-240*s-gap));
+        auto pane = [&](FilePanel& panel, PanelSide side, float paneWidth) {
+            bool active=m_lastFocusedPanel==&panel || (!m_lastFocusedPanel && side==PanelSide::Right);
+            ImVec4 border=ImGui::GetStyleColorVec4(ImGuiCol_Border);
+            if(active) {
+                ImVec4 accent=ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+                border=ImVec4(border.x+(accent.x-border.x)*0.45f,border.y+(accent.y-border.y)*0.45f,border.z+(accent.z-border.z)*0.45f,1);
+            }
+            ImGui::PushStyleColor(ImGuiCol_Border,border);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(12*s,10*s));
+            ImGui::BeginChild(side==PanelSide::Left?"##LeftPanel":"##RightPanel",ImVec2(paneWidth,bodyHeight),ImGuiChildFlags_Borders,ImGuiWindowFlags_NoScrollbar);
+            ImGui::PopStyleVar();ImGui::PopStyleColor();
+            auto min=ImGui::GetWindowPos();auto size=ImGui::GetWindowSize();
+            if(side==PanelSide::Left){m_leftPanelMin=min;m_leftPanelMax=ImVec2(min.x+size.x,min.y+size.y);}
+            else {m_rightPanelMin=min;m_rightPanelMax=ImVec2(min.x+size.x,min.y+size.y);}
+            if(ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows))m_lastFocusedPanel=&panel;
+            renderPanel(panel,side);
+            FilePanel* source = nullptr;
+            const ImGuiPayload* drag = ImGui::GetDragDropPayload();
+            if (drag && drag->IsDataType("FILE_DRAG") && drag->DataSize == sizeof(DragPayload)) {
+                source = static_cast<const DragPayload*>(drag->Data)->sourcePanel;
+            }
+            bool validSource = source == &m_leftPanel || source == &m_rightPanel;
+            bool canDrop = validSource && source != &panel && !panel.isApps && !panel.isConnections &&
+                panelAvailable(panel) && panelAvailable(*source) &&
+                !(source->isAndroid && panel.isAndroid && source->deviceSlot == panel.deviceSlot);
+            if (auto drop = ui::endDropTargetChild<DragPayload>("FILE_DRAG", canDrop)) {
+                startTransferFromDrag(*drop->sourcePanel, panel);
+                m_dragSourcePanel = nullptr;
+            }
+        };
+        pane(m_leftPanel,PanelSide::Left,leftWidth);
+        ImGui::SameLine(0,0);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize,0);
+        ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0,0,0,0));
+        ImGui::Button("##PaneDivider",ImVec2(gap,bodyHeight));
+        ImGui::PopStyleColor();ImGui::PopStyleVar();
+        if(ImGui::IsItemHovered()||ImGui::IsItemActive())ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if(ImGui::IsItemActive()&&ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+            m_prefs.paneSplit=std::clamp(m_prefs.paneSplit+io.MouseDelta.x/(width-gap),0.3f,0.7f);
+        if(ImGui::IsItemFocused()) {
+            if(ImGui::IsKeyPressed(ImGuiKey_LeftArrow))m_prefs.paneSplit=std::max(0.3f,m_prefs.paneSplit-0.02f);
+            if(ImGui::IsKeyPressed(ImGuiKey_RightArrow))m_prefs.paneSplit=std::min(0.7f,m_prefs.paneSplit+0.02f);
+        }
+        if(ImGui::IsItemDeactivated())m_prefs.save();
+        auto a=ImGui::GetItemRectMin(),b=ImGui::GetItemRectMax();
+        ImGui::GetWindowDrawList()->AddLine(ImVec2((a.x+b.x)*0.5f,(a.y+b.y)*0.5f-14*s),ImVec2((a.x+b.x)*0.5f,(a.y+b.y)*0.5f+14*s),ImGui::GetColorU32(ImGuiCol_Border),2*s);
+        ImGui::SameLine(0,0);
+        pane(m_rightPanel,PanelSide::Right,width-gap-leftWidth);
+    }
+    ImGui::SetCursorPosX(0);
+    ImGui::SetCursorPosY(bodyY+bodyHeight+8*s);
+    renderTransferDock(dockHeight);
+    ImGui::SetCursorPosY(bodyY+bodyHeight+8*s+dockHeight);
+    renderStatusBar();
     ImGui::End();
+    renderWorkspaceDrawer();
+    if(m_showDeviceSettings)renderDeviceBar();
 
-    renderConnectionActivity();
 
     // --- Transfer overlay (separate window) ---
     renderTransferOverlay();
@@ -2462,12 +2402,7 @@ bool App::wantsHighFps() {
 }
 
 void App::renderMenuBar() {
-    if (ImGui::BeginMenuBar()) {
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(m_theme.gradientPrimary, "FAST ENOUGH");
-        ImGui::SameLine(0.0f, 10.0f);
-        ImGui::TextDisabled("|");
-        ImGui::SameLine(0.0f, 10.0f);
+    if (ImGui::BeginPopup("##WorkspaceMenu")) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Refresh All", "F5")) {
                 m_leftPanel.needsRefresh = true;
@@ -2494,17 +2429,18 @@ void App::renderMenuBar() {
             ImGui::MenuItem("Show Hidden (Windows)", nullptr, &m_leftPanel.showHidden);
             ImGui::MenuItem("Show Hidden (Android)", nullptr, &m_rightPanel.showHidden);
             ImGui::Separator();
-            if (ImGui::MenuItem("Show Transfer Window", nullptr, m_overlayVisible)) {
+            if (ImGui::MenuItem("Transfer details", nullptr, m_overlayVisible)) {
                 m_overlayVisible = !m_overlayVisible;
             }
             if (ImGui::MenuItem("Appearance...")) {
                 m_showThemeWindow = true;
             }
-            ImGui::MenuItem("Debug Log", "F12", &m_showDebugWindow);
+            ImGui::MenuItem("Activity log", "F12", &m_showDebugWindow);
             ImGui::EndMenu();
         }
         if (ImGui::MenuItem("Backup Manager")) {
             m_showBackupManager = true;
+            m_showAppsWorkspace = m_showConnectionsWorkspace = false;
             m_backupManagerApps.clear();
             m_backupManagerAppSelectionAnchor = -1;
             m_backupManagerNeedsAppRefresh = true;
@@ -2774,10 +2710,7 @@ void App::renderMenuBar() {
             ImGui::EndMenu();
         }
 
-        float tw = ImGui::CalcTextSize("Fast Enough? - Android File Explorer").x;
-        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - tw) * 0.5f);
-        ImGui::TextColored(ImVec4(0.5f,0.7f,1,1), "Fast Enough? - Android File Explorer");
-        ImGui::EndMenuBar();
+        ImGui::EndPopup();
     }
 }
 
@@ -3019,52 +2952,65 @@ void App::removeFavoritePath(int index) {
 }
 
 void App::renderFavoritesBar(FilePanel& panel, PanelSide side) {
-    if (panel.isApps) return;
-    bool alreadyFavorite = isFavoritePath(panel);
-    if (alreadyFavorite) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.33f, 0.08f, 1));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.43f, 0.12f, 1));
-    }
-
-    std::string starId = std::string(alreadyFavorite ? "*##Fav" : "+ Fav##Fav") +
-        (side == PanelSide::Left ? "L" : "R");
-    if (modernSmallButton(starId.c_str())) {
-        if (alreadyFavorite) {
-            for (int i = 0; i < (int)m_prefs.favoritePaths.size(); i++) {
-                const auto& fav = m_prefs.favoritePaths[i];
-                if (fav.isAndroid == panel.isAndroid &&
-                    fav.deviceSlot == panel.deviceSlot &&
-                    fav.path == panel.currentPath) {
+    const float scale = ui::scale();
+    bool favorite = isFavoritePath(panel);
+    if (ui::button("##FavoriteFolder", ui::Icon::Star,
+        favorite ? ui::Appearance::Selected : ui::Appearance::Quiet, ImVec2(26*scale,26*scale),
+        favorite ? "Remove folder from favorites" : "Add folder to favorites")) {
+        if (favorite) {
+            for (int i=0; i<(int)m_prefs.favoritePaths.size(); ++i) {
+                const auto& f = m_prefs.favoritePaths[i];
+                if (f.isAndroid==panel.isAndroid && f.deviceSlot==panel.deviceSlot && f.path==panel.currentPath) {
                     removeFavoritePath(i);
                     break;
                 }
             }
-        } else {
-            addFavoritePath(panel);
-        }
+        } else addFavoritePath(panel);
     }
-    if (alreadyFavorite) ImGui::PopStyleColor(2);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(alreadyFavorite ? "Remove this folder from favorites" : "Add this folder to favorites");
-
-    for (int i = 0; i < (int)m_prefs.favoritePaths.size(); i++) {
-        const auto& fav = m_prefs.favoritePaths[i];
-        if (fav.isAndroid != panel.isAndroid) continue;
-        if (fav.isAndroid && fav.deviceSlot != panel.deviceSlot) continue;
-
-        ImGui::SameLine();
-        std::string label = fav.label.empty() ? favoriteLabelForPath(fav.path, fav.isAndroid) : fav.label;
-        std::string id = label + "##FavPath" + std::to_string(i) + (side == PanelSide::Left ? "L" : "R");
-        if (modernSmallButton(id.c_str())) {
-            navigateToDirectory(panel, fav.path);
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Open %s\nRight-click to remove", fav.path.c_str());
-        }
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-            removeFavoritePath(i);
+    struct Shortcut { std::string label, path; int favoriteIndex=-1; };
+    std::vector<Shortcut> shortcuts;
+    for (int i=0; i<(int)m_prefs.favoritePaths.size(); ++i) {
+        const auto& f=m_prefs.favoritePaths[i];
+        if (f.isAndroid!=panel.isAndroid || (f.isAndroid && f.deviceSlot!=panel.deviceSlot)) continue;
+        shortcuts.push_back({f.label.empty()?favoriteLabelForPath(f.path,f.isAndroid):f.label,f.path,i});
+    }
+    if (!panel.isAndroid) {
+        for (const auto& drive:getWindowsDrives()) shortcuts.push_back({drive,drive+"\\"});
+    } else {
+        int slot=panel.deviceSlot&1;
+        std::string root=m_slotStorageRoot[slot].empty()?"/sdcard":m_slotStorageRoot[slot];
+        for (size_t i=0; i<m_slotVolumes[slot].size(); ++i)
+            shortcuts.push_back({i==0?"Internal":"SD "+std::to_string(i),m_slotVolumes[slot][i]});
+        if (m_slotVolumes[slot].empty()) shortcuts.push_back({"Storage",root});
+        for (const char* folder:{"Download","DCIM","Documents","Pictures","Music"})
+            shortcuts.push_back({folder,root+"/"+folder});
+        shortcuts.push_back({"/","/"});
+    }
+    for (size_t i=0; i<shortcuts.size(); ++i) {
+        const auto& link=shortcuts[i];
+        ImGui::SameLine(0,2*scale);
+        float width=ImGui::CalcTextSize(link.label.c_str()).x+20*scale;
+        if (width+30*scale>ImGui::GetContentRegionAvail().x) {
+            if (ui::button("##MoreShortcuts",ui::Icon::Down,ui::Appearance::Quiet,ImVec2(26*scale,26*scale),"More folder shortcuts"))
+                ImGui::OpenPopup("##FolderShortcutMenu");
+            if (ImGui::BeginPopup("##FolderShortcutMenu")) {
+                for (size_t j=i; j<shortcuts.size(); ++j) {
+                    ImGui::PushID((int)j);
+                    if (ImGui::MenuItem(shortcuts[j].label.c_str())) navigateToDirectory(panel,shortcuts[j].path);
+                    ui::tooltip(shortcuts[j].path.c_str());
+                    if (shortcuts[j].favoriteIndex>=0 && ImGui::IsItemClicked(ImGuiMouseButton_Right))
+                        removeFavoritePath(shortcuts[j].favoriteIndex);
+                    ImGui::PopID();
+                }
+                ImGui::EndPopup();
+            }
             break;
         }
+        ImGui::PushID((int)i);
+        if (ui::button(link.label.c_str(),ui::Icon::None,ui::Appearance::Quiet,ImVec2(width,26*scale),link.path.c_str()))
+            navigateToDirectory(panel,link.path);
+        if (link.favoriteIndex>=0 && ImGui::IsItemClicked(ImGuiMouseButton_Right)) removeFavoritePath(link.favoriteIndex);
+        ImGui::PopID();
     }
 }
 
@@ -3210,12 +3156,10 @@ void App::startCompareHashCheck(const std::string& signature) {
 }
 
 void App::renderDeviceBar() {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_ChildBg));
-    float devBarH = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2 + 12;
-    ImGui::SetCursorPosX(8.0f);
-    ImGui::BeginChild("##DeviceBar", ImVec2(-16.0f, devBarH), ImGuiChildFlags_Borders);
-    ImGui::SetCursorPos(ImVec2(12, 9));
-
+    ImGui::SetNextWindowSize(ImVec2(470*ui::scale(),580*ui::scale()),ImGuiCond_FirstUseEver);
+    if(!ImGui::Begin("Advanced connection controls",&m_showDeviceSettings)) {ImGui::End();return;}
+    ImGui::TextWrapped("These controls manage the primary ADB connection. Per-device stream settings are in Device details.");
+    ImGui::Spacing();
     if (m_device.getAdbPath().empty()) {
         ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "ADB not found!");
         ImGui::SameLine(); ImGui::TextDisabled("Extract the full ZIP or add Android SDK Platform Tools to PATH");
@@ -3336,7 +3280,7 @@ void App::renderDeviceBar() {
                 }
                 ImGui::EndCombo();
             }
-            if (selSnap >= 0 && devSnap[selSnap].state == "device") {
+            if (selSnap >= 0 && selSnap < (int)devSnap.size() && devSnap[selSnap].state == "device") {
                 ImGui::SameLine();
 
                 // Show connection mode - detect actual transport
@@ -3392,7 +3336,7 @@ void App::renderDeviceBar() {
 
                 // Pipe controls, directly visible for quick tuning
                 auto& devicePipes = m_prefs.pipePreferencesFor(devSnap[selSnap].serial);
-                ImGui::SameLine(0, 16);
+                ImGui::Spacing();
                 {
                     if (drawPipeSelector("USB", "usbdevbar", devicePipes.usbPipeCount)) {
                         m_prefs.save();
@@ -3402,7 +3346,7 @@ void App::renderDeviceBar() {
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Parallel ADB connections over USB. Higher values can improve throughput on fast devices.\nApplies on next device reconnect or transfer channel setup.");
                 }
-                ImGui::SameLine(0, 8);
+                ImGui::Spacing();
                 {
                     if (drawPipeSelector("WiFi", "wifidevbar", devicePipes.wifiPipeCount)) {
                         m_prefs.save();
@@ -3414,7 +3358,7 @@ void App::renderDeviceBar() {
                 }
 
                 // Root mode toggle — relaunches the on-device server via `su -c`
-                ImGui::SameLine(0, 16);
+                ImGui::Spacing();
                 {
                     std::string ser = devSnap[selSnap].serial;
                     bool rootOn = m_prefs.rootEnabledForSerial(ser);
@@ -3470,7 +3414,7 @@ void App::renderDeviceBar() {
                 }
 
                 // WiFi auto-connect toggle
-                ImGui::SameLine(0, 16);
+                ImGui::Spacing();
                 bool wifiAuto = m_prefs.wifiAutoConnect;
                 if (ImGui::Checkbox("WiFi Auto##devbar", &wifiAuto)) {
                     m_prefs.wifiAutoConnect = wifiAuto;
@@ -3489,7 +3433,7 @@ void App::renderDeviceBar() {
                     ImGui::SetTooltip("Automatically set up WiFi for dual-channel transfers\nwhen this device connects via USB");
 
                 // Keep awake toggle (uses a wakelock held by a background adb shell process)
-                ImGui::SameLine(0, 16);
+                ImGui::Spacing();
                 bool keepAwake = m_keepAwake;
                 if (ImGui::Checkbox("Keep Awake##devbar", &keepAwake)) {
                     std::string serial = devSnap[selSnap].serial;
@@ -3549,7 +3493,7 @@ void App::renderDeviceBar() {
 
                 // Disconnect button for WiFi devices
                 if (isWifiSerial(devSnap[selSnap].serial)) {
-                    ImGui::SameLine(0, 16);
+                    ImGui::Spacing();
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.15f, 0.15f, 1));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.2f, 0.2f, 1));
                     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
@@ -3579,8 +3523,7 @@ void App::renderDeviceBar() {
         }
 
     }
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
+    ImGui::End();
 }
 
 void App::renderConnectionActivity() {
@@ -3883,6 +3826,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         return;
     }
 
+    renderPaneHeader(panel, side);
     const char* label = panel.isAndroid ? "Android" : "Windows";
     ImVec4 labelColor = panel.isAndroid ? ImVec4(0.3f,0.85f,0.4f,1) : ImVec4(0.40f,0.65f,1,1);
 
@@ -3894,26 +3838,12 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         (!deviceFor(panel).isServerRunning() || connectionSetupActive))) {
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 1.0f);
 
-        std::string sideId = side == PanelSide::Left ? "L" : "R";
-        if (modernSmallButton(("PC##Connections" + sideId).c_str())) switchPanelMode(panel, false);
-        ImGui::SameLine(0, 2);
-        if (modernSmallButton(("Android##Connections" + sideId).c_str())) switchPanelMode(panel, true);
-        ImGui::SameLine(0, 2);
-        if (modernSmallButton(("Apps##Connections" + sideId).c_str())) switchPanelToApps(panel);
-        ImGui::SameLine(0, 2);
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.28f, 0.46f, 1));
-        modernSmallButton(("Connections##Connections" + sideId).c_str());
-        ImGui::PopStyleColor();
-
+        ImGui::BeginChild("##ConnectionContent",ImVec2(0,0));
         float availH = ImGui::GetContentRegionAvail().y;
-        float centerY = availH * 0.3f;
-        ImGui::SetCursorPosY(centerY);
-
-        // Center content
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY()+std::max(12.0f,availH*0.10f));
         float availW = ImGui::GetContentRegionAvail().x;
-        float contentW = 360.0f;
-        float padX = (availW - contentW) * 0.5f;
-        if (padX > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + padX);
+        float contentW = std::min(360*ui::scale(),availW);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX()+std::max(0.0f,(availW-contentW)*0.5f));
 
         ImGui::BeginGroup();
 
@@ -4059,6 +3989,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                 else
                     displayLabel = connectAddr;
                 std::string btnLabel = "Connect##saved" + std::to_string(si);
+                ImGui::TextWrapped("%s",displayLabel.c_str());
                 // Auto-connect on launch checkbox
                 std::string autoLabel = "Auto##auto" + std::to_string(si);
                 if (ImGui::Checkbox(autoLabel.c_str(), &w.autoConnect)) {
@@ -4098,8 +4029,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                 }
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Remove this saved device");
-                ImGui::SameLine();
-                ImGui::Text("%s", displayLabel.c_str());
+                ImGui::Spacing();
             }
             if (deleteSavedDevice >= 0 && deleteSavedDevice < (int)m_prefs.savedWifiDevices.size()) {
                 std::string removed = m_prefs.savedWifiDevices[deleteSavedDevice].model;
@@ -4172,6 +4102,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         }
 
         ImGui::EndGroup();
+        ImGui::EndChild();
         ImGui::PopStyleVar();
         return;
     }
@@ -4190,299 +4121,21 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         directoryContentAlpha = 0.55f + 0.45f * eased;
     }
 
-    // --- Navigation bar: Back / Forward / Up + Breadcrumb ---
-    bool canBack = panel.navHistoryPos > 0;
-    bool canFwd = panel.navHistoryPos >= 0 && panel.navHistoryPos < (int)panel.navHistory.size() - 1;
+    renderPaneNavigation(panel);
 
-    auto triggerNavAnim = [&]() {
-        panel.navigationTransitionPending = true;
-    };
-
-    ImGui::BeginDisabled(!canBack);
-    if (modernSmallButton(("<##B" + std::string(label)).c_str())) {
-        panel.navHistoryPos--;
-        panel.currentPath = panel.navHistory[panel.navHistoryPos];
-        panel.selectedIndices.clear(); panel.focusedIndex = -1;
-        panel.searchFilter[0] = '\0'; panel.needsRefresh = true;
-        strcpy_s(panel.pathInput, panel.currentPath.c_str());
-        triggerNavAnim();
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine(0, 2);
-
-    ImGui::BeginDisabled(!canFwd);
-    if (modernSmallButton((">##F" + std::string(label)).c_str())) {
-        panel.navHistoryPos++;
-        panel.currentPath = panel.navHistory[panel.navHistoryPos];
-        panel.selectedIndices.clear(); panel.focusedIndex = -1;
-        panel.searchFilter[0] = '\0'; panel.needsRefresh = true;
-        strcpy_s(panel.pathInput, panel.currentPath.c_str());
-        triggerNavAnim();
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine(0, 4);
-
-    if (modernSmallButton(("^##U" + std::string(label)).c_str())) navigateUp(panel);
-    ImGui::SameLine(0, 6);
-
-    // Panel mode toggle: Windows / Android / Apps
-    {
-        std::string winId = std::string("PC##") + (side == PanelSide::Left ? "L" : "R");
-        std::string andId = std::string("Android##") + (side == PanelSide::Left ? "L" : "R");
-        std::string appsId = std::string("Apps##") + (side == PanelSide::Left ? "L" : "R");
-        std::string connectionsId = std::string("Connections##") + (side == PanelSide::Left ? "L" : "R");
-
-        if (!panel.isAndroid) {
-            // Windows is active — show it highlighted, Android as clickable
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.22f, 0.38f, 1));
-            modernSmallButton(winId.c_str());
-            ImGui::PopStyleColor();
-            ImGui::SameLine(0, 2);
-            if (modernSmallButton(andId.c_str())) switchPanelMode(panel, true);
-            ImGui::SameLine(0, 2);
-            if (modernSmallButton(appsId.c_str())) switchPanelToApps(panel);
-            ImGui::SameLine(0, 2);
-            if (modernSmallButton(connectionsId.c_str())) switchPanelToConnections(panel);
-        } else {
-            // Android is active
-            if (modernSmallButton(winId.c_str())) switchPanelMode(panel, false);
-            ImGui::SameLine(0, 2);
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.30f, 0.15f, 1));
-            modernSmallButton(andId.c_str());
-            ImGui::PopStyleColor();
-            ImGui::SameLine(0, 2);
-            if (modernSmallButton(appsId.c_str())) switchPanelToApps(panel);
-            ImGui::SameLine(0, 2);
-            if (modernSmallButton(connectionsId.c_str())) switchPanelToConnections(panel);
-
-            // Device indicator / selector - always visible when in Android mode
-            {
-                std::lock_guard<std::mutex> lk(m_deviceMutex);
-
-                // Count online devices
-                int onlineCount = 0;
-                for (int slot = 0; slot < 2; ++slot)
-                    if (m_slotConnected[slot] && m_deviceSlots[slot].isServerRunning()) onlineCount++;
-
-                // Helper: get friendly display name for a device slot
-                auto getSlotName = [&](int slot) -> std::string {
-                    if (slot < 0 || slot >= 2 || !m_slotConnected[slot]) return "No device";
-                    auto it = m_deviceDisplayNames.find(m_slotSerial[slot]);
-                    if (it != m_deviceDisplayNames.end()) return it->second;
-                    for (auto& d : m_devices) {
-                        if (d.serial == m_slotSerial[slot])
-                            return d.model.empty() ? d.serial : d.model;
-                    }
-                    return m_slotSerial[slot];
-                };
-                auto channelBadgeText = [&](int slot) -> const char* {
-                    if (slot == 0 && m_dualChannelAvailable && m_activeChannelCount > 1) return "dual";
-                    if (slot >= 0 && slot < 2 && m_slotConnected[slot]) {
-                        auto pipes = m_prefs.pipePreferencesFor(m_slotSerial[slot]);
-                        if (pipes.usbPipeCount > 1 || pipes.wifiPipeCount > 1) return "multi";
-                    }
-                    return "single";
-                };
-                auto channelBadgeColor = [&](int slot) -> ImVec4 {
-                    auto pipes = (slot >= 0 && slot < 2) ? m_prefs.pipePreferencesFor(m_slotSerial[slot]) : DevicePipePreference{};
-                    if ((slot == 0 && m_dualChannelAvailable && m_activeChannelCount > 1) ||
-                        (slot >= 0 && slot < 2 && m_slotConnected[slot] &&
-                         (pipes.usbPipeCount > 1 || pipes.wifiPipeCount > 1)))
-                        return ImVec4(0.25f, 0.80f, 0.35f, 1.0f);
-                    return ImVec4(0.95f, 0.65f, 0.25f, 1.0f);
-                };
-                auto showChannelTooltip = [&](int slot) {
-                    if (slot == 0 && m_dualChannelAvailable && m_activeChannelCount > 1) {
-                        ImGui::SetTooltip("%d transfer channels available for this device", m_activeChannelCount);
-                    } else if (slot >= 0 && slot < 2 && m_slotConnected[slot] && [&] {
-                        auto pipes = m_prefs.pipePreferencesFor(m_slotSerial[slot]);
-                        return pipes.usbPipeCount > 1 || pipes.wifiPipeCount > 1;
-                    }()) {
-                        ImGui::SetTooltip("Extra transfer channels will be opened for this device when a transfer starts");
-                    } else if (slot == 0) {
-                        ImGui::SetTooltip("Single-channel transfer for this device");
-                    } else {
-                        ImGui::SetTooltip("Secondary devices use a separate single-channel connection");
-                    }
-                };
-
-                // Slot colors for visual distinction between devices
-                static const ImVec4 slotColors[] = {
-                    ImVec4(0.35f, 0.65f, 1.0f, 1.0f),  // slot 0: blue
-                    ImVec4(0.2f,  0.85f, 0.5f, 1.0f),   // slot 1: green
-                };
-
-                int slotIdx = panel.deviceSlot;
-                ImVec4 slotColor = slotColors[slotIdx < 2 ? slotIdx : 0];
-
-                if (onlineCount >= 1 && m_slotConnected[slotIdx]) {
-                    ImGui::SameLine(0, 8);
-
-                    // Draw colored dot indicator
-                    ImVec2 dotPos = ImGui::GetCursorScreenPos();
-                    dotPos.x += 4.0f;
-                    dotPos.y += ImGui::GetFrameHeight() * 0.5f;
-                    ImGui::GetWindowDrawList()->AddCircleFilled(dotPos, 4.0f,
-                        ImGui::ColorConvertFloat4ToU32(slotColor));
-                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 14);
-
-                    std::string currentName = getSlotName(slotIdx);
-
-                    if (onlineCount > 1) {
-                        // Multiple devices: dropdown to switch
-                        std::string comboId = "##DevSlot" + std::string(side == PanelSide::Left ? "L" : "R");
-                        ImGui::SetNextItemWidth(200);
-                        if (ImGui::BeginCombo(comboId.c_str(), currentName.c_str())) {
-                            for (int di = 0; di < 2; di++) {
-                                if (!m_slotConnected[di]) continue;
-                                bool isSel = (panel.deviceSlot == di);
-                                std::string devName = getSlotName(di);
-                                // Show serial in parentheses for disambiguation, unique ImGui ID per slot
-                                std::string fullLabel = devName + "  (" + m_slotSerial[di] + ")  [" +
-                                    channelBadgeText(di) + "]##slot" + std::to_string(di);
-
-                                ImVec4 itemColor = slotColors[di < 2 ? di : 0];
-                                if (isSel) ImGui::PushStyleColor(ImGuiCol_Text, itemColor);
-
-                                if (ImGui::Selectable(fullLabel.c_str(), isSel)) {
-                                    if (panel.deviceSlot != di) {
-                                        panel.deviceSlot = di;
-                                        panel.currentPath = m_slotStorageRoot[di].empty() ? "/" : m_slotStorageRoot[di];
-                                        strcpy_s(panel.pathInput, panel.currentPath.c_str());
-                                        panel.needsRefresh = true;
-                                        panel.navHistory.clear();
-                                        panel.navHistoryPos = -1;
-                                    }
-                                }
-                                if (isSel) ImGui::PopStyleColor();
-                            }
-                            ImGui::EndCombo();
-                        }
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Switch which device this panel browses");
-                    } else {
-                        // Single device: show name as colored label
-                        ImGui::TextColored(slotColor, "%s", currentName.c_str());
-                    }
-                    ImGui::SameLine(0, 6);
-                    ImGui::TextColored(channelBadgeColor(slotIdx), "%s", channelBadgeText(slotIdx));
-                    if (ImGui::IsItemHovered()) showChannelTooltip(slotIdx);
-                }
-            }
-        }
-    }
-    ImGui::SameLine(0, 6);
-
-    // Breadcrumb path — clickable segments
-    {
-        char sep = panel.isAndroid ? '/' : '\\';
-        std::string path = panel.currentPath;
-        std::vector<std::pair<std::string, std::string>> crumbs; // {segment, full path}
-
-        if (panel.isAndroid) {
-            if (!path.empty() && path[0] == '/') {
-                crumbs.push_back({"/", "/"});
-                path = path.substr(1);
-            }
-            std::string accum = "/";
-            size_t pos = 0;
-            while (pos < path.size()) {
-                size_t next = path.find('/', pos);
-                if (next == std::string::npos) next = path.size();
-                std::string seg = path.substr(pos, next - pos);
-                if (!seg.empty()) {
-                    accum += seg;
-                    crumbs.push_back({seg, accum});
-                    accum += "/";
-                }
-                pos = next + 1;
-            }
-        } else {
-            // Windows: "C:\Users\Foo" -> ["C:\", "Users", "Foo"]
-            if (path.size() >= 2 && path[1] == ':') {
-                std::string root = path.substr(0, 3); // "C:\"
-                crumbs.push_back({root, root});
-                path = (path.size() > 3) ? path.substr(3) : "";
-            }
-            std::string accum = crumbs.empty() ? "" : crumbs[0].second;
-            size_t pos = 0;
-            while (pos < path.size()) {
-                size_t next = path.find('\\', pos);
-                if (next == std::string::npos) next = path.size();
-                std::string seg = path.substr(pos, next - pos);
-                if (!seg.empty()) {
-                    appendPathSeparator(accum, '\\');
-                    accum += seg;
-                    crumbs.push_back({seg, accum});
-                }
-                pos = next + 1;
-            }
-        }
-
-        for (size_t ci = 0; ci < crumbs.size(); ci++) {
-            if (ci > 0) {
-                ImGui::SameLine(0, 0);
-                alignTextToCompactFrame();
-                ImGui::TextDisabled("%c", sep);
-                ImGui::SameLine(0, 0);
-            }
-            ImGui::PushID((int)ci);
-            if (ci < crumbs.size() - 1) {
-                // Clickable
-                if (modernSmallButton(crumbs[ci].first.c_str()))
-                    navigateToDirectory(panel, crumbs[ci].second);
-            } else {
-                // Current (non-clickable, highlighted)
-                alignTextToCompactFrame();
-                ImGui::TextColored(ImVec4(0.5f,0.75f,1,1), "%s", crumbs[ci].first.c_str());
-            }
-            ImGui::PopID();
-        }
-    }
-
-    // Filter bar
-    ImGui::SetNextItemWidth(-1);
+    // Keep search, refresh and folder shortcuts on consistent baselines.
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(9*ui::scale(),7*ui::scale()));
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x-32*ui::scale());
     ImGui::InputTextWithHint(("##Filter" + std::string(label)).c_str(),
-        "Search names or patterns, e.g. *.mp4", panel.searchFilter, sizeof(panel.searchFilter));
-    ImGui::Separator();
-
+        "Filter this folder, e.g. *.mp4", panel.searchFilter, sizeof(panel.searchFilter));
+    ImGui::PopStyleVar();
+    ImGui::SameLine(0,4*ui::scale());
+    if(ui::button("##RefreshFolder",ui::Icon::Refresh,ui::Appearance::Quiet,ImVec2(28*ui::scale(),28*ui::scale()),"Refresh folder"))panel.needsRefresh=true;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
+    ImGui::BeginChild("##FolderShortcuts",ImVec2(0,26*ui::scale()),ImGuiChildFlags_None,ImGuiWindowFlags_NoScrollbar);
     renderFavoritesBar(panel, side);
-    if (!m_prefs.favoritePaths.empty()) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("|");
-        ImGui::SameLine();
-    }
-
-    if (!panel.isAndroid) {
-        for (const auto& d : getWindowsDrives()) { if (modernSmallButton(d.c_str())) navigateToDirectory(panel, d + "\\"); ImGui::SameLine(); }
-        ImGui::NewLine();
-    } else {
-        // Dynamic bookmarks based on detected storage
-        std::string root = m_androidStorageRoot.empty() ? "/sdcard" : m_androidStorageRoot;
-
-        // Storage volumes (internal + SD cards)
-        for (size_t vi = 0; vi < m_androidVolumes.size(); vi++) {
-            std::string label = (vi == 0) ? "Internal" : "SD " + std::to_string(vi);
-            if (modernSmallButton(label.c_str())) navigateToDirectory(panel, m_androidVolumes[vi]);
-            ImGui::SameLine();
-        }
-        if (m_androidVolumes.empty()) {
-            if (modernSmallButton("Storage")) navigateToDirectory(panel, root);
-            ImGui::SameLine();
-        }
-
-        // Common subfolders
-        const char* subfolders[] = {"Download", "DCIM", "Documents", "Pictures", "Music"};
-        for (const char* sub : subfolders) {
-            if (modernSmallButton(sub)) navigateToDirectory(panel, root + "/" + sub);
-            ImGui::SameLine();
-        }
-
-        // Root access button
-        if (modernSmallButton("/")) navigateToDirectory(panel, "/");
-        ImGui::SameLine();
-        ImGui::NewLine();
-    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
 
     // Ctrl+A — select all
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
@@ -4491,13 +4144,16 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         for (int i = 0; i < panel.entryCount(); i++) panel.selectedIndices.insert(i);
     }
 
-    ImGuiTableFlags tf = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
+    ImGuiTableFlags tf = ImGuiTableFlags_Resizable | ImGuiTableFlags_Hideable | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable;
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * directoryContentAlpha);
-    if (ImGui::BeginTable(("##Tbl" + std::string(label)).c_str(), 3, tf)) {
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_DefaultSort, 0.55f);
-        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthStretch, 0.20f);
-        ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_WidthStretch, 0.25f);
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(10*ui::scale(),(m_prefs.compactRows?3.0f:6.0f)*ui::scale()));
+    ImVec2 tableSize(0,std::max(40.0f,ImGui::GetContentRegionAvail().y-28*ui::scale()));
+    if (ImGui::BeginTable(("##FilesV2" + std::string(label)).c_str(), 3, tf, tableSize)) {
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_DefaultSort, 1.0f);
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 66*ui::scale());
+        ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_WidthFixed, 128*ui::scale());
+        ImGui::TableSetColumnEnabled(2,ImGui::GetWindowWidth()>420*ui::scale());
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
 
@@ -4544,7 +4200,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         }
         if (!atRoot) {
             ImGui::TableNextRow(); ImGui::TableNextColumn();
-            if (ImGui::Selectable("[..]##up", false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick))
+            if (ImGui::Selectable("   ..##up", false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick))
                 if (ImGui::IsMouseDoubleClicked(0)) navigateUp(panel);
             ImGui::TableNextColumn(); ImGui::TableNextColumn();
         }
@@ -4599,16 +4255,27 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
             float rowYMin = ImGui::GetCursorScreenPos().y;
 
             std::string icon = getFileIcon(name, isDir);
+            ui::Icon glyph = isDir ? ui::Icon::Folder : ui::Icon::File;
+            if(icon=="[I]")glyph=ui::Icon::Image;
+            if(icon=="[V]"||icon=="[M]")glyph=ui::Icon::Video;
+            if(icon=="[A]")glyph=ui::Icon::Music;
+            if(icon=="[K]")glyph=ui::Icon::Apps;
+            if(icon=="[Z]")glyph=ui::Icon::Archive;
+            ImVec2 iconPosition = ImGui::GetCursorScreenPos();
+            iconPosition.y += (ImGui::GetTextLineHeight()-16*ui::scale())*0.5f;
             std::string compareTag;
             if (contentState == CompareContentState::SizeMismatch) compareTag = " [size diff]";
             else if (contentState == CompareContentState::HashPending) compareTag = " [hashing]";
             else if (contentState == CompareContentState::HashMatch) compareTag = " [hash ok]";
             else if (contentState == CompareContentState::HashMismatch) compareTag = " [hash diff]";
             else if (contentState == CompareContentState::HashError) compareTag = " [hash error]";
-            std::string sid = icon + " " + name + compareTag + "##" + std::to_string(i);
+            std::string sid = "##File" + std::to_string(i);
+            float nameWidth = ImGui::GetContentRegionAvail().x;
+            ImVec2 textPosition = ImGui::GetCursorScreenPos();
+            textPosition.x += 24*ui::scale();
 
             bool pushedTextColor = true;
-            if (isDir) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f,0.70f,1,1));
+            if (isDir) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_Text));
             else if (contentState == CompareContentState::SizeMismatch ||
                      contentState == CompareContentState::HashMismatch) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f,0.55f,0.50f,1));
             else if (contentState == CompareContentState::HashError) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f,0.65f,1.0f,1));
@@ -4616,7 +4283,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
             else if (contentState == CompareContentState::HashPending) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.78f,0.78f,0.84f,1));
             else if (compareHighlight) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f,0.86f,0.42f,1));
             else pushedTextColor = false;
-            if (isSel) ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.15f,0.28f,0.50f,0.90f));
+            if (isSel) ImGui::PushStyleColor(ImGuiCol_Header, ImGui::GetStyleColorVec4(ImGuiCol_Header));
             ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
 
             ImGuiSelectableFlags sf = ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick;
@@ -4732,20 +4399,22 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                     panel.selectedIndices.insert(i);
                     panel.focusedIndex = i;
                 }
-                DragPayload dp;
-                dp.isAndroid = panel.isAndroid;
+                DragPayload dp{&panel};
                 ImGui::SetDragDropPayload("FILE_DRAG", &dp, sizeof(dp));
                 int selCount = (int)panel.selectedIndices.size();
                 if (selCount == 1) {
-                    ImGui::Text("Move: %s", name.c_str());
+                    ImGui::Text("Copy: %s", name.c_str());
                 } else {
-                    ImGui::Text("Move %d files", selCount);
+                    ImGui::Text("Copy %d items", selCount);
                 }
                 m_dragSourcePanel = &panel;
                 m_isDragging = true;
                 ImGui::EndDragDropSource();
             }
 
+            ImU32 glyphColor = ImGui::GetColorU32(isDir ? (m_resolvedLightTheme ? ImVec4(0.59f,0.41f,0.07f,1) : ImVec4(0.91f,0.73f,0.45f,1)) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ui::icon(glyph,iconPosition,16*ui::scale(),glyphColor);
+            ui::drawTextClipped(textPosition,name+compareTag,nameWidth-24*ui::scale(),ImGui::GetColorU32(ImGuiCol_Text));
             if (isSel) ImGui::PopStyleColor(); // header
             if (pushedTextColor) ImGui::PopStyleColor(); // text
 
@@ -4870,7 +4539,9 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
         }
     }
 
-    ImGui::PopStyleVar(); // directory listing fade
+    ImGui::PopStyleVar(2);
+    ImGui::Separator();
+    ImGui::TextDisabled("%d items%s",panel.entryCount(),panel.selectedIndices.empty()?"":("  |  "+std::to_string(panel.selectedIndices.size())+" selected").c_str());
 }
 
 void App::drawProgressBar(float fraction, const char* overlayText, float height,
@@ -4928,11 +4599,8 @@ void App::renderTransferOverlay() {
         return;
     }
 
-    // Auto-show overlay when a batch starts
+    if (auto selected = m_transferDetailsBatch.lock(); selected && m_overlayVisible) batch = selected;
     BatchState st = batch->state.load();
-    if (st == BatchState::Running || st == BatchState::Paused || st == BatchState::Queued || st == BatchState::Verifying || st == BatchState::WaitingConflict) {
-        if (!m_overlayWasOpen) { m_overlayVisible = true; m_overlayWasOpen = true; }
-    }
 
     // Auto-dismiss on success (no CRC failures)
     if (st == BatchState::Completed && m_prefs.autoDismissTransfer && m_overlayVisible) {
@@ -5218,11 +4886,13 @@ void App::renderTransferOverlay() {
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
         if (modernButton("Overwrite", ImVec2(100, 0))) {
             batch->conflictResponse = ConflictAction::Overwrite;
+            batch->logEvent(LogLevel::Info,"Conflict decision: Overwrite for "+batch->conflictFileName);
             m_batchCV.notify_all();
         }
         ImGui::SameLine();
         if (modernButton("Overwrite All", ImVec2(120, 0))) {
             batch->conflictResponse = ConflictAction::OverwriteAll;
+            batch->logEvent(LogLevel::Info,"Conflict decision: OverwriteAll for "+batch->conflictFileName);
             m_batchCV.notify_all();
         }
         ImGui::PopStyleColor(2);
@@ -5233,11 +4903,13 @@ void App::renderTransferOverlay() {
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.50f, 0.15f, 1));
         if (modernButton("Skip", ImVec2(100, 0))) {
             batch->conflictResponse = ConflictAction::Skip;
+            batch->logEvent(LogLevel::Info,"Conflict decision: Skip for "+batch->conflictFileName);
             m_batchCV.notify_all();
         }
         ImGui::SameLine();
         if (modernButton("Skip All", ImVec2(120, 0))) {
             batch->conflictResponse = ConflictAction::SkipAll;
+            batch->logEvent(LogLevel::Info,"Conflict decision: SkipAll for "+batch->conflictFileName);
             m_batchCV.notify_all();
         }
         ImGui::PopStyleColor(2);
@@ -5250,7 +4922,7 @@ void App::renderTransferOverlay() {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.20f, 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.50f, 0.28f, 1));
         if (modernButton("Retry", ImVec2(120, 0))) {
-            batch->userRetryRequested = true;
+            batch->userRetryRequested = true; batch->logEvent(LogLevel::Info,"Retry requested");
             m_batchCV.notify_all();
         }
         ImGui::PopStyleColor(2);
@@ -5260,7 +4932,7 @@ void App::renderTransferOverlay() {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.12f, 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.18f, 0.18f, 1));
         if (modernButton("Cancel Transfer", ImVec2(140, 0))) {
-            batch->stopRequested = true;
+            batch->stopRequested = true; batch->logEvent(LogLevel::Info,"Cancel requested");
             batch->userRetryRequested = false;
             // Stop is handled by progress callback checking stopRequested every chunk
             m_batchCV.notify_all();
@@ -5291,7 +4963,7 @@ void App::renderTransferOverlay() {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.12f, 0.12f, 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.18f, 0.18f, 1));
         if (modernButton("Cancel Transfer", ImVec2(140, 0))) {
-            batch->stopRequested = true;
+            batch->stopRequested = true; batch->logEvent(LogLevel::Info,"Cancel requested");
             batch->userRetryRequested = false;
             // Stop is handled by progress callback checking stopRequested every chunk
             m_batchCV.notify_all();
@@ -5303,7 +4975,7 @@ void App::renderTransferOverlay() {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f,0.35f,0.20f,1));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f,0.50f,0.28f,1));
             if (modernButton("Resume", ImVec2(90, 0))) {
-                batch->pauseRequested = false;
+                batch->pauseRequested = false; batch->logEvent(LogLevel::Info,"Resume requested");
                 m_batchCV.notify_all();
             }
             ImGui::PopStyleColor(2);
@@ -5311,7 +4983,7 @@ void App::renderTransferOverlay() {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f,0.35f,0.10f,1));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f,0.50f,0.15f,1));
             if (modernButton("Pause", ImVec2(90, 0))) {
-                batch->pauseRequested = true;
+                batch->pauseRequested = true; batch->logEvent(LogLevel::Info,"Pause requested");
             }
             ImGui::PopStyleColor(2);
         }
@@ -5330,8 +5002,8 @@ void App::renderTransferOverlay() {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f,0.12f,0.12f,1));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f,0.18f,0.18f,1));
             if (modernButton("Yes", ImVec2(60, 0))) {
-                batch->stopRequested = true;
-                batch->pauseRequested = false;
+                batch->stopRequested = true; batch->logEvent(LogLevel::Info,"Cancel requested");
+                batch->pauseRequested = false; batch->logEvent(LogLevel::Info,"Resume requested");
                 // Stop is handled by progress callback checking stopRequested every chunk
                 m_batchCV.notify_all();
                 m_confirmStopTransfer = false;
@@ -5423,6 +5095,7 @@ void App::renderTransferOverlay() {
                         retryBatch->totalBytes = retryTotal;
                         {
                             std::lock_guard<std::mutex> lk(m_batchMutex);
+                            retryBatch->logQueued();
                             m_batchQueue.push_back(retryBatch);
                         }
                         m_batchCV.notify_one();
@@ -5492,33 +5165,6 @@ void App::renderTransferOverlay() {
     ImGui::PopStyleVar(); // alpha fade
 }
 
-static std::string buildLogText(const std::vector<LogEntry>& entries, const std::vector<int>& visible,
-                                std::chrono::steady_clock::time_point startTime) {
-    std::string text;
-    text.reserve(visible.size() * 100);
-    char timeBuf[32];
-    for (int idx : visible) {
-        auto& e = entries[idx];
-        double secs = std::chrono::duration<double>(e.time - startTime).count();
-        const char* lvl;
-        switch (e.level) {
-            case LogLevel::Debug: lvl = "DBG"; break;
-            case LogLevel::Info:  lvl = "INF"; break;
-            case LogLevel::Warn:  lvl = "WRN"; break;
-            case LogLevel::Error: lvl = "ERR"; break;
-            default:              lvl = "???"; break;
-        }
-        { auto t = std::chrono::system_clock::to_time_t(e.wallTime);
-          auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(e.wallTime.time_since_epoch()).count() % 1000;
-          struct tm tm; localtime_s(&tm, &t);
-          snprintf(timeBuf, sizeof(timeBuf), "[%02d:%02d:%02d.%03d]", tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms); }
-        text += timeBuf;
-        text += " ["; text += lvl; text += "] ["; text += e.tag; text += "] ";
-        text += e.message;
-        text += "\n";
-    }
-    return text;
-}
 
 void App::startAppUninstall(FilePanel& panel, bool useRoot) {
     struct AppToRemove {
@@ -5591,8 +5237,10 @@ void App::startAppUninstall(FilePanel& panel, bool useRoot) {
                 if (deviceForSlot(slot).uninstallPackage(
                         serial, apps[index].packageName, output, false, true, useRoot)) {
                     ++succeeded;
+                    LOG_INFO("Apps","Uninstalled: "+apps[index].packageName+" from "+serial);
                 } else {
                     ++failed;
+                    LOG_ERROR("Apps","Uninstall failed: "+apps[index].packageName+" on "+serial+": "+output);
                     details += apps[index].displayName + " (" + apps[index].packageName + "): " + output + "\n";
                 }
 
@@ -5633,108 +5281,49 @@ void App::startAppUninstall(FilePanel& panel, bool useRoot) {
 }
 
 void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
+    renderPaneHeader(panel,side);
     if (!deviceFor(panel).isServerRunning()) {
-        ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.25f, 1), "No Android device connected");
-        ImGui::Spacing();
-        if (modernSmallButton(("PC##AppsNoDev" + std::string(side == PanelSide::Left ? "L" : "R")).c_str()))
-            switchPanelMode(panel, false);
-        ImGui::SameLine();
-        if (modernSmallButton(("Android##AppsNoDev" + std::string(side == PanelSide::Left ? "L" : "R")).c_str()))
-            switchPanelMode(panel, true);
-        ImGui::SameLine();
-        if (modernSmallButton(("Connections##AppsNoDev" + std::string(side == PanelSide::Left ? "L" : "R")).c_str()))
-            switchPanelToConnections(panel);
+        ImGui::TextWrapped("Connect an Android device to view installed apps.");
+        if(ui::button("Connect a device",ui::Icon::Phone,ui::Appearance::Secondary)) {
+            m_showConnectionsWorkspace=true;m_showAppsWorkspace=false;m_connectionsWorkspacePanel.isConnections=true;
+        }
         return;
     }
-
     std::string sideId = side == PanelSide::Left ? "L" : "R";
-    if (modernSmallButton(("PC##Apps" + sideId).c_str())) switchPanelMode(panel, false);
-    ImGui::SameLine(0, 2);
-    if (modernSmallButton(("Android##Apps" + sideId).c_str())) switchPanelMode(panel, true);
-    ImGui::SameLine(0, 2);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.26f, 0.08f, 1));
-    modernSmallButton(("Apps##Apps" + sideId).c_str());
-    ImGui::PopStyleColor();
-    ImGui::SameLine(0, 2);
-    if (modernSmallButton(("Connections##Apps" + sideId).c_str())) switchPanelToConnections(panel);
-
-    ImGui::SameLine(0, 10);
-    ImGui::TextColored(m_theme.gradientPrimary, "Installed Apps");
-    {
-        std::lock_guard<std::mutex> lk(m_deviceMutex);
-        int onlineCount = 0;
-        for (int slot = 0; slot < 2; ++slot)
-            if (m_slotConnected[slot] && m_deviceSlots[slot].isServerRunning()) onlineCount++;
-        auto getSlotName = [&](int slot) -> std::string {
-            if (slot < 0 || slot >= 2 || !m_slotConnected[slot]) return "No device";
-            auto it = m_deviceDisplayNames.find(m_slotSerial[slot]);
-            if (it != m_deviceDisplayNames.end()) return it->second;
-            for (auto& d : m_devices) {
-                if (d.serial == m_slotSerial[slot])
-                    return d.model.empty() ? d.serial : d.model;
-            }
-            return m_slotSerial[slot];
-        };
-        if (onlineCount > 1) {
-            ImGui::SameLine(0, 8);
-            std::string comboId = "##AppsDevSlot" + sideId;
-            std::string currentName = getSlotName(panel.deviceSlot);
-            ImGui::SetNextItemWidth(200);
-            if (ImGui::BeginCombo(comboId.c_str(), currentName.c_str())) {
-                for (int di = 0; di < 2; di++) {
-                    if (!m_slotConnected[di]) continue;
-                    bool selected = panel.deviceSlot == di;
-                    std::string label = getSlotName(di) + " (" + m_slotSerial[di] + ")##appsSlot" + std::to_string(di);
-                    if (ImGui::Selectable(label.c_str(), selected)) {
-                        if (panel.deviceSlot != di) {
-                            panel.deviceSlot = di;
-                            panel.appEntries.clear();
-                            panel.selectedIndices.clear();
-                            panel.refreshInProgress = false;
-                            panel.needsRefresh = true;
-                        }
-                    }
-                    if (selected) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Switch which device this app list uses");
-        } else {
-            ImGui::SameLine(0, 8);
-            ImGui::TextDisabled("%s", getSlotName(panel.deviceSlot).c_str());
-        }
+    const float s=ui::scale();
+    if(ui::button("Install APK",ui::Icon::Plus,ui::Appearance::Primary)) {
+        wchar_t path[32768] = {};
+        OPENFILENAMEW dialog = {};
+        dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=g_mainHwnd;
+        dialog.lpstrFilter=L"Android packages (*.apk)\0*.apk\0All files\0*.*\0";
+        dialog.lpstrFile=path;dialog.nMaxFile=(DWORD)std::size(path);
+        dialog.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
+        if(GetOpenFileNameW(&dialog))requestApkInstall(pathToUtf8(std::filesystem::path(path)));
     }
-    ImGui::SameLine(0, 10);
-    if (modernSmallButton(("Refresh##Apps" + sideId).c_str())) panel.needsRefresh = true;
-
-    auto uninstallSelectedAppsFromMenu = [this, &panel](bool useRoot) {
-        startAppUninstall(panel, useRoot);
-    };
-
-    ImGui::SameLine(0, 10);
-    bool hasSelection = !panel.selectedIndices.empty();
-    ImGui::BeginDisabled(!hasSelection || m_asyncBusy.load());
-    if (modernSmallButton(("Uninstall##Apps" + sideId).c_str())) {
-        startAppUninstall(panel, false);
-    }
-    ImGui::SameLine(0, 4);
-    if (modernSmallButton(("Root Uninstall##Apps" + sideId).c_str())) {
-        startAppUninstall(panel, true);
-    }
+    ImGui::SameLine(0,8*s);
+    bool hasSelection=!panel.selectedIndices.empty();
+    ImGui::BeginDisabled(!hasSelection||m_asyncBusy.load());
+    if(ui::button("Uninstall",ui::Icon::Trash,ui::Appearance::Secondary))startAppUninstall(panel,false);
     ImGui::EndDisabled();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Uses root for the package manager command. System partitions may still be read-only.");
-
-    ImGui::SameLine(0, 10);
-    ImGui::SetNextItemWidth(220);
-    ImGui::InputText(("Search##AppsSearch" + sideId).c_str(), panel.searchFilter, sizeof(panel.searchFilter));
-    if (panel.refreshInProgress) {
-        ImGui::SameLine(0, 10);
-        ImGui::TextDisabled("Loading...");
+    ImGui::SameLine(0,4*s);
+    if(ui::button("##AppActions",ui::Icon::More,ui::Appearance::Quiet,ImVec2(32*s,32*s),"App actions"))ImGui::OpenPopup("##AppActionsMenu");
+    if(ImGui::BeginPopup("##AppActionsMenu")) {
+        if(ImGui::MenuItem("Uninstall with root",nullptr,false,hasSelection&&!m_asyncBusy))startAppUninstall(panel,true);
+        ui::tooltip("Uses root for the package manager command.");
+        ImGui::EndPopup();
     }
-    ImGui::Separator();
-
+    float refreshWidth=ImGui::CalcTextSize("Refresh").x+45*s;
+    ImGui::SameLine(ImGui::GetWindowWidth()-ImGui::GetStyle().WindowPadding.x-refreshWidth);
+    if(ui::button("Refresh##Apps",ui::Icon::Refresh,ui::Appearance::Secondary))panel.needsRefresh=true;
+    auto uninstallSelectedAppsFromMenu=[this,&panel](bool useRoot){startAppUninstall(panel,useRoot);};
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(10*s,9*s));
+    ImGui::SetNextItemWidth(140*s);
+    const char* appTypeLabels[]={"All apps","User apps","System apps"};
+    ImGui::Combo("##AppTypeFilter",&panel.appTypeFilter,appTypeLabels,3);
+    ImGui::SameLine(0,8*s);
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("##AppsSearch","Search by app name or package",panel.searchFilter,sizeof(panel.searchFilter));
+    ImGui::PopStyleVar();
     if (m_appUninstallActive && m_appUninstallPanel == &panel) {
         ImVec2 available = ImGui::GetContentRegionAvail();
         ImGui::BeginChild(("##AppUninstallProgress" + sideId).c_str(), available, 0,
@@ -5821,21 +5410,16 @@ void App::renderAppsPanel(FilePanel& panel, PanelSide side) {
         m_lastFocusedPanel = &panel;
     }
 
-    ImGui::TextDisabled("Show");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(120);
-    const char* appTypeLabels[] = { "All apps", "User apps", "System apps" };
-    ImGui::Combo(("##AppTypeFilter" + sideId).c_str(), &panel.appTypeFilter, appTypeLabels, 3);
-    ImGui::SameLine(0, 10);
-    if (modernSmallButton(("Select All##Apps" + sideId).c_str())) {
-        for (int i = 0; i < (int)panel.appEntries.size(); ++i)
-            if (appVisible(panel.appEntries[i])) panel.selectedIndices.insert(i);
+    if(ui::button("Select all",ui::Icon::Check,ui::Appearance::Quiet,ImVec2(110*s,28*s))) {
+        for(int index:visibleAppIndices)panel.selectedIndices.insert(index);
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Select every app currently shown by the type and search filters");
-    ImGui::SameLine(0, 4);
-    if (modernSmallButton(("Clear Selection##Apps" + sideId).c_str())) panel.selectedIndices.clear();
-    ImGui::SameLine(0, 10);
-    ImGui::TextDisabled("%d shown, %d selected", (int)visibleAppIndices.size(), (int)panel.selectedIndices.size());
+    ImGui::SameLine(0,4*s);
+    ImGui::BeginDisabled(panel.selectedIndices.empty());
+    if(ui::button("Clear selection",ui::Icon::Close,ui::Appearance::Quiet,ImVec2(140*s,28*s)))panel.selectedIndices.clear();
+    ImGui::EndDisabled();
+    ImGui::SameLine(0,16*s);
+    ui::textClipped(panel.refreshInProgress?"Loading apps...":std::to_string(visibleAppIndices.size())+" apps / "+
+        std::to_string(panel.selectedIndices.size())+" selected",ImGui::GetContentRegionAvail().x,ImGui::GetColorU32(ImGuiCol_TextDisabled),28*s);
     ImGui::Separator();
 
     ImGuiTableFlags tf = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg |
@@ -8574,6 +8158,7 @@ void App::renderCopyMoveDialog() {
             m_pendingBatch->isMove = false;
             {
                 std::lock_guard<std::mutex> lk(m_batchMutex);
+                m_pendingBatch->logQueued();
                 m_batchQueue.push_back(m_pendingBatch);
             }
             m_batchCV.notify_one();
@@ -8592,6 +8177,7 @@ void App::renderCopyMoveDialog() {
             m_pendingBatch->isMove = true;
             {
                 std::lock_guard<std::mutex> lk(m_batchMutex);
+                m_pendingBatch->logQueued();
                 m_batchQueue.push_back(m_pendingBatch);
             }
             m_batchCV.notify_one();
@@ -9210,6 +8796,7 @@ void App::renderCrossDeviceDialog() {
             m_pendingBatch->useDokanRelay = false;
             {
                 std::lock_guard<std::mutex> lk(m_batchMutex);
+                m_pendingBatch->logQueued();
                 m_batchQueue.push_back(m_pendingBatch);
             }
             m_batchCV.notify_one();
@@ -9231,6 +8818,7 @@ void App::renderCrossDeviceDialog() {
             m_pendingBatch->useDokanRelay = true;
             {
                 std::lock_guard<std::mutex> lk(m_batchMutex);
+                m_pendingBatch->logQueued();
                 m_batchQueue.push_back(m_pendingBatch);
             }
             m_batchCV.notify_one();
@@ -9410,6 +8998,7 @@ void App::renderNotificationPopup() {
 }
 
 void App::showNotification(const std::string& title, const std::string& message, bool isError) {
+    DebugLog::instance().log(isError?LogLevel::Error:LogLevel::Info,"Activity",title+": "+message);
     std::lock_guard<std::mutex> lk(m_notificationMutex);
     m_notificationTitle = title;
     m_notificationMessage = message;
@@ -10100,7 +9689,7 @@ void App::applyScale(float newScale) {
     io.Fonts->Clear();
 
     float effectiveScale = m_systemDpiScale * newScale;
-    float fontSize = 16.0f * effectiveScale;
+    float fontSize = 14.0f * effectiveScale;
 
     ImFontConfig fontCfg;
     fontCfg.OversampleH = 3;
@@ -10132,6 +9721,10 @@ void App::applyScale(float newScale) {
         fontCfg.SizePixels = fontSize;
         mainFont = io.Fonts->AddFontDefault(&fontCfg);
     }
+
+    std::string semiboldPath=std::string(winDir)+"\\Fonts\\seguisb.ttf";
+    ui::semiboldFont=io.Fonts->AddFontFromFileTTF(semiboldPath.c_str(),fontSize,&fontCfg,glyphRanges);
+    if(!ui::semiboldFont)ui::semiboldFont=mainFont;
 
     io.Fonts->Build();
 
@@ -10427,198 +10020,98 @@ void App::renderThemeWindow() {
 }
 
 void App::renderDebugWindow() {
-    ImGui::SetNextWindowSize(ImVec2(800, 450), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Debug Log (F12)", &m_showDebugWindow)) { ImGui::End(); return; }
-
-    // Toolbar
-    auto entries = DebugLog::instance().snapshot();
-    auto startTime = entries.empty() ? std::chrono::steady_clock::now() : entries.front().time;
-
-    // Pre-filter into indices
+    const float s=ui::scale();
+    auto* viewport=ImGui::GetMainViewport();
+    ImGui::SetNextWindowSize(ImVec2(std::min(1000*s,viewport->WorkSize.x-32*s),std::min(560*s,viewport->WorkSize.y-32*s)),ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(580*s,300*s),viewport->WorkSize);
+    if(!ImGui::Begin("Activity log (F12)",&m_showDebugWindow)){ImGui::End();return;}
+    auto& logger=DebugLog::instance();
+    auto entries=logger.snapshot();
+    auto lower=[](std::string value){for(char& c:value)c=(char)std::tolower((unsigned char)c);return value;};
+    std::string query=lower(m_debugTagFilter);
     std::vector<int> visible;
-    visible.reserve(entries.size());
-    for (int i = 0; i < (int)entries.size(); i++) {
-        auto& e = entries[i];
-        if ((int)e.level < m_debugLevelFilter) continue;
-        if (m_debugTagFilter[0] && e.tag.find(m_debugTagFilter) == std::string::npos) continue;
+    int errors=0,warnings=0;
+    for(int i=0;i<(int)entries.size();++i) {
+        const auto& entry=entries[i];
+        if(entry.level==LogLevel::Error)++errors;
+        if(entry.level==LogLevel::Warn)++warnings;
+        if((int)entry.level<m_debugLevelFilter)continue;
+        if(!query.empty()&&lower(entry.tag+" "+entry.message).find(query)==std::string::npos)continue;
         visible.push_back(i);
     }
-
-    if (modernButton("Copy All")) {
-        std::string text = buildLogText(entries, visible, startTime);
-        ImGui::SetClipboardText(text.c_str());
-    }
-    ImGui::SameLine();
-    if (modernButton("Clear")) DebugLog::instance().clear();
-    ImGui::SameLine();
-    ImGui::Checkbox("Auto-scroll", &m_debugAutoScroll);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(100);
-    const char* levels[] = { "All", "Info+", "Warn+", "Error" };
-    ImGui::Combo("Level", &m_debugLevelFilter, levels, 4);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(150);
-    ImGui::InputTextWithHint("##TagFilter", "Filter tag...", m_debugTagFilter, sizeof(m_debugTagFilter));
-    ImGui::SameLine();
-    ImGui::TextDisabled("(%d / %d entries)", (int)visible.size(), (int)entries.size());
-    ImGui::Separator();
-
-    // Log content area
-    ImGui::BeginChild("##LogScroll", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
-
-    ImGuiListClipper clipper;
-    clipper.Begin((int)visible.size());
-    while (clipper.Step()) {
-        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-            auto& e = entries[visible[row]];
-            double secs = std::chrono::duration<double>(e.time - startTime).count();
-
-            ImVec4 col;
-            const char* lvl;
-            switch (e.level) {
-                case LogLevel::Debug: col = ImVec4(0.5f,0.5f,0.5f,1); lvl = "DBG"; break;
-                case LogLevel::Info:  col = ImVec4(0.7f,0.9f,1.0f,1); lvl = "INF"; break;
-                case LogLevel::Warn:  col = ImVec4(1.0f,0.8f,0.3f,1); lvl = "WRN"; break;
-                case LogLevel::Error: col = ImVec4(1.0f,0.3f,0.3f,1); lvl = "ERR"; break;
-                default:              col = ImVec4(1,1,1,1);           lvl = "???"; break;
-            }
-
-            // Build the line text for selection
-            char timeBuf[32];
-            { auto t = std::chrono::system_clock::to_time_t(e.wallTime);
-              auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(e.wallTime.time_since_epoch()).count() % 1000;
-              struct tm tm; localtime_s(&tm, &t);
-              snprintf(timeBuf, sizeof(timeBuf), "[%02d:%02d:%02d.%03d] [%s] [%-8s] ",
-                       tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms, lvl, e.tag.c_str()); }
-            std::string lineText = std::string(timeBuf) + e.message;
-
-            // Selectable row — right-click to copy individual line
-            ImGui::PushID(row);
-            if (ImGui::Selectable("##line", false, ImGuiSelectableFlags_AllowOverlap)) {
-                ImGui::SetClipboardText(lineText.c_str());
-            }
-            if (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
-                ImGui::SetClipboardText(lineText.c_str());
-            }
-            ImGui::SameLine(0, 0);
-
-            // Colored rendering on top
-            { auto t2 = std::chrono::system_clock::to_time_t(e.wallTime);
-              auto ms2 = std::chrono::duration_cast<std::chrono::milliseconds>(e.wallTime.time_since_epoch()).count() % 1000;
-              struct tm tm2; localtime_s(&tm2, &t2);
-              ImGui::TextDisabled("[%02d:%02d:%02d.%03d]", tm2.tm_hour, tm2.tm_min, tm2.tm_sec, (int)ms2); }
-            ImGui::SameLine();
-            ImGui::TextColored(col, "[%s]", lvl);
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.4f,0.7f,1,1), "[%-8s]", e.tag.c_str());
-            ImGui::SameLine();
-            if (e.level == LogLevel::Error)
-                ImGui::TextColored(col, "%s", e.message.c_str());
-            else
-                ImGui::TextUnformatted(e.message.c_str());
-            ImGui::PopID();
+    auto exportText=[&](){std::string text;for(int index:visible)text+=DebugLog::format(entries[index])+"\r\n";return text;};
+    if(ui::button("Copy visible",ui::Icon::Copy,ui::Appearance::Secondary))ImGui::SetClipboardText(exportText().c_str());
+    ImGui::SameLine(0,8*s);
+    if(ui::button("Export visible",ui::Icon::File,ui::Appearance::Secondary)) {
+        wchar_t path[32768]=L"FastEnough-activity.txt";
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=g_mainHwnd;
+        dialog.lpstrFilter=L"Text files (*.txt)\0*.txt\0All files\0*.*\0";
+        dialog.lpstrFile=path;dialog.nMaxFile=(DWORD)std::size(path);dialog.lpstrDefExt=L"txt";
+        dialog.Flags=OFN_OVERWRITEPROMPT|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
+        if(GetSaveFileNameW(&dialog)) {
+            std::ofstream output(std::filesystem::path(path),std::ios::binary);
+            output<<exportText();output.close();
+            if(!output)showNotification("Export failed","Could not write the log to the selected location.",true);
+            else LOG_INFO("Activity","Exported activity log: "+pathToUtf8(std::filesystem::path(path)));
         }
     }
-    clipper.End();
-
-    if (m_debugAutoScroll && DebugLog::instance().m_scrollToBottom) {
-        ImGui::SetScrollHereY(1.0f);
-        DebugLog::instance().m_scrollToBottom = false;
+    ImGui::SameLine(0,8*s);
+    if(ui::button("Log folder",ui::Icon::Folder,ui::Appearance::Secondary)) {
+        auto folder=toFsPath(logger.filePath()).parent_path();
+        auto result=ShellExecuteW(g_mainHwnd,L"explore",folder.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+        if((INT_PTR)result<=32)LOG_ERROR("Activity","Cannot open log folder, ShellExecute error "+std::to_string((INT_PTR)result));
     }
-
+    ImGui::SameLine(0,8*s);
+    if(ui::button("Clear view",ui::Icon::Trash,ui::Appearance::Quiet))logger.clear();
+    ui::tooltip("Clear the in-app history. Saved log files are kept.");
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(10*s,9*s));
+    const char* levels[]={"All events","Info and above","Warnings and errors","Errors only"};
+    ImGui::SetNextItemWidth(175*s);ImGui::Combo("##LogLevel",&m_debugLevelFilter,levels,4);
+    ImGui::SameLine(0,8*s);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x-96*s);
+    ImGui::InputTextWithHint("##LogSearch","Search operations, paths or errors",m_debugTagFilter,sizeof(m_debugTagFilter));
+    ImGui::SameLine(0,8*s);ImGui::Checkbox("Follow",&m_debugAutoScroll);
+    ImGui::PopStyleVar();
+    ImGui::TextDisabled("%d visible / %d recent events    %d warnings    %d errors",(int)visible.size(),(int)entries.size(),warnings,errors);
+    std::string fileError=logger.fileError();
+    if(!fileError.empty())ImGui::TextWrapped("Local log unavailable: %s",fileError.c_str());
+    ui::textClipped(logger.filePath(),ImGui::GetContentRegionAvail().x,ImGui::GetColorU32(ImGuiCol_TextDisabled));
+    ImGui::Separator();
+    ImGui::BeginChild("##LogScroll",ImVec2(0,0),ImGuiChildFlags_None,ImGuiWindowFlags_HorizontalScrollbar);
+    ImGuiListClipper clipper;
+    clipper.Begin((int)visible.size(),ImGui::GetTextLineHeight()+6*s+ImGui::GetStyle().ItemSpacing.y);
+    while(clipper.Step())for(int row=clipper.DisplayStart;row<clipper.DisplayEnd;++row) {
+        const auto& entry=entries[visible[row]];
+        std::string line=DebugLog::format(entry);
+        ImVec2 origin=ImGui::GetCursorScreenPos();
+        ImGui::PushID(row);
+        if(ImGui::Selectable("##LogEntry",false,ImGuiSelectableFlags_None,
+            ImVec2(std::max(ImGui::GetContentRegionAvail().x,ImGui::CalcTextSize(line.c_str()).x),ImGui::GetTextLineHeight()+6*s)))
+            ImGui::SetClipboardText(line.c_str());
+        ui::tooltip("Click to copy this event");
+        ImU32 color=ImGui::GetColorU32(entry.level==LogLevel::Debug?ImGuiCol_TextDisabled:ImGuiCol_Text);
+        if(entry.level==LogLevel::Error)color=ImGui::GetColorU32(m_resolvedLightTheme?ImVec4(.7f,.14f,.18f,1):ImVec4(1,.55f,.57f,1));
+        if(entry.level==LogLevel::Warn)color=ImGui::GetColorU32(m_resolvedLightTheme?ImVec4(.55f,.34f,.02f,1):ImVec4(.93f,.75f,.43f,1));
+        ImGui::GetWindowDrawList()->AddText(ImVec2(origin.x,origin.y+3*s),color,line.c_str());
+        ImGui::PopID();
+    }
+    if(logger.m_scrollToBottom.exchange(false)&&m_debugAutoScroll)ImGui::SetScrollHereY(1);
     ImGui::EndChild();
     ImGui::End();
 }
 
 void App::renderStatusBar() {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_ChildBg));
-    float statusBarH = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y * 2.0f;
-    ImGui::BeginChild("##StatusBar", ImVec2(0, statusBarH), ImGuiChildFlags_Borders);
-    float padY = (statusBarH - ImGui::GetFontSize()) * 0.5f;
-    ImGui::SetCursorPos(ImVec2(8, padY));
-
-    ImGui::TextDisabled("Windows: %d items", m_leftPanel.entryCount());
-    ImGui::SameLine(0, 20);
-
-    int ls = (int)m_leftPanel.selectedIndices.size();
-    int rs = (int)m_rightPanel.selectedIndices.size();
-    if (ls > 0) {
-        ImGui::Text("| %d selected, %s (PC)", ls, formatSize(m_leftPanel.selectedFileSize()).c_str());
-        ImGui::SameLine(0, 20);
-    }
-    if (rs > 0) {
-        ImGui::Text("| %d selected, %s (Android)", rs, formatSize(m_rightPanel.selectedFileSize()).c_str());
-        ImGui::SameLine(0, 20);
-    }
-
-    ImGui::TextDisabled("| Android: %d items", m_rightPanel.entryCount());
-    ImGui::SameLine(0, 20);
-
-    // Status message - show device client status if poll is active, otherwise app status
-    {
-        std::string devStatus = m_device.statusText();
-        if (m_primaryReconnectActive.load() && !devStatus.empty()) {
-            // Live status from device client takes priority
-            ImGui::TextColored(ImVec4(0.4f, 0.7f, 1, 1), "| %s", devStatus.c_str());
-            ImGui::SameLine(0, 20);
-        }
-    }
-    auto elapsed = std::chrono::steady_clock::now() - m_statusTime;
-    if (!m_statusMessage.empty() && elapsed < std::chrono::seconds(15)) {
-        ImGui::TextColored(ImVec4(0.3f,0.9f,0.5f,1), "| %s", m_statusMessage.c_str());
-        ImGui::SameLine(0, 20);
-    }
-
-    // Show transfer indicator if overlay is hidden but transfer is active
-    if (!m_overlayVisible) {
-        std::lock_guard<std::mutex> lk(m_batchMutex);
-        for (auto& b : m_batchQueue) {
-            BatchState s = b->state.load();
-            if (s == BatchState::Running || s == BatchState::Paused || s == BatchState::Verifying) {
-                if (s == BatchState::Verifying) {
-                    int ph = b->crcPhase.load();
-                    if (ph == 1)
-                        ImGui::TextColored(ImVec4(0.5f,0.4f,0.9f,1), "| Verifying: Device CRC...");
-                    else {
-                        float crcPct = b->crcProgress.load() * 100.0f;
-                        ImGui::TextColored(ImVec4(0.5f,0.4f,0.9f,1), "| Verifying: Local %.0f%%", crcPct);
-                    }
-                } else {
-                    float pct = b->totalProgress.load() * 100.0f;
-                    ImGui::TextColored(ImVec4(0.4f,0.7f,1,1), "| Transfer: %.0f%%", pct);
-                }
-                ImGui::SameLine();
-                if (modernSmallButton("Show")) m_overlayVisible = true;
-                ImGui::SameLine(0, 20);
-                break;
-            }
-        }
-    }
-
-    // Connection mode indicator - always show when device is selected
-    if (m_selectedDevice >= 0) {
-        std::string mode;
-        if (!m_device.isServerRunning())
-            mode = "[Connecting...]";
-        else if (m_device.isDirectConnection())
-            mode = "[Direct TCP: " + m_device.deviceIp() + "]";
-        else
-            mode = "[ADB Forward]";
-
-        float tw = ImGui::CalcTextSize(mode.c_str()).x;
-        ImGui::SameLine(ImGui::GetWindowWidth() - tw - 16);
-
-        if (!m_device.isServerRunning()) {
-            ImGui::TextColored(ImVec4(1, 0.7f, 0.2f, 1), "%s", mode.c_str());
-        } else if (m_device.isDirectConnection()) {
-            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1), "%s", mode.c_str());
-        } else {
-            ImGui::TextUnformatted(mode.c_str());
-        }
-    }
-
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
+    float s=ui::scale();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(18*s,5*s));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,0);
+    ImGui::BeginChild("##StatusBar",ImVec2(0,28*s),ImGuiChildFlags_None,ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_AlwaysUseWindowPadding);
+    auto elapsed=std::chrono::steady_clock::now()-m_statusTime;
+    std::string message="F5 Refresh   |   F2 Rename   |   Ctrl+L Folder path   |   F12 Activity log";
+    if(m_asyncBusy)message=m_asyncStatus;
+    else if(!m_statusMessage.empty()&&elapsed<std::chrono::seconds(15))message=m_statusMessage;
+    ui::textClipped(message,ImGui::GetContentRegionAvail().x,ImGui::GetColorU32(ImGuiCol_TextDisabled));
+    ImGui::EndChild();ImGui::PopStyleVar(2);
 }
 
 void App::renderContextMenu(FilePanel& panel) {
@@ -10711,10 +10204,24 @@ void App::renderNewFolderPopup() {
         if ((modernButton("Create", ImVec2(120,0)) || enter) && strlen(m_newFolderName) > 0 && m_contextPanel) {
             if (m_contextPanel->isAndroid) {
                 std::string mkdirPath = m_contextPanel->currentPath + "/" + m_newFolderName;
-                if (m_selectedDevice >= 0) { int slot = m_contextPanel->deviceSlot; postAsync("Creating folder...", [this, mkdirPath, slot]() { deviceForSlot(slot).createDirectory(mkdirPath); }); }
+                if (m_selectedDevice >= 0) { int slot = m_contextPanel->deviceSlot; FilePanel* target=m_contextPanel; postAsync("Creating folder: "+mkdirPath, [this, mkdirPath, slot, target]() {
+                    auto& device=deviceForSlot(slot);
+                    bool ok=device.createDirectory(mkdirPath);
+                    DebugLog::instance().log(ok?LogLevel::Info:LogLevel::Error,"Files",
+                        std::string(ok?"Created folder: ":"Create folder failed: ")+mkdirPath+(ok?"":": "+device.lastError()));
+                    UiMessage message;
+                    message.hasStatus=true;
+                    message.status=ok?"Created folder: "+mkdirPath:"Create folder failed: "+device.lastError();
+                    message.refreshFilePanel=target;
+                    postUiMessage(std::move(message));
+                }); }
             } else {
                 std::string p = m_contextPanel->currentPath; appendPathSeparator(p, '\\'); p+=m_newFolderName;
-                std::filesystem::create_directories(p);
+                std::error_code error;
+                bool created=std::filesystem::create_directories(toFsPath(p),error);
+                DebugLog::instance().log(error?LogLevel::Error:LogLevel::Info,"Files",
+                    std::string(error?"Create folder failed: ":created?"Created folder: ":"Folder already exists: ")+p+(error?": "+error.message():""));
+                if (error) showNotification("Create folder failed",p+": "+error.message(),true);
             }
             m_contextPanel->needsRefresh = true; ImGui::CloseCurrentPopup();
         }
@@ -10759,9 +10266,11 @@ void App::renderRenamePopup() {
                         if (device.renameFile(fromP, toP)) {
                             message.hasStatus = true;
                             message.status = "Renamed to " + newN;
+                            LOG_INFO("Files","Renamed: "+fromP+" -> "+toP);
                         } else {
                             message.hasNotification = true;
                             message.notificationTitle = "Rename Failed";
+                            LOG_ERROR("Files","Rename failed: "+fromP+" -> "+toP+": "+device.lastError());
                             message.notificationMessage = device.lastError();
                             message.notificationIsError = true;
                         }
@@ -10772,9 +10281,11 @@ void App::renderRenamePopup() {
                     std::string bp = m_contextPanel->currentPath; appendPathSeparator(bp, '\\');
                     try {
                         std::filesystem::rename(toFsPath(bp+oldN), toFsPath(bp+newN));
+                        LOG_INFO("Files","Renamed: "+bp+oldN+" -> "+bp+newN);
                         m_statusMessage = "Renamed to " + newN;
                         m_statusTime = std::chrono::steady_clock::now();
                     } catch (const std::exception& e) {
+                        LOG_ERROR("Files","Rename failed: "+bp+oldN+" -> "+bp+newN+": "+e.what());
                         m_statusMessage = std::string("Rename failed: ") + e.what(); m_statusTime = std::chrono::steady_clock::now();
                     }
                 }
@@ -10856,7 +10367,8 @@ void App::renderDeleteConfirmPopup() {
                                 if (!deviceForSlot(slot).deleteFile(p)) {
                                     failed++;
                                     lastError = deviceForSlot(slot).lastError();
-                                }
+                                    LOG_ERROR("Files","Delete failed: "+p+": "+lastError);
+                                } else LOG_INFO("Files","Deleted: "+p);
                             }
                             FilePanel& panel = refreshLeft ? m_leftPanel : m_rightPanel;
                             panel.needsRefresh = true;
@@ -10880,11 +10392,13 @@ void App::renderDeleteConfirmPopup() {
                         p += m_contextPanel->entryName(idx);
                         paths.push_back(p);
                     }
+                    for (const auto& path:paths) LOG_INFO("Files",std::string(m_deletePermanent?"Permanent delete requested: ":"Recycle requested: ")+path);
                     std::string error;
                     if (!deleteWindowsFiles(paths, m_deletePermanent, error)) {
+                        LOG_ERROR("Files","Delete failed or cancelled: "+error);
                         m_statusMessage = "Delete failed: " + error;
                         m_statusTime = std::chrono::steady_clock::now();
-                    }
+                    } else LOG_INFO("Files","Delete completed, "+std::to_string(paths.size())+" items");
                     m_contextPanel->needsRefresh = true;
                 }
                 m_contextIndex = -1; m_contextPanel = nullptr;
@@ -10942,7 +10456,9 @@ void App::performClipboardPaste(FilePanel& dstPanel) {
                         else
                             std::filesystem::copy_file(srcPath, dstPath, std::filesystem::copy_options::overwrite_existing);
                     }
+                    LOG_INFO("Files",std::string(isCut?"Moved: ":"Copied: ")+src+" -> "+dst);
                 } catch (const std::exception& e) {
+                    LOG_ERROR("Files","Paste failed: "+src+" -> "+dstDir+": "+e.what());
                     m_statusMessage = std::string("Paste failed: ") + e.what();
                     m_statusTime = std::chrono::steady_clock::now();
                 }
@@ -11002,11 +10518,12 @@ void App::refreshWindowsPanel(FilePanel& panel) {
     std::error_code iterEc;
     std::filesystem::directory_iterator it(toFsPath(panel.currentPath), std::filesystem::directory_options::skip_permission_denied, iterEc);
     if (iterEc) {
+        LOG_ERROR("Files","List folder failed: "+panel.currentPath+": "+iterEc.message());
         m_statusMessage = "Error: " + iterEc.message();
         m_statusTime = std::chrono::steady_clock::now();
     } else {
         for (const auto end = std::filesystem::directory_iterator(); it != end; it.increment(iterEc)) {
-            if (iterEc) { iterEc.clear(); continue; }
+            if (iterEc) { LOG_ERROR("Files","Reading folder failed: "+panel.currentPath+": "+iterEc.message()); break; }
             const auto& entry = *it;
             WindowsFileEntry fe;
             fe.name = pathToUtf8(entry.path().filename());
@@ -11245,6 +10762,7 @@ void App::forEachAndroidPanel(std::function<void(FilePanel&)> fn) {
 void App::forEachDevicePanel(std::function<void(FilePanel&)> fn) {
     if (m_leftPanel.isAndroid || m_leftPanel.isApps) fn(m_leftPanel);
     if (m_rightPanel.isAndroid || m_rightPanel.isApps) fn(m_rightPanel);
+    if (m_appsWorkspacePanel.isApps) fn(m_appsWorkspacePanel);
 }
 
 void App::navigateUp(FilePanel& panel) {
@@ -12726,7 +12244,13 @@ static void buildLocalBatchItems(FilePanel& srcPanel, FilePanel& dstPanel,
     }
 }
 
-void App::startTransfer(bool pullFromAndroid) {
+void App::startWorkspaceTransfer(bool move) {
+    FilePanel& source = m_lastFocusedPanel == &m_leftPanel ? m_leftPanel : m_rightPanel;
+    if (!panelAvailable(source)) return;
+    startTransfer(source.isAndroid, move);
+}
+
+void App::startTransfer(bool pullFromAndroid, bool move) {
     if (m_leftPanel.isConnections || m_rightPanel.isConnections) {
         m_statusMessage = "Choose a file view in both panes before starting a transfer";
         m_statusTime = std::chrono::steady_clock::now();
@@ -12741,7 +12265,6 @@ void App::startTransfer(bool pullFromAndroid) {
     // Determine source and destination panels based on their modes
     FilePanel* srcPtr = nullptr;
     FilePanel* dstPtr = nullptr;
-    bool localCopy = false;
 
     bool bothWindows = !m_leftPanel.isAndroid && !m_rightPanel.isAndroid;
     bool bothAndroid = m_leftPanel.isAndroid && m_rightPanel.isAndroid;
@@ -12750,7 +12273,6 @@ void App::startTransfer(bool pullFromAndroid) {
         // Windows-to-Windows: use focused panel as source, other as destination
         srcPtr = (m_lastFocusedPanel == &m_rightPanel) ? &m_rightPanel : &m_leftPanel;
         dstPtr = (srcPtr == &m_leftPanel) ? &m_rightPanel : &m_leftPanel;
-        localCopy = true;
     } else if (bothAndroid) {
         // Android-to-Android: need two different devices
         if (m_leftPanel.deviceSlot == m_rightPanel.deviceSlot) {
@@ -12774,16 +12296,53 @@ void App::startTransfer(bool pullFromAndroid) {
         }
     }
 
-    FilePanel& src = *srcPtr;
-    FilePanel& dst = *dstPtr;
+    queuePanelTransfer(*srcPtr,*dstPtr,move);
+}
+
+void App::queuePanelTransfer(FilePanel& src, FilePanel& dst, bool move) {
+    if (&src==&dst || src.isConnections || dst.isConnections || src.isApps || dst.isApps) return;
+    if (!panelAvailable(src) || !panelAvailable(dst)) {
+        LOG_WARN("Transfer","Copy rejected because a selected location is disconnected");
+        m_statusMessage="Connect both locations before copying files";
+        m_statusTime=std::chrono::steady_clock::now();
+        return;
+    }
+    bool localCopy=!src.isAndroid && !dst.isAndroid;
+    bool bothAndroid=src.isAndroid && dst.isAndroid;
+    if (bothAndroid && src.deviceSlot==dst.deviceSlot) {
+        LOG_WARN("Transfer","Copy rejected because both panes use the same Android device");
+        m_statusMessage="Choose different devices for a transfer between Android panes";
+        m_statusTime=std::chrono::steady_clock::now();
+        return;
+    }
     if (src.selectedIndices.empty()) {
         m_statusMessage = "No files selected for transfer";
         m_statusTime = std::chrono::steady_clock::now();
         return;
     }
 
+    if (localCopy) {
+        std::error_code error;
+        auto destination=std::filesystem::weakly_canonical(toFsPath(dst.currentPath),error).wstring();
+        if (!error) for (int index:src.selectedIndices) {
+            if (!src.validIndex(index)) continue;
+            auto source=std::filesystem::weakly_canonical(toFsPath(src.currentPath)/toFsPath(src.entryName(index)),error).wstring();
+            if (error) continue;
+            auto parent=std::filesystem::path(source).parent_path().wstring();
+            bool sameFolder=_wcsicmp(parent.c_str(),destination.c_str())==0;
+            std::wstring prefix=source+L"\\";
+            bool insideSource=src.entryIsDir(index) && (_wcsicmp(source.c_str(),destination.c_str())==0 ||
+                (destination.size()>=prefix.size() && _wcsnicmp(prefix.c_str(),destination.c_str(),prefix.size())==0));
+            if (sameFolder || insideSource) {
+                showNotification("Choose another destination","Files cannot be copied or moved into their source folder or its descendants.",true);
+                return;
+            }
+        }
+    }
+
     auto batch = std::make_shared<TransferBatch>();
     batch->isLocalCopy = localCopy;
+    batch->isMove = move && localCopy;
     batch->srcDeviceSlot = src.deviceSlot;
     batch->dstDeviceSlot = dst.deviceSlot;
 
@@ -12792,7 +12351,7 @@ void App::startTransfer(bool pullFromAndroid) {
         batch->isCrossDevice = true;
         batch->isPull = false;
     } else {
-        batch->isPull = !localCopy && pullFromAndroid;
+        batch->isPull = !localCopy && src.isAndroid;
     }
     const FilePanel& transferDevicePanel = src.isAndroid ? src : dst;
     auto transferPipes = m_prefs.pipePreferencesFor(m_slotSerial[transferDevicePanel.deviceSlot & 1]);
@@ -12810,30 +12369,12 @@ void App::startTransfer(bool pullFromAndroid) {
 
     if (batch->files.empty()) return;
 
-    if (batch->isLocalCopy) {
-        // Same drive → auto-move (instant rename), cross-drive → ask copy/move
-        bool sameDrive = false;
-        if (!batch->files.empty()) {
-            auto& s = batch->files[0].sourcePath;
-            auto& d = batch->files[0].destPath;
-            if (s.size() >= 2 && d.size() >= 2)
-                sameDrive = (toupper(s[0]) == toupper(d[0]) && s[1] == ':' && d[1] == ':');
-        }
-        if (sameDrive) {
-            batch->isMove = true;
-            std::lock_guard<std::mutex> lk(m_batchMutex);
-            m_batchQueue.push_back(batch);
-            m_batchCV.notify_one();
-            m_overlayWasOpen = false;
-        } else {
-            m_pendingBatch = batch;
-            m_showCopyMoveDialog = true;
-        }
-    } else if (batch->isCrossDevice) {
+    if (batch->isCrossDevice) {
         m_pendingBatch = batch;
         m_showCrossDeviceDialog = true;
     } else {
         std::lock_guard<std::mutex> lk(m_batchMutex);
+        batch->logQueued();
         m_batchQueue.push_back(batch);
         m_batchCV.notify_one();
         m_overlayWasOpen = false;
@@ -12934,6 +12475,7 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
         if (sameDrive) {
             batch->isMove = true;
             std::lock_guard<std::mutex> lk(m_batchMutex);
+            batch->logQueued();
             m_batchQueue.push_back(batch);
             m_batchCV.notify_one();
             m_overlayWasOpen = false;
@@ -12943,6 +12485,7 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
         }
     } else {
         std::lock_guard<std::mutex> lk(m_batchMutex);
+        batch->logQueued();
         m_batchQueue.push_back(batch);
         m_batchCV.notify_one();
         m_overlayWasOpen = false;
@@ -12950,79 +12493,9 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
 }
 
 void App::startTransferFromDrag(FilePanel& srcPanel, FilePanel& dstPanel) {
-    if (srcPanel.selectedIndices.empty()) return;
-    if (srcPanel.isConnections || dstPanel.isConnections) return;
-    if (srcPanel.isApps || dstPanel.isApps) {
-        m_statusMessage = "App panels are for install and uninstall only";
-        m_statusTime = std::chrono::steady_clock::now();
-        return;
-    }
-
-    bool localCopy = !srcPanel.isAndroid && !dstPanel.isAndroid;
-    bool isPull = srcPanel.isAndroid;
-
-    if (!localCopy) {
-        const FilePanel& devicePanel = srcPanel.isAndroid ? srcPanel : dstPanel;
-        if (!m_slotConnected[devicePanel.deviceSlot & 1] ||
-            !deviceForSlot(devicePanel.deviceSlot).isServerRunning()) return;
-    }
-
-    auto batch = std::make_shared<TransferBatch>();
-    batch->isLocalCopy = localCopy;
-    batch->srcDeviceSlot = srcPanel.deviceSlot;
-    batch->dstDeviceSlot = dstPanel.deviceSlot;
-
-    // Cross-device Android-to-Android via drag
-    bool crossDevice = srcPanel.isAndroid && dstPanel.isAndroid && srcPanel.deviceSlot != dstPanel.deviceSlot;
-    if (crossDevice) {
-        batch->isCrossDevice = true;
-        batch->isPull = false;
-    } else {
-        batch->isPull = !localCopy && isPull;
-    }
-    const FilePanel& transferDevicePanel = srcPanel.isAndroid ? srcPanel : dstPanel;
-    auto transferPipes = m_prefs.pipePreferencesFor(m_slotSerial[transferDevicePanel.deviceSlot & 1]);
-    batch->useParallelChannels = !localCopy &&
-        (transferPipes.usbPipeCount > 1 || transferPipes.wifiPipeCount > 1);
-
-    uint64_t total = 0;
-    if (localCopy)
-        buildLocalBatchItems(srcPanel, dstPanel, batch->files, total);
-    else if (crossDevice)
-        buildCrossDeviceBatchItems(srcPanel, dstPanel, batch->files, total, &deviceFor(srcPanel));
-    else
-        buildBatchItems(srcPanel, dstPanel, isPull, batch->files, total, &deviceFor(srcPanel));
-    batch->totalBytes = total;
-
-    if (batch->files.empty()) return;
-
-    if (batch->isLocalCopy) {
-        bool sameDrive = false;
-        if (!batch->files.empty()) {
-            auto& s = batch->files[0].sourcePath;
-            auto& d = batch->files[0].destPath;
-            if (s.size() >= 2 && d.size() >= 2)
-                sameDrive = (toupper(s[0]) == toupper(d[0]) && s[1] == ':' && d[1] == ':');
-        }
-        if (sameDrive) {
-            batch->isMove = true;
-            std::lock_guard<std::mutex> lk(m_batchMutex);
-            m_batchQueue.push_back(batch);
-            m_batchCV.notify_one();
-            m_overlayWasOpen = false;
-        } else {
-            m_pendingBatch = batch;
-            m_showCopyMoveDialog = true;
-        }
-    } else if (batch->isCrossDevice) {
-        m_pendingBatch = batch;
-        m_showCrossDeviceDialog = true;
-    } else {
-        std::lock_guard<std::mutex> lk(m_batchMutex);
-        m_batchQueue.push_back(batch);
-        m_batchCV.notify_one();
-        m_overlayWasOpen = false;
-    }
+    LOG_INFO("Transfer","Drop accepted: "+panelDisplayName(srcPanel)+" "+srcPanel.currentPath+
+        " -> "+panelDisplayName(dstPanel)+" "+dstPanel.currentPath);
+    queuePanelTransfer(srcPanel,dstPanel,false);
 }
 
 void App::processBatchQueue() {
@@ -13057,6 +12530,30 @@ void App::processBatchQueue() {
             }
         }
         if (!batch) continue;
+        struct OutcomeLog {
+            std::shared_ptr<TransferBatch> batch;
+            ~OutcomeLog() {
+                auto state=batch->state.load();
+                bool errors=state==BatchState::Failed || batch->errorSkippedFiles>0 || batch->crcFailCount()>0;
+                std::string outcome=state==BatchState::Completed?(errors?"Completed with errors":"Completed"):
+                    state==BatchState::Stopped?"Cancelled":state==BatchState::Failed?"Failed":"Interrupted";
+                batch->logEvent(errors?LogLevel::Error:LogLevel::Info,outcome+", bytes="+
+                    std::to_string(batch->totalTransferred.load())+"/"+std::to_string(batch->totalBytes.load())+
+                    ", skipped="+std::to_string(batch->skippedFiles)+", file errors="+
+                    std::to_string(batch->errorSkippedFiles.load())+", verification errors="+std::to_string(batch->crcFailCount()));
+                if (errors && !batch->errorMessage.empty()) batch->logEvent(LogLevel::Error,batch->errorMessage);
+                int index=batch->currentFileIndex.load();
+                if (state==BatchState::Failed && index>=0 && index<(int)batch->files.size()) {
+                    const auto& file=batch->files[index];
+                    batch->logEvent(LogLevel::Error,"Source: "+file.sourcePath+" -> Destination: "+file.destPath);
+                }
+            }
+        } outcomeLog{batch};
+        try {
+        if (batch->stopRequested) { batch->state=BatchState::Stopped; continue; }
+        batch->logEvent(LogLevel::Info,std::string(batch->isMove?"Move":"Copy")+" started");
+        std::string localPartialPath;
+
 
         auto waitForRetry = [&](std::chrono::milliseconds delay, uint64_t& seenGeneration) {
             const auto deadline = std::chrono::steady_clock::now() + delay;
@@ -15432,11 +14929,7 @@ void App::processBatchQueue() {
                         progressCb(item.fileSize, item.fileSize);
                         ok = true;
                     } else if (item.isDirectory) {
-                        if (batch->isMove && sameDrive) {
-                            std::filesystem::rename(toFsPath(item.sourcePath), toFsPath(item.destPath));
-                        } else {
-                            std::filesystem::create_directories(toFsPath(item.destPath));
-                        }
+                        std::filesystem::create_directories(toFsPath(item.destPath));
                         ok = true;
                     } else {
                         // Create parent directory if needed
@@ -15444,35 +14937,15 @@ void App::processBatchQueue() {
                         if (dp.has_parent_path())
                             std::filesystem::create_directories(dp.parent_path());
 
-                        // Buffered copy with progress reporting
-                        FILE* fin = nullptr; FILE* fout = nullptr;
-                        _wfopen_s(&fin, toWide(item.sourcePath).c_str(), L"rb");
-                        if (!fin) throw std::runtime_error("Cannot open source: " + item.sourcePath);
-                        _wfopen_s(&fout, toWide(item.destPath).c_str(), L"wb");
-                        if (!fout) { fclose(fin); throw std::runtime_error("Cannot open dest: " + item.destPath); }
-
-                        const size_t bufSize = 4 * 1024 * 1024; // 4MB
-                        auto buf = std::make_unique<char[]>(bufSize);
-                        uint64_t copied = 0;
-                        bool cancelled = false;
-                        while (true) {
-                            size_t n = fread(buf.get(), 1, bufSize, fin);
-                            if (n == 0) break;
-                            fwrite(buf.get(), 1, n, fout);
-                            copied += n;
-                            if (!progressCb(copied, item.fileSize)) { cancelled = true; break; }
+                        bool touched=false;
+                        try {
+                            ok=copyLocalFile(toFsPath(item.sourcePath),toFsPath(item.destPath),item.fileSize,touched,progressCb);
+                        } catch (...) {
+                            if (touched) localPartialPath=item.destPath;
+                            throw;
                         }
-                        fclose(fin);
-                        fclose(fout);
-                        if (cancelled) {
-                            std::filesystem::remove(toFsPath(item.destPath));
-                        } else {
-                            ok = true;
-                            // Cross-drive move: delete source after successful copy
-                            if (batch->isMove) {
-                                std::filesystem::remove(toFsPath(item.sourcePath));
-                            }
-                        }
+                        if (!ok && touched) localPartialPath=item.destPath;
+                        if (ok && batch->isMove) std::filesystem::remove(toFsPath(item.sourcePath));
                     }
                 } catch (const std::exception& e) {
                     batch->errorMessage = item.displayName + ": " + e.what();
@@ -15486,6 +14959,7 @@ void App::processBatchQueue() {
                     break;
                 }
 
+                batch->logEvent(LogLevel::Info,std::string(item.isDirectory?"Prepared folder: ":batch->isMove?"Moved: ":"Copied: ")+item.sourcePath+" -> "+item.destPath);
                 bytesCompletedBefore += item.fileSize;
                 batch->totalTransferred = bytesCompletedBefore;
                 batch->curFileProgress = 1.0f;
@@ -15978,7 +15452,7 @@ void App::processBatchQueue() {
             int curIdx = batch->currentFileIndex.load();
             if (curIdx >= 0 && curIdx < batch->totalFiles()) {
                 auto& item = batch->files[curIdx];
-                if (!item.isDirectory && batch->isPull) {
+                if (!item.isDirectory && batch->isPull && !batch->isLocalCopy) {
                     // Pull: partial file is on Windows
                     try {
                         if (std::filesystem::exists(toFsPath(item.destPath))) {
@@ -15990,7 +15464,7 @@ void App::processBatchQueue() {
                     // Push: partial file is on Android
                     batchDev.deleteFile(item.destPath);
                     LOG_INFO("Transfer", "Deleted partial remote file: " + item.destPath);
-                } else if (!item.isDirectory && batch->isLocalCopy) {
+                } else if (!item.isDirectory && batch->isLocalCopy && localPartialPath==item.destPath) {
                     // Local copy: partial file is on Windows
                     try {
                         if (std::filesystem::exists(toFsPath(item.destPath))) {
@@ -16002,6 +15476,18 @@ void App::processBatchQueue() {
             }
             batchDev.flushStaleData();
             batchDev.restoreTimeouts();
+        }
+
+        if (batch->isLocalCopy && batch->isMove && batch->state==BatchState::Running) {
+            for (auto item=batch->files.rbegin();item!=batch->files.rend();++item) {
+                if (!item->isDirectory) continue;
+                std::error_code error;
+                std::filesystem::remove(toFsPath(item->sourcePath),error);
+                if (error) {
+                    ++batch->errorSkippedFiles;
+                    batch->logEvent(LogLevel::Warn,"Source folder retained after move: "+item->sourcePath+": "+error.message());
+                }
+            }
         }
 
         // Finalize batch
@@ -16030,6 +15516,13 @@ void App::processBatchQueue() {
 
             m_leftPanel.needsRefresh = true;
             m_rightPanel.needsRefresh = true;
+        }
+        } catch (const std::exception& error) {
+            batch->errorMessage=error.what();
+            batch->state=BatchState::Failed;
+        } catch (...) {
+            batch->errorMessage="Unexpected transfer exception";
+            batch->state=BatchState::Failed;
         }
     }
 }
