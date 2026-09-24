@@ -36,9 +36,9 @@ release-staging/
 # Local unreleased notes
 CHANGELOG.md
 
-# Local documentation
+# Local documentation and tests
 /docs/
-/tests/README.md
+/tests/
 
 # ImGui runtime layout
 imgui.ini
