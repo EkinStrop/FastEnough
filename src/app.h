@@ -842,6 +842,7 @@ private:
     std::atomic<bool> m_tetheringInProgress{false}; // prevents batch thread from calling startServer during tethering
     std::chrono::steady_clock::time_point m_lastTransferActivity; // cooldown for health check
     std::mutex m_deviceMutex; // protects m_devices, m_selectedDevice
+    std::mutex m_deviceWorkMutex; // serializes poller and async worker device operations
     void devicePollLoop();
 
     // Async action queue — UI thread posts, background worker executes

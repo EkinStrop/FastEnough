@@ -1463,6 +1463,8 @@ void App::asyncWorkerLoop() {
         }
         m_asyncBusy = true;
         try {
+            std::lock_guard<std::mutex> deviceWork(m_deviceWorkMutex);
+            if (m_shutdownPoll) return;
             action();
         } catch (const std::exception& e) {
             LOG_ERROR("Async", std::string("Background task failed: ") + e.what());
@@ -10794,6 +10796,7 @@ void App::navigateUp(FilePanel& panel) {
 
 void App::devicePollLoop() {
     // Find ADB and clean start on background thread
+    std::unique_lock<std::mutex> deviceWork(m_deviceWorkMutex);
     m_pollBusy = true;
     m_statusMessage = "Finding ADB...";
     m_statusTime = std::chrono::steady_clock::now();
@@ -10820,6 +10823,7 @@ void App::devicePollLoop() {
         m_statusTime = std::chrono::steady_clock::now();
     }
     m_pollBusy = false;
+    deviceWork.unlock();
 
     // Helper to check if any batch is active
     auto isBatchActive = [&]() -> bool {
@@ -10833,6 +10837,8 @@ void App::devicePollLoop() {
 
     // Helper to process a device list update (from track-devices or getDevices)
     auto processDeviceUpdate = [&](const std::vector<DeviceInfo>& devices) {
+        std::lock_guard<std::mutex> deviceUpdate(m_deviceWorkMutex);
+        if (m_shutdownPoll) return;
         m_pollBusy = true;
         std::string curSerial;
         bool primaryServerRunning = m_device.isServerRunning();
@@ -11528,14 +11534,18 @@ void App::devicePollLoop() {
     // Main loop: use track-devices for instant notifications, fallback to polling
     while (!m_shutdownPoll) {
         if (m_device.getAdbPath().empty()) {
-            if (m_device.findAdb()) {
-                m_deviceSlots[1].setAdbPath(m_device.getAdbPath());
-                m_statusMessage = "ADB ready - waiting for device...";
+            {
+                std::lock_guard<std::mutex> adbDiscovery(m_deviceWorkMutex);
+                if (m_shutdownPoll) return;
+                if (m_device.findAdb()) {
+                    m_deviceSlots[1].setAdbPath(m_device.getAdbPath());
+                    m_statusMessage = "ADB ready - waiting for device...";
+                    m_statusTime = std::chrono::steady_clock::now();
+                    continue;
+                }
+                m_statusMessage = "ADB not found. Extract the full ZIP or install Android SDK Platform Tools.";
                 m_statusTime = std::chrono::steady_clock::now();
-                continue;
             }
-            m_statusMessage = "ADB not found. Extract the full ZIP or install Android SDK Platform Tools.";
-            m_statusTime = std::chrono::steady_clock::now();
             for (int i = 0; i < 50 && !m_shutdownPoll; i++)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
@@ -11564,6 +11574,10 @@ void App::devicePollLoop() {
                 }
                 if (err == WSAETIMEDOUT) {
                     // An idle stream still needs periodic connection health checks.
+                    // A busy worker owns the connections until its operation is complete.
+                    std::unique_lock<std::mutex> healthCheck(m_deviceWorkMutex, std::try_to_lock);
+                    if (!healthCheck.owns_lock()) continue;
+                    if (m_shutdownPoll) break;
                     std::string curSerial;
                     {
                         std::lock_guard<std::mutex> lk(m_deviceMutex);
