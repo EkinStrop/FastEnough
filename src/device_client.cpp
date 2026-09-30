@@ -408,6 +408,7 @@ bool DeviceClient::tryDirectConnect(const std::string& ip, int port) {
     disconnectTcp();
     if (connectTcp(ip, port) && verifyConnection()) {
         m_directConnection = true;
+        m_serverPort = port;
         m_deviceIp = ip;
         return true;
     }
@@ -1597,6 +1598,7 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
     // Additional device slots use their own remote helper port. This lets a slot
     // recover without root if a legacy process is still holding the default port.
     int launchPort = m_localPort == AFM_PORT ? AFM_PORT : m_localPort;
+    m_serverPort = AFM_PORT;
 
     if (m_useRoot) {
         LOG_INFO("Server", "Root mode requested - restarting helper as root");
@@ -1664,6 +1666,8 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
         LOG_WARN("Server", "ADB Forward to existing server failed");
         disconnectTcp();
     }
+
+    m_serverPort = launchPort;
 
     // 2. Server not running - push and start it
     m_statusText = "Pushing server binary to device...";
@@ -1811,6 +1815,7 @@ bool DeviceClient::connectDirectForSerial(const std::string& serial, const std::
     std::lock_guard<std::mutex> serverLk(m_serverMutex);
     disconnectTcp();
     m_serial = serial;
+    m_serverPort = port;
     m_directConnection = false;
     m_deviceIp.clear();
     if (connectTcp(ip, port) && verifyConnection()) {
@@ -2063,6 +2068,7 @@ bool DeviceClient::connectParallelFrom(const DeviceClient& source) {
     m_serverIsRoot = source.m_serverIsRoot;
     m_directConnection = source.m_directConnection;
     m_deviceIp = source.m_deviceIp;
+    m_serverPort = source.m_serverPort;
     m_ownsServer = false;
     if (!connectTcp(source.m_lastConnectHost, source.m_lastConnectPort, source.m_lastConnectBindIp)) return false;
     if (!verifyConnection()) {

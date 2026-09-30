@@ -316,7 +316,8 @@ private:
     std::atomic<bool> m_cancelCommands{false};
     std::string m_serial;
     uintptr_t m_socket = ~(uintptr_t)0; // INVALID_SOCKET
-    bool m_connected = false;
+    std::atomic<bool> m_connected{false};
+    int m_serverPort = AFM_PORT;
     bool m_directConnection = false; // true = direct IP, false = adb forward
     std::string m_deviceIp;
     std::string m_lastError;
@@ -356,6 +357,8 @@ private:
 public:
     void setLocalPort(int port) { m_localPort = port; }
     int localPort() const { return m_localPort; }
+    int serverPort() const { return m_serverPort; }
+    void setServerPort(int port) { m_serverPort = port; }
     void setInlineCrc(uint32_t crc, const std::string& path) { m_inlineCrc = crc; m_inlineCrcPath = path; }
     uint32_t getInlineCrc() const { return m_inlineCrc; }
 

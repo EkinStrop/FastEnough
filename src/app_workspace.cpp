@@ -45,22 +45,22 @@ std::wstring workspaceWide(const std::string& value) {
 }
 
 std::string App::deviceDisplayName(int slot) const {
-    slot &= 1;
-    auto found = m_deviceDisplayNames.find(m_slotSerial[slot]);
+    auto found = m_deviceDisplayNames.find(deviceSession(slot).serial);
     if (found != m_deviceDisplayNames.end() && !found->second.empty()) return found->second;
-    if (!m_slotSerial[slot].empty()) return m_slotSerial[slot];
+    if (!deviceSession(slot).serial.empty()) return deviceSession(slot).serial;
     return "Android device";
 }
 
 std::string App::panelDisplayName(const FilePanel& panel) const {
     if (panel.isConnections) return "Connections";
+    if (!panel.pendingDeviceSerial.empty()) return panel.pendingDeviceName;
     return panel.isAndroid || panel.isApps ? deviceDisplayName(panel.deviceSlot) : "This PC";
 }
 
 bool App::panelAvailable(const FilePanel& panel) const {
-    if (panel.isConnections) return false;
+    if (panel.isConnections || !panel.pendingDeviceSerial.empty()) return false;
     return !panel.isAndroid && !panel.isApps ||
-        (m_slotConnected[panel.deviceSlot & 1] && m_deviceSlots[panel.deviceSlot & 1].isServerRunning());
+        (deviceSession(panel.deviceSlot).connected && deviceSession(panel.deviceSlot).client.isServerRunning());
 }
 
 void App::renderWorkspaceHeader() {
@@ -110,16 +110,22 @@ void App::renderWorkspaceHeader() {
         }
         m_showBackupManager=true; m_showAppsWorkspace=m_showConnectionsWorkspace=false;
     }
+    ImGui::SameLine(0,4*s);
+    if (tab("Connections",m_showConnectionsWorkspace)) {
+        m_showConnectionsWorkspace=true;
+        m_showAppsWorkspace=m_showBackupManager=false;
+        m_connectionsWorkspacePanel.isConnections=true;
+    }
     int ready=0;
-    for (int i=0;i<2;++i) if (m_slotConnected[i]&&m_deviceSlots[i].isServerRunning()) ++ready;
+    for (int i=0;i < deviceSessionCount();++i) if (deviceSession(i).connected&&deviceSession(i).client.isServerRunning()) ++ready;
     std::string deviceLabel=std::to_string(ready)+(ready==1?" phone ready":" phones ready");
     float rightWidth=ImGui::CalcTextSize(deviceLabel.c_str()).x+132*s;
-    ImGui::SameLine(std::max(ImGui::GetCursorPosX(),ImGui::GetWindowWidth()-rightWidth));
+    ImGui::SameLine(std::max(ImGui::GetItemRectMax().x-ImGui::GetWindowPos().x+12*s,ImGui::GetWindowWidth()-rightWidth));
     if (ui::button((deviceLabel+"##Devices").c_str(),ui::Icon::Phone)) ImGui::OpenPopup("##WorkspaceDevices");
     if (ImGui::BeginPopup("##WorkspaceDevices")) {
-        for (int slot=0;slot<2;++slot) {
-            if (m_slotSerial[slot].empty()) continue;
-            std::string name=deviceDisplayName(slot)+(m_slotConnected[slot]?"":" (disconnected)")+"##device"+std::to_string(slot);
+        for (int slot=0;slot < deviceSessionCount();++slot) {
+            if (deviceSession(slot).serial.empty()) continue;
+            std::string name=deviceDisplayName(slot)+(deviceSession(slot).connected?"":" (disconnected)")+"##device"+std::to_string(slot);
             if (ImGui::MenuItem(name.c_str())) { m_detailsDeviceSlot=slot; m_workspaceDrawer=2; }
         }
         ImGui::Separator();
@@ -127,7 +133,7 @@ void App::renderWorkspaceHeader() {
             m_showConnectionsWorkspace=true; m_showAppsWorkspace=m_showBackupManager=false;
             m_connectionsWorkspacePanel.isConnections=true;
         }
-        if (ImGui::MenuItem("Pair over WiFi...")) m_showWifiPairing=true;
+        if (ImGui::MenuItem("Pair over WiFi...")) openWifiPairing();
         ImGui::EndPopup();
     }
     ImGui::SameLine(0,2*s);
@@ -214,10 +220,11 @@ void App::renderPaneHeader(FilePanel& panel, PanelSide side) {
     std::string title=panelDisplayName(panel);
     std::string caption=panel.isConnections?"USB and wireless connections":"Local storage";
     if(panel.isAndroid||panel.isApps) {
-        int slot=panel.deviceSlot&1;
+        int slot=panel.deviceSlot;
         caption=panelAvailable(panel)?"Connected":"Disconnected";
+        if (!panel.pendingDeviceSerial.empty()) caption=panel.deviceOpenError.empty()?"Opening files...":"Connection unavailable";
         if(panelAvailable(panel)) {
-            caption+=m_deviceSlots[slot].isDirectConnection()?"  /  Direct connection":"  /  ADB";
+            caption+=deviceSession(slot).client.isDirectConnection()?"  /  Direct connection":"  /  ADB";
             if(slot==0&&m_dualChannelAvailable)caption+=" + "+m_secondaryChannelType;
         }
     }
@@ -245,21 +252,17 @@ void App::renderPaneHeader(FilePanel& panel, PanelSide side) {
     ImGui::SetNextWindowSizeConstraints(ImVec2(280*s,0),ImVec2(460*s,500*s));
     if(ImGui::BeginPopup("##PaneLocationMenu")) {
         if(!panel.isApps&&ImGui::Selectable("This PC",!panel.isAndroid&&!panel.isConnections)) switchPanelMode(panel,false);
-        for(int slot=0;slot<2;++slot) {
-            if(m_slotSerial[slot].empty()&&!m_slotConnected[slot]) continue;
-            std::string serial=m_slotSerial[slot];
+        for(int slot=0;slot < deviceSessionCount();++slot) {
+            if(deviceSession(slot).serial.empty()&&!deviceSession(slot).connected) continue;
+            std::string serial=deviceSession(slot).serial;
             std::string suffix=serial.size()>6?serial.substr(serial.size()-6):serial;
-            std::string label=deviceDisplayName(slot)+" ("+suffix+")"+(!m_slotConnected[slot]?" [offline]":"")+"##"+std::to_string(slot);
+            std::string label=deviceDisplayName(slot)+" ("+suffix+")"+(!deviceSession(slot).connected?(deviceForSlot(slot).isConnecting()?" [preparing]":" [offline]"):"")+"##"+std::to_string(slot);
             if(ImGui::Selectable(label.c_str(),(panel.isAndroid||panel.isApps)&&panel.deviceSlot==slot)) {
+                panel.pendingDeviceSerial.clear();panel.pendingDeviceName.clear();panel.deviceOpenError.clear();
                 if(panel.isApps) {
                     panel.deviceSlot=slot;panel.appEntries.clear();panel.selectedIndices.clear();panel.needsRefresh=true;
-                } else if(!panel.isAndroid||panel.isConnections||panel.deviceSlot!=slot) {
-                    if(!panel.isAndroid||panel.isConnections) switchPanelMode(panel,true);
-                    panel.deviceSlot=slot;panel.isAndroid=true;panel.isConnections=false;
-                    panel.insideMcraw=false;panel.mcrawFilePath.clear();panel.androidEntries.clear();panel.selectedIndices.clear();
-                    panel.navHistory.clear();panel.navHistoryPos=-1;
-                    panel.currentPath=m_slotStorageRoot[slot].empty()?"/sdcard":m_slotStorageRoot[slot];
-                    strcpy_s(panel.pathInput,panel.currentPath.c_str());panel.needsRefresh=true;
+                } else {
+                    openDeviceSession(panel, slot);
                 }
             }
         }
@@ -488,20 +491,20 @@ void App::renderWorkspaceDrawer() {
             ImGui::Spacing();ImGui::TextDisabled("Keyboard shortcuts");
             ImGui::TextUnformatted("Ctrl+A    Select all\nF2           Rename\nF5           Refresh folders\nDelete    Delete selection\nCtrl+L    Edit folder path\nEscape  Close details or clear selection");
         } else if(m_workspaceDrawer==2) {
-            int slot=m_detailsDeviceSlot&1;
+            int slot=m_detailsDeviceSlot;
             ImGui::SetNextItemWidth(-1);
             if(ImGui::BeginCombo("##DetailsDevice",deviceDisplayName(slot).c_str())) {
-                for(int i=0;i<2;++i)if(!m_slotSerial[i].empty()) {
+                for(int i=0;i < deviceSessionCount();++i)if(!deviceSession(i).serial.empty()) {
                     if(ImGui::Selectable((deviceDisplayName(i)+"##"+std::to_string(i)).c_str(),i==slot))m_detailsDeviceSlot=i;
                 }
                 ImGui::EndCombo();
             }
-            bool connected=m_slotConnected[slot]&&m_deviceSlots[slot].isServerRunning();
+            bool connected=deviceSession(slot).connected&&deviceSession(slot).client.isServerRunning();
             ImGui::TextDisabled("%s",connected?"Connected":"Disconnected");
             ImGui::Spacing();ImGui::TextDisabled("Connection");
-            ImGui::TextWrapped("%s",m_deviceSlots[slot].isDirectConnection()?"Direct connection":"ADB connection");
+            ImGui::TextWrapped("%s",deviceSession(slot).client.isDirectConnection()?"Direct connection":"ADB connection");
             if(slot==0&&m_dualChannelAvailable)ImGui::TextDisabled("Additional connection: %s",m_secondaryChannelType.c_str());
-            auto& prefs=m_prefs.pipePreferencesFor(m_slotSerial[slot]);
+            auto& prefs=m_prefs.pipePreferencesFor(deviceSession(slot).serial);
             ImGui::Spacing();
             if(ImGui::CollapsingHeader("Advanced connection settings")) {
                 ImGui::TextWrapped("Requested streams apply when transfer channels are opened.");
@@ -521,17 +524,17 @@ void App::renderWorkspaceDrawer() {
                 }
                 if(ui::button("Unmount drive"))postAsync("Unmounting drive...",[slot](){DeviceMountManager::instance(slot).unmount();});
             } else if(ui::button("Mount as drive",ui::Icon::Computer,ui::Appearance::Secondary)) {
-                std::string root=m_slotStorageRoot[slot],drive=slot==0?"P:\\":"Q:\\";
+                std::string root=deviceSession(slot).storageRoot,drive=DeviceMountManager::availableMountPoint();
                 postAsync("Mounting drive...",[this,slot,root,drive](){
-                    bool ok=DeviceMountManager::instance(slot).mount(&m_deviceSlots[slot],root,drive);
+                    bool ok=DeviceMountManager::instance(slot).mount(&deviceSession(slot).client,root,drive);
                     m_statusMessage=ok?"Mounted as "+drive:"Unable to mount the drive. Check the Dokan installation.";
                     m_statusTime=std::chrono::steady_clock::now();
                 });
             }
             ImGui::EndDisabled();
-            ImGui::Spacing();if(ui::button("Pair over WiFi",ui::Icon::Wifi))m_showWifiPairing=true;
+            ImGui::Spacing();if(ui::button("Pair over WiFi",ui::Icon::Wifi))openWifiPairing();
             ImGui::BeginDisabled(!connected);
-            if(ui::button("WiFi setup wizard",ui::Icon::Wifi)){m_wizardSerial=m_slotSerial[slot];m_wizardStep=0;m_showWifiWizard=true;}
+            if(ui::button("WiFi setup wizard",ui::Icon::Wifi)){if(!m_wizardBusy)m_wizardSerial=deviceSession(slot).serial;openWifiWizard();}
             ImGui::EndDisabled();
         } else if(m_workspaceDrawer==1) {
             FilePanel* panel=m_lastFocusedPanel?m_lastFocusedPanel:&m_rightPanel;

@@ -21,6 +21,10 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\app_workspace.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\app_connections.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\app_pairing.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\app_sessions.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="thirdparty\qrcodegen\qrcodegen.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\app.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -57,11 +61,14 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\ui_widgets.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="thirdparty\qrcodegen\qrcodegen.hpp" />
+    <ClInclude Include="src\ui_panels.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\activity_log.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\local_copy.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\app.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\device_sessions.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\device_client.h">
       <Filter>Header Files</Filter>
     </ClInclude>

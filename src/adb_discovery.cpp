@@ -5,6 +5,77 @@
 #include <sstream>
 #include <tuple>
 
+std::optional<AdbEndpoint> parseAdbEndpoint(std::string_view address) {
+    auto colon = address.rfind(':');
+    if (colon == std::string_view::npos || colon == 0) return {};
+    auto host = address.substr(0, colon);
+    auto portText = address.substr(colon + 1);
+    unsigned port = 0;
+    auto [end, error] = std::from_chars(portText.data(), portText.data() + portText.size(), port);
+    if (error != std::errc{} || end != portText.data() + portText.size() || port == 0 || port > 65535)
+        return {};
+    if (host.front() == '[') {
+        if (host.size() < 4 || host.back() != ']') return {};
+        auto ipv6 = host.substr(1, host.size() - 2);
+        if (std::count(ipv6.begin(), ipv6.end(), ':') < 2 ||
+            !std::all_of(ipv6.begin(), ipv6.end(), [](unsigned char c) {
+                return std::isxdigit(c) || c == ':' || c == '.' || c == '%';
+            })) return {};
+    } else {
+        int octets = 0;
+        size_t start = 0;
+        while (start < host.size()) {
+            auto dot = host.find('.', start);
+            if (dot == std::string_view::npos) dot = host.size();
+            auto part = host.substr(start, dot - start);
+            unsigned value = 0;
+            auto [last, ec] = std::from_chars(part.data(), part.data() + part.size(), value);
+            if (part.empty() || part.size() > 3 || ec != std::errc{} ||
+                last != part.data() + part.size() || value > 255) return {};
+            ++octets;
+            start = dot + 1;
+        }
+        if (octets != 4 || host.back() == '.') return {};
+    }
+    return AdbEndpoint{std::string(host), static_cast<uint16_t>(port)};
+}
+
+std::vector<AdbMdnsService> parseAdbMdnsServices(std::string_view output) {
+    std::vector<AdbMdnsService> services;
+    std::istringstream stream{std::string(output)};
+    std::string line;
+    while (std::getline(stream, line)) {
+        std::istringstream fields(line);
+        AdbMdnsService service;
+        if (!(fields >> service.name >> service.type >> service.address)) continue;
+        if (service.type.ends_with('.')) service.type.pop_back();
+        if (service.type != "_adb-tls-pairing._tcp" && service.type != "_adb-tls-connect._tcp" &&
+            service.type != "_adb._tcp") continue;
+        if (!parseAdbEndpoint(service.address)) continue;
+        services.push_back(std::move(service));
+    }
+    return services;
+}
+
+std::string findAdbConnectAddress(const std::vector<AdbMdnsService>& services,
+    std::string_view pairedAddress, std::string_view guid) {
+    auto paired = parseAdbEndpoint(pairedAddress);
+    if (!paired) return {};
+    std::string match;
+    for (const auto& service : services) {
+        if (service.type != "_adb-tls-connect._tcp") continue;
+        auto endpoint = parseAdbEndpoint(service.address);
+        if (!endpoint || endpoint->host != paired->host) continue;
+        if (!guid.empty()) {
+            if (service.name == guid || service.name == "adb-" + std::string(guid)) return service.address;
+        } else {
+            if (!match.empty() && match != service.address) return {};
+            match = service.address;
+        }
+    }
+    return guid.empty() ? match : std::string{};
+}
+
 bool isWirelessAdbSerial(std::string_view serial) {
     std::string lower(serial);
     std::transform(lower.begin(), lower.end(), lower.begin(),

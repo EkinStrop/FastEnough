@@ -11,10 +11,12 @@
 namespace ui {
 enum class Icon { None, Folder, File, Image, Video, Music, Archive, Apps, Phone, Computer,
     Back, Forward, Up, Down, Refresh, Search, Star, Copy, Move, Trash, Plus, Compare,
-    Info, Settings, Transfer, Pause, Play, Close, More, Check, Usb, Wifi };
+    Info, Settings, Transfer, Pause, Play, Close, More, Check, Usb, Wifi,
+    Link, Help, Gear, Wand, MoreVertical, Backup };
 enum class Appearance { Quiet, Secondary, Primary, Selected };
 
 inline ImFont* semiboldFont=nullptr;
+inline ImFont* connectionHeadingFont=nullptr;
 
 inline float scale() { return ImGui::GetFontSize() / 14.0f; }
 
@@ -84,6 +86,28 @@ inline void icon(Icon type, ImVec2 position, float size, ImU32 color) {
     case Icon::Check: path({{5,12},{10,17},{20,7}}); break;
     case Icon::Usb: path({{12,20},{12,3},{9,6},{12,3},{15,6}}); path({{12,16},{6,12},{6,7}}); path({{12,13},{18,9},{18,5}}); circle(12,20,1.5f); circle(6,7,1.5f); rect(16.5f,3.5f,3,3,0); break;
     case Icon::Wifi: for (float r : {5.0f,10.0f,15.0f}) { draw->PathArcTo(point(12,21),r*unit,3.95f,5.47f,16); draw->PathStroke(color,0,stroke); } circle(12,21,0.7f); break;
+    case Icon::Link:
+        path({{10,8},{13,5},{16,3},{19,3},{21,5},{21,8},{16,13},{13,13},{11,11}});
+        path({{14,16},{11,19},{8,21},{5,21},{3,19},{3,16},{8,11},{11,11},{13,13}});
+        path({{8,16},{16,8}}); break;
+    case Icon::Help:
+        circle(12,12,9); path({{9,8},{10,6},{13,6},{15,8},{15,10},{12,12},{12,14}});
+        draw->AddCircleFilled(point(12,17),unit,color); break;
+    case Icon::Gear:
+        for (int i=0;i<32;++i) {
+            float angle=i*6.2831853f/32;
+            float radius=(i%4==0||i%4==3)?10.0f:7.6f;
+            draw->PathLineTo(point(12+std::cos(angle)*radius,12+std::sin(angle)*radius));
+        }
+        draw->PathStroke(color,ImDrawFlags_Closed,stroke); circle(12,12,3.2f); break;
+    case Icon::Wand:
+        path({{4,19},{16,7},{19,10},{7,22}},true); path({{13,10},{16,13}});
+        path({{6,2},{6,8}}); path({{3,5},{9,5}}); path({{18,1},{18,5}}); path({{16,3},{20,3}});
+        path({{21,15},{21,21}}); path({{18,18},{24,18}}); break;
+    case Icon::MoreVertical: for (float y : {5.0f,12.0f,19.0f}) draw->AddCircleFilled(point(12,y),1.3f*unit,color); break;
+    case Icon::Backup:
+        path({{5,3},{19,3},{22,16},{22,21},{2,21},{2,16},{5,3}},true);
+        path({{2,15},{8,15},{10,18},{14,18},{16,15},{22,15}}); path({{7,7},{17,7}}); path({{6,11},{18,11}}); break;
     default: break;
     }
 }

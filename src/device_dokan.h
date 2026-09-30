@@ -10,8 +10,9 @@
 
 class DeviceMountManager {
 public:
-    // Access by device slot (0=primary, 1=secondary)
+    // Access the mount associated with a stable device session.
     static DeviceMountManager& instance(int slot = 0);
+    static std::string availableMountPoint();
 
     // Mount device storage as a drive letter (e.g., "P:\\").
     // Runs Dokan in a background thread. Returns true on success.

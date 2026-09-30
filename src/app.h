@@ -1,5 +1,6 @@
 #pragma once
 #include "device_client.h"
+#include "device_sessions.h"
 #include "imgui.h"
 #include <string>
 #include <vector>
@@ -181,8 +182,12 @@ struct FilePanel {
     bool isAndroid = false;
     bool isApps = false;
     bool isConnections = false;
+    std::string pendingDeviceSerial;
+    std::string pendingDeviceName;
+    std::string deviceOpenError;
     bool needsRefresh = true;
     bool refreshInProgress = false;
+    uint64_t listingGeneration = 0;
     bool navigationTransitionPending = false;
     bool navigationTransitionReady = false;
     int hoveredEntryIndex = -1;
@@ -212,7 +217,7 @@ struct FilePanel {
     ImVec2 rubberBandStart;
     ImVec2 rubberBandEnd;
 
-    // Device assignment (for Android panels) — 0=primary, 1=secondary
+    // Stable session index for the phone shown in this panel.
     int deviceSlot = 0;
 
     // Navigation history
@@ -283,6 +288,8 @@ struct SavedWifiDevice {
     int port = 5555;      // WiFi ADB port
     bool autoConnect = true;
     std::string model;    // Phone model name for display
+    bool wirelessDebugging = false;
+    std::string pairingGuid;
 };
 
 struct DevicePipePreference {
@@ -358,6 +365,7 @@ struct AppPreferences {
     std::vector<DevicePipePreference> devicePipePreferences;
     std::vector<RootDevicePreference> rootDevices; // per-device root server preference
     std::vector<FavoritePath> favoritePaths;
+    std::vector<std::string> deviceSessionIdentities;
 
     bool rootEnabledForSerial(const std::string& serial) const;
     void setRootEnabledForSerial(const std::string& serial, bool enabled);
@@ -421,11 +429,44 @@ private:
         bool notificationIsError = false;
         bool hasStatus = false;
         std::string status;
+        FilePanel* listingPanel = nullptr;
+        uint64_t listingGeneration = 0;
+        int listingSlot = -1;
+        bool listingApps = false;
+        std::string listingPath;
+        std::vector<DeviceFileEntry> listingEntries;
+        std::vector<InstalledAppEntry> listingAppEntries;
+        bool saveDeviceSessions = false;
+        bool deviceSessionReady = false;
+        int readyDeviceSlot = -1;
+        bool connectionRequestFinished = false;
+        std::string connectionSerial;
+        int connectionSlot = -1;
+        std::string connectedWifiAddress;
+        std::string connectedWifiName;
+        bool connectionRefreshFinished = false;
+        std::vector<DeviceInfo> connectionDevices;
         bool hasWizardProbe = false;
         uint64_t wizardProbeGeneration = 0;
         std::string wizardProbeSerial;
         std::string wizardProbeIp;
         std::string wizardProbeError;
+        bool hasWizardSetupProgress = false;
+        uint64_t wizardSetupGeneration = 0;
+        std::string wizardSetupSerial;
+        std::string wizardSetupStatus;
+        bool wizardSetupFinished = false;
+        bool wizardSetupSucceeded = false;
+        bool hasWifiPairing = false;
+        uint64_t wifiPairingGeneration = 0;
+        bool wifiPaired = false;
+        std::string wifiPairingAddress;
+        std::string wifiPairingGuid;
+        std::string wifiPairingConnectedAddress;
+        std::string wifiPairingModel;
+        std::string wifiPairingSerial;
+        std::string wifiPairingStatus;
+        std::string wifiPairingError;
         bool setBackupApps = false;
         std::vector<BackupManagerAppRow> backupApps;
         bool markBackupAppsFresh = false;
@@ -463,6 +504,8 @@ private:
 
     void setupStyle();
     void renderWorkspaceHeader();
+    void renderConnectionManager(FilePanel& panel);
+    void connectFromManager(const std::string& serial, bool savedWifi);
     void renderWorkspaceToolbar();
     void renderPaneHeader(FilePanel& panel, PanelSide side);
     void renderPaneNavigation(FilePanel& panel);
@@ -501,11 +544,15 @@ private:
     void renderThemeWindow();
     void renderNicConfigWindow();
     void renderWifiWizard();
+    void openWifiWizard();
+    void startWizardWifiSetup();
     void renderWifiPairingDialog();
+    void openWifiPairing();
+    void startWifiQrSession();
+    void pollWifiPairing(int action = 0);
+    void applyWifiPairingResult(const UiMessage& message);
     void renderWifiBanner();
     void tryAutoWifiConnect(const std::string& serial);
-    bool prepareSlot1WifiFallback(const std::string& serial);
-    bool recoverSecondarySlotConnection(const std::string& serial);
     void renderCopyMoveDialog();
     void renderCrossDeviceDialog();
     void openAndroidFile(FilePanel& panel, int index);
@@ -575,27 +622,44 @@ private:
 
     void onDeviceChanged();
 
-    // Dual-device support: slot 0 = primary, slot 1 = secondary
-    DeviceClient m_deviceSlots[2];
-    std::string m_slotSerial[2];       // serial assigned to each slot
-    std::string m_slotStorageRoot[2];  // storage root per slot
-    std::vector<std::string> m_slotVolumes[2]; // volumes per slot
-    bool m_slotConnected[2] = {false, false};
+    struct DeviceSession {
+        DeviceClient client;
+        std::string serial;
+        std::string storageRoot;
+        std::vector<std::string> volumes;
+        std::atomic<bool> connected{false};
+        std::chrono::steady_clock::time_point retryAfter{};
+        std::chrono::steady_clock::time_point lastHealthCheck{};
+        std::chrono::steady_clock::time_point missingSince{};
+        std::mutex cacheMutex;
+        std::vector<DeviceFileEntry> rootEntries;
+        bool rootCached = false;
+        std::unique_ptr<FilePanel> views[2];
+    };
+    DeviceSessionStore<DeviceSession> m_deviceSessions;
+    DeviceSession& deviceSession(int slot) const { return m_deviceSessions.at(slot); }
+    int deviceSessionCount() const { return m_deviceSessions.size(); }
+    std::string deviceIdentity(const std::string& serial) const;
+    void discoverDeviceIdentities(const std::vector<DeviceInfo>& devices);
+    void maintainDeviceSessions(const std::vector<DeviceInfo>& devices);
+    bool prepareDeviceSession(int slot, const std::string& serial);
+    void cacheDeviceRoot(int slot);
+    void rememberDeviceView(FilePanel& panel);
+    void openDeviceSession(FilePanel& panel, int slot);
+    mutable std::mutex m_identityMutex;
+    std::unordered_map<std::string, std::string> m_deviceIdentities;
     std::atomic<bool> m_primaryReconnectActive{false};
     std::atomic<bool> m_wifiTransitionActive{false};
-    std::string m_secondaryRetrySerial;
-    std::chrono::steady_clock::time_point m_secondaryRetryAfter{};
-    std::chrono::steady_clock::time_point m_connectionCardMissingSince[2]{};
     std::chrono::steady_clock::time_point m_connectionActivityVisibleUntil{};
     std::chrono::steady_clock::time_point m_connectionActivityManualUntil{};
     float m_connectionActivityAlpha = 0.0f;
     int m_connectionActivityPreviousCardCount = 0;
     bool m_connectionActivityWasActive = false;
 
-    // Legacy accessors (slot 0 = primary for backward compat)
-    DeviceClient& m_device = m_deviceSlots[0]; // MSVC handles this fine in practice
-    std::string m_androidStorageRoot;           // kept in sync with m_slotStorageRoot[0]
-    std::vector<std::string> m_androidVolumes;  // kept in sync with m_slotVolumes[0]
+    // The first session also owns the optional parallel transport channels.
+    DeviceClient& m_device = deviceSession(0).client;
+    std::string m_androidStorageRoot;           // kept in sync with deviceSession(0).storageRoot
+    std::vector<std::string> m_androidVolumes;  // kept in sync with deviceSession(0).volumes
 
     std::vector<DeviceInfo> m_devices;
     int m_selectedDevice = -1;
@@ -607,13 +671,11 @@ private:
     std::string m_wifiToUsbSerial;  // reverse mapping
 
     // Get the DeviceClient for a given panel
-    DeviceClient& deviceFor(FilePanel& panel) { return m_deviceSlots[panel.deviceSlot]; }
-    DeviceClient& deviceForSlot(int slot) { return m_deviceSlots[slot & 1]; }
+    DeviceClient& deviceFor(FilePanel& panel) { return deviceSession(panel.deviceSlot).client; }
+    DeviceClient& deviceForSlot(int slot) { return deviceSession(slot).client; }
 
     // Parallel transfer: additional channels to same device
     DeviceClient m_secondaryChannel;
-    DeviceClient m_slot1WifiChannel;
-    std::string m_slot1WifiIp;
     struct ExtraChannel {
         std::unique_ptr<DeviceClient> dev;
         bool isUsb; // true=USB ADB forward, false=WiFi Direct
@@ -683,6 +745,13 @@ private:
     bool m_showConnectionsWorkspace = false;
     FilePanel m_appsWorkspacePanel;
     FilePanel m_connectionsWorkspacePanel;
+    char m_connectionSearch[256] = {};
+    char m_savedConnectionSearch[256] = {};
+    int m_connectionFilter = 0;
+    int m_savedConnectionSort = 0;
+    bool m_connectionsRefreshing = false;
+    std::string m_connectionPendingSerial;
+    std::string m_connectionFeedback;
     int m_workspaceDrawer = 0;
     int m_detailsDeviceSlot = 0;
     bool m_showDeviceSettings = false;
@@ -691,6 +760,8 @@ private:
     std::weak_ptr<TransferBatch> m_lastDockBatch;
     int m_backupManagerSlot = 0;
     char m_backupManagerSearch[256] = {};
+    int m_backupManagerAppPage = 0;
+    int m_backupManagerAppsPerPage = 15;
     char m_backupManagerBackupSearch[256] = {};
     char m_backupManagerJobAppSearch[256] = {};
     int m_backupManagerAppSelectionAnchor = -1;
@@ -783,12 +854,13 @@ private:
     // WiFi ADB
     bool m_showWifiWizard = false;
     bool m_showWifiPairing = false;
-    bool m_showMdnsDiscovery = false;
     int m_wizardStep = 0;           // 0=USB check, 1=WiFi check, 2=setting up, 3=done
     std::string m_wizardStatus;
     std::string m_wizardWifiIp;
     std::string m_wizardSerial;     // which device the wizard is operating on
     bool m_wizardBusy = false;
+    bool m_wizardSucceeded = false;
+    uint64_t m_wizardSetupGeneration = 0;
     std::atomic<uint64_t> m_wizardProbeGeneration{0};
     bool m_wizardProbeBusy = false;
     std::string m_wizardProbeError;
@@ -796,6 +868,21 @@ private:
     char m_pairingCode[16] = {};
     char m_connectIp[64] = {};  // connect IP:port (different from pairing port)
     bool m_pairingDone = false; // show connect step after pairing
+    bool m_pairingUseQr = true;
+    std::atomic<uint64_t> m_pairingGeneration{0};
+    std::atomic<bool> m_pairingWorkerBusy{false};
+    std::thread m_pairingThread;
+    std::string m_pairingService;
+    std::string m_pairingPassword;
+    std::string m_pairingAddress;
+    std::string m_pairingGuid;
+    std::string m_pairingReadyAddress;
+    std::string m_pairingStatus;
+    std::string m_pairingError;
+    std::vector<uint8_t> m_pairingQrModules;
+    int m_pairingQrSize = 0;
+    double m_pairingNextPoll = 0;
+    double m_pairingExpiresAt = 0;
     bool m_wifiBannerDismissed = false;  // user dismissed the "enable dual channel?" banner
     bool m_wifiBannerShown = false;
     bool m_wifiAutoSetupDone = false;    // already auto-setup dual channel this session
@@ -855,8 +942,6 @@ private:
     std::string m_asyncStatus; // shown in status bar while async action runs
     void asyncWorkerLoop();
     void postAsync(const std::string& statusMsg, std::function<void()> action);
-    bool selectDeviceBySerial(const std::string& serial, const std::vector<DeviceInfo>* refreshedDevices = nullptr);
-    bool refreshDeviceListAndSelect(const std::string& serial, int attempts = 6, int delayMs = 250);
     void connectDeviceBySerialNow(const std::string& serial);
     void addKnownPrimarySerials(std::set<std::string>& serials, const std::string& serial) const;
 

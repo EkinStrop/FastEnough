@@ -1,5 +1,6 @@
 #include "app.h"
 #include "ui_widgets.h"
+#include "ui_panels.h"
 #include "local_copy.h"
 #include "backup_archive.h"
 #include "imgui_internal.h"
@@ -1064,6 +1065,7 @@ void AppPreferences::save() {
     f << "killAdbOnClose=" << (killAdbOnClose ? 1 : 0) << "\n";
     for (auto& w : savedWifiDevices) {
         f << "wifiDevice=" << w.serial << "|" << w.wifiIp << "|" << w.port << "|" << (w.autoConnect ? 1 : 0) << "|" << w.model << "\n";
+        if (w.wirelessDebugging) f << "wifiPairing=" << w.serial << "|" << w.pairingGuid << "\n";
     }
     f << "enableMultiNic=" << (enableMultiNic ? 1 : 0) << "\n";
     f << "pipeSettingsV2=1\n";
@@ -1077,6 +1079,8 @@ void AppPreferences::save() {
         if (!r.serial.empty())
             f << "rootDevice=" << r.serial << "|" << (r.enabled ? 1 : 0) << "\n";
     }
+    for (const auto& identity : deviceSessionIdentities)
+        if (!identity.empty()) f << "deviceSession=" << identity << "\n";
     for (auto& fav : favoritePaths) {
         f << "favoritePath=" << (fav.isAndroid ? 1 : 0) << "|" << fav.deviceSlot << "|"
           << fav.label << "|" << fav.path << "\n";
@@ -1185,6 +1189,16 @@ void AppPreferences::load() {
             }
             savedWifiDevices.push_back(std::move(w));
         }
+        else if (line.find("wifiPairing=") == 0) {
+            const auto split = line.find('|', 12);
+            if (split == std::string::npos) continue;
+            const auto serial = line.substr(12, split - 12);
+            for (auto& saved : savedWifiDevices) {
+                if (saved.serial != serial) continue;
+                saved.wirelessDebugging = true;
+                saved.pairingGuid = line.substr(split + 1);
+            }
+        }
         else if (line.find("enableMultiNic=") == 0)
             enableMultiNic = (lastCharOr(line) == '1');
         else if (line.find("pipeSettingsV2=") == 0)
@@ -1215,6 +1229,9 @@ void AppPreferences::load() {
             r.enabled = (val.substr(p1 + 1) == "1");
             if (!r.serial.empty()) rootDevices.push_back(std::move(r));
         }
+        else if (line.find("deviceSession=") == 0) {
+            if (line.size() > 14) deviceSessionIdentities.push_back(line.substr(14));
+        }
         else if (line.find("favoritePath=") == 0) {
             std::string val = line.substr(13);
             FavoritePath fav;
@@ -1222,7 +1239,7 @@ void AppPreferences::load() {
             auto p2 = val.find('|', p1 + 1); if (p2 == std::string::npos) continue;
             auto p3 = val.find('|', p2 + 1); if (p3 == std::string::npos) continue;
             fav.isAndroid = (val.substr(0, p1) == "1");
-            try { fav.deviceSlot = std::clamp(std::stoi(val.substr(p1 + 1, p2 - p1 - 1)), 0, 1); }
+            try { fav.deviceSlot = std::max(0, std::stoi(val.substr(p1 + 1, p2 - p1 - 1))); }
             catch (...) { fav.deviceSlot = 0; }
             fav.label = val.substr(p2 + 1, p3 - p2 - 1);
             fav.path = val.substr(p3 + 1);
@@ -1380,11 +1397,14 @@ static bool deleteWindowsFiles(const std::vector<std::string>& paths, bool perma
 App::App() {
     m_prefs.load();
     m_theme.load();
+    for (const auto& identity : m_prefs.deviceSessionIdentities) {
+        int slot = m_deviceSessions.ensure(identity);
+        deviceSession(slot).serial = identity;
+    }
+
 
     // Second device uses a different local port for ADB forward
-    m_deviceSlots[1].setLocalPort(AFM_PORT + 1);
-    m_slot1WifiChannel.setLocalPort(AFM_PORT + 1);
-    m_slot1WifiChannel.setOwnsServer(false);
+    deviceSession(1).client.setLocalPort(AFM_PORT + 1);
     // Secondary channel (dual-channel WiFi) uses a different port to avoid ADB forward collision
     m_secondaryChannel.setLocalPort(AFM_PORT + 2);
 
@@ -1415,9 +1435,10 @@ App::App() {
 App::~App() {
     m_shutdownTransfer = true;
     m_shutdownPoll = true;
-    for (auto& device : m_deviceSlots) device.cancelCommands();
+    ++m_pairingGeneration;
+    if (m_pairingThread.joinable()) m_pairingThread.join();
+    for (int slot = 0; slot < deviceSessionCount(); ++slot) deviceForSlot(slot).cancelCommands();
     m_secondaryChannel.cancelCommands();
-    m_slot1WifiChannel.cancelCommands();
     m_batchCV.notify_all();
     m_asyncCV.notify_all();
     if (m_batchThread.joinable()) m_batchThread.join();
@@ -1432,8 +1453,7 @@ App::~App() {
     }
 
     // Unmount all mounts
-    DeviceMountManager::instance(0).unmount();
-    DeviceMountManager::instance(1).unmount();
+    for (int slot = 0; slot < deviceSessionCount(); ++slot) DeviceMountManager::instance(slot).unmount();
     McrawMountManager::instance().unmountAll();
 
     // Finish every client before the optional shared ADB shutdown.
@@ -1441,8 +1461,8 @@ App::~App() {
     m_nicChannels.clear();
     m_secondaryChannel.disconnectTcp();
     m_secondaryChannel.setOwnsServer(false);
-    m_slot1WifiChannel.disconnectTcp();
-    for (auto& device : m_deviceSlots) {
+    for (int slot = 0; slot < deviceSessionCount(); ++slot) {
+        auto& device = deviceForSlot(slot);
         device.resetCommandCancellation();
         device.stopServer();
     }
@@ -1522,12 +1542,98 @@ void App::drainUiMessages() {
     }
 
     for (auto& message : messages) {
+        if (message.listingPanel) {
+            FilePanel& panel = *message.listingPanel;
+            if (panel.listingGeneration == message.listingGeneration) {
+                panel.refreshInProgress = false;
+                if (panel.pendingDeviceSerial.empty() && panel.deviceSlot == message.listingSlot &&
+                    (message.listingApps ? panel.isApps : panel.isAndroid && panel.currentPath == message.listingPath)) {
+                    if (message.listingApps) panel.appEntries = std::move(message.listingAppEntries);
+                    else panel.androidEntries = std::move(message.listingEntries);
+                    panel.selectedIndices.clear();
+                    strcpy_s(panel.pathInput, message.listingApps ? "Installed apps" : panel.currentPath.c_str());
+                    if (panel.navigationTransitionPending) {
+                        panel.navigationTransitionPending = false;
+                        panel.navigationTransitionReady = true;
+                    }
+                    m_compareDirty = true;
+                }
+            }
+        }
+        if (message.saveDeviceSessions) {
+            m_prefs.deviceSessionIdentities = m_deviceSessions.identities();
+            m_prefs.save();
+        }
+        if (message.deviceSessionReady) {
+            int slot = message.readyDeviceSlot;
+            for (FilePanel* panel : {&m_leftPanel, &m_rightPanel}) {
+                if (!panel->pendingDeviceSerial.empty() &&
+                    deviceIdentity(panel->pendingDeviceSerial) == deviceIdentity(deviceSession(slot).serial))
+                    openDeviceSession(*panel, slot);
+                else if (panel->isAndroid && panel->deviceSlot == slot && panel->pendingDeviceSerial.empty()) {
+                    auto& session = deviceSession(slot);
+                    if (panel->currentPath.empty() || panel->currentPath == "/") {
+                        ++panel->listingGeneration;
+                        panel->refreshInProgress = false;
+                        panel->currentPath = session.storageRoot;
+                        strcpy_s(panel->pathInput, panel->currentPath.c_str());
+                        std::lock_guard<std::mutex> lock(session.cacheMutex);
+                        panel->androidEntries = session.rootEntries;
+                    }
+                    panel->needsRefresh = true;
+                }
+            }
+        }
+        if (message.hasWifiPairing) applyWifiPairingResult(message);
+        if (message.connectionRequestFinished) {
+            if (m_connectionPendingSerial == message.connectionSerial) m_connectionPendingSerial.clear();
+            m_connectionFeedback = message.status;
+            for (FilePanel* panel : {&m_leftPanel, &m_rightPanel}) {
+                if (panel->pendingDeviceSerial != message.connectionSerial) continue;
+                if (message.connectionSlot >= 0) {
+                    openDeviceSession(*panel, message.connectionSlot);
+                } else panel->deviceOpenError = message.status;
+            }
+            if (!message.connectedWifiAddress.empty()) {
+                m_prefs.wifiAutoConnect = true;
+                for (auto& saved : m_prefs.savedWifiDevices) {
+                    if (saved.wifiIp + ":" + std::to_string(saved.port) != message.connectionSerial) continue;
+                    if (saved.model.empty()) saved.model = message.connectedWifiName;
+                    if (auto endpoint = parseAdbEndpoint(message.connectedWifiAddress)) {
+                        saved.wifiIp = endpoint->host;
+                        saved.port = endpoint->port;
+                    }
+                }
+                m_prefs.save();
+            }
+        }
+        if (message.connectionRefreshFinished) {
+            m_connectionsRefreshing = false;
+            if (!message.hasStatus) {
+                std::lock_guard<std::mutex> lock(m_deviceMutex);
+                std::string selectedSerial;
+                if (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size()) selectedSerial = m_devices[m_selectedDevice].serial;
+                m_devices = std::move(message.connectionDevices);
+                m_selectedDevice = -1;
+                for (int i = 0; i < (int)m_devices.size(); ++i)
+                    if (m_devices[i].serial == selectedSerial) m_selectedDevice = i;
+            } else m_connectionFeedback = message.status;
+        }
         if (message.hasWizardProbe && m_showWifiWizard && m_wizardStep == 1 &&
             message.wizardProbeGeneration == m_wizardProbeGeneration.load() &&
             message.wizardProbeSerial == m_wizardSerial) {
             m_wizardProbeBusy = false;
             m_wizardWifiIp = std::move(message.wizardProbeIp);
             m_wizardProbeError = std::move(message.wizardProbeError);
+        }
+        if (message.hasWizardSetupProgress && message.wizardSetupGeneration == m_wizardSetupGeneration &&
+            message.wizardSetupSerial == m_wizardSerial) {
+            m_wizardStatus = std::move(message.wizardSetupStatus);
+            if (message.wizardSetupFinished) {
+                m_wizardBusy = false;
+                m_wizardSucceeded = message.wizardSetupSucceeded;
+                m_wizardStep = 3;
+            }
         }
         if (message.setBackupApps) {
             m_backupManagerApps = std::move(message.backupApps);
@@ -1554,8 +1660,8 @@ void App::drainUiMessages() {
             m_appUninstallFailed = message.appUninstallFailed;
             m_appUninstallPackage = std::move(message.appUninstallPackage);
         }
-        if (message.backupRootProbeComplete && message.backupRootSlot == (m_backupManagerSlot & 1) &&
-            message.backupRootSerial == m_slotSerial[m_backupManagerSlot & 1]) {
+        if (message.backupRootProbeComplete && message.backupRootSlot == (m_backupManagerSlot) &&
+            message.backupRootSerial == deviceSession(m_backupManagerSlot).serial) {
             m_backupRootAccessSerial = message.backupRootSerial;
             m_backupRootAccess = message.backupRootAvailable ? BackupRootAccess::Available : BackupRootAccess::Unavailable;
             if (message.backupRootAvailable) {
@@ -1602,38 +1708,13 @@ void App::drainUiMessages() {
     }
 }
 
-bool App::selectDeviceBySerial(const std::string& serial, const std::vector<DeviceInfo>* refreshedDevices) {
-    if (serial.empty()) return false;
-    std::lock_guard<std::mutex> lk(m_deviceMutex);
-    if (refreshedDevices) m_devices = *refreshedDevices;
-    for (int i = 0; i < (int)m_devices.size(); i++) {
-        if (m_devices[i].serial == serial && m_devices[i].state == "device") {
-            m_selectedDevice = i;
-            m_lastDeviceSerial.clear();
-            return true;
-        }
-    }
-    return false;
-}
-
-bool App::refreshDeviceListAndSelect(const std::string& serial, int attempts, int delayMs) {
-    for (int attempt = 0; attempt < attempts && !m_shutdownPoll; attempt++) {
-        auto devices = m_device.getDevices();
-        if (selectDeviceBySerial(serial, &devices)) return true;
-        if (attempt + 1 < attempts)
-            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
-    }
-    return false;
-}
 
 void App::connectDeviceBySerialNow(const std::string& serial) {
-    if (serial.empty()) return;
-    if (!refreshDeviceListAndSelect(serial) && !selectDeviceBySerial(serial)) {
-        m_statusMessage = "Device not available: " + serial;
-        m_statusTime = std::chrono::steady_clock::now();
-        return;
-    }
-    onDeviceChanged();
+    if (serial.empty() || m_shutdownPoll) return;
+    discoverDeviceIdentities({DeviceInfo{serial, {}, "device"}});
+    int slot = m_deviceSessions.ensure(deviceIdentity(serial));
+    if (deviceSession(slot).connected && deviceForSlot(slot).isServerRunning()) return;
+    prepareDeviceSession(slot, serial);
 }
 
 void App::addKnownPrimarySerials(std::set<std::string>& serials, const std::string& serial) const {
@@ -1922,6 +2003,7 @@ void App::render() {
     bool panelsRefreshed = false;
     auto refreshPanel = [&](FilePanel& panel) {
         if (!panel.needsRefresh) return;
+        if (!panel.pendingDeviceSerial.empty()) return;
         if (panel.isConnections) {
             panel.needsRefresh = false;
             return;
@@ -1930,17 +2012,18 @@ void App::render() {
             if (panel.refreshInProgress) return;
             panel.refreshInProgress = true;
             panel.needsRefresh = false;
+            const auto generation = ++panel.listingGeneration;
+            const int col = panel.sortColumn;
+            const bool desc = panel.sortDescending;
             FilePanel* targetPanel = &panel;
             int slot = panel.deviceSlot;
-            std::string expectedSerial = (slot >= 0 && slot < 2) ? m_slotSerial[slot] : "";
-            postAsync("Loading installed apps...", [this, targetPanel, slot, expectedSerial]() {
+            std::string expectedSerial = (slot >= 0 && slot < deviceSessionCount()) ? deviceSession(slot).serial : "";
+            postAsync("Loading installed apps...", [this, targetPanel, slot, expectedSerial, generation, col, desc]() {
                 std::vector<InstalledAppEntry> apps;
                 DeviceClient& dev = deviceForSlot(slot);
                 if (dev.isServerRunning()) {
-                    std::string serial = m_slotSerial[slot];
+                    std::string serial = deviceSession(slot).serial;
                     apps = dev.listInstalledApps(serial, true);
-                    int col = targetPanel->sortColumn;
-                    bool desc = targetPanel->sortDescending;
                     std::sort(apps.begin(), apps.end(),
                         [col, desc](const InstalledAppEntry& a, const InstalledAppEntry& b) {
                             int cmp = 0;
@@ -1955,26 +2038,29 @@ void App::render() {
                             return desc ? cmp > 0 : cmp < 0;
                         });
                 }
-                if (targetPanel->isApps && targetPanel->deviceSlot == slot && m_slotSerial[slot] == expectedSerial) {
-                    targetPanel->appEntries = std::move(apps);
-                    targetPanel->selectedIndices.clear();
-                    strcpy_s(targetPanel->pathInput, "Installed apps");
-                }
-                targetPanel->refreshInProgress = false;
-                m_compareDirty = true;
+                UiMessage message;
+                message.listingPanel = targetPanel;
+                message.listingGeneration = generation;
+                message.listingSlot = slot;
+                message.listingApps = true;
+                message.listingAppEntries = std::move(apps);
+                postUiMessage(std::move(message));
             });
         } else if (panel.isAndroid) {
-            if (!m_slotConnected[panel.deviceSlot & 1] ||
+            if (!deviceSession(panel.deviceSlot).connected ||
                 !deviceForSlot(panel.deviceSlot).isServerRunning()) return;
             if (panel.refreshInProgress) return;
             panel.refreshInProgress = true;
             panel.needsRefresh = false;
+            const auto generation = ++panel.listingGeneration;
+            const int col = panel.sortColumn;
+            const bool desc = panel.sortDescending;
             FilePanel* targetPanel = &panel;
             int slot = panel.deviceSlot;
             std::string path = panel.currentPath;
             bool insideMcraw = panel.insideMcraw;
             std::string mcrawPath = panel.mcrawFilePath;
-            postAsync("Loading folder...", [this, targetPanel, slot, path, insideMcraw, mcrawPath]() {
+            postAsync("Loading folder...", [this, targetPanel, slot, path, insideMcraw, mcrawPath, generation, col, desc]() {
                 std::vector<DeviceFileEntry> entries;
                 DeviceClient& dev = deviceForSlot(slot);
                 if (dev.isServerRunning()) {
@@ -1982,8 +2068,6 @@ void App::render() {
                         entries = dev.listMcraw(mcrawPath);
                     else
                         entries = dev.listDirectory(path);
-                    int col = targetPanel->sortColumn;
-                    bool desc = targetPanel->sortDescending;
                     std::sort(entries.begin(), entries.end(),
                         [col, desc](const DeviceFileEntry& a, const DeviceFileEntry& b) {
                             if (a.isDirectory() != b.isDirectory()) return a.isDirectory();
@@ -1994,17 +2078,13 @@ void App::render() {
                             return desc ? cmp > 0 : cmp < 0;
                         });
                 }
-                if (targetPanel->isAndroid && targetPanel->deviceSlot == slot && targetPanel->currentPath == path) {
-                    targetPanel->androidEntries = std::move(entries);
-                    targetPanel->selectedIndices.clear();
-                    strcpy_s(targetPanel->pathInput, targetPanel->currentPath.c_str());
-                    if (targetPanel->navigationTransitionPending) {
-                        targetPanel->navigationTransitionPending = false;
-                        targetPanel->navigationTransitionReady = true;
-                    }
-                    m_compareDirty = true;
-                }
-                targetPanel->refreshInProgress = false;
+                UiMessage message;
+                message.listingPanel = targetPanel;
+                message.listingGeneration = generation;
+                message.listingSlot = slot;
+                message.listingPath = path;
+                message.listingEntries = std::move(entries);
+                postUiMessage(std::move(message));
             });
         } else {
             refreshWindowsPanel(panel);
@@ -2056,10 +2136,13 @@ void App::render() {
     ImGui::SetCursorPosY(bodyY);
     ImGui::SetCursorPosX(14*s);
     if (m_showBackupManager || m_showAppsWorkspace || m_showConnectionsWorkspace) {
-        ImGui::BeginChild("##WorkspacePage",ImVec2(-14*s,bodyHeight),ImGuiChildFlags_Borders);
+        if (m_showConnectionsWorkspace) ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
+        ImGui::BeginChild("##WorkspacePage",ImVec2(-14*s,bodyHeight),
+            m_showConnectionsWorkspace ? ImGuiChildFlags_None : ImGuiChildFlags_Borders);
+        if (m_showConnectionsWorkspace) ImGui::PopStyleVar();
         if (m_showBackupManager) renderBackupManagerWindow();
         else if (m_showAppsWorkspace) renderAppsPanel(m_appsWorkspacePanel,PanelSide::Left);
-        else renderPanel(m_connectionsWorkspacePanel,PanelSide::Left);
+        else renderConnectionManager(m_connectionsWorkspacePanel);
         ImGui::EndChild();
     } else {
         float width = ImGui::GetContentRegionAvail().x-14*s;
@@ -2369,7 +2452,7 @@ bool App::wantsHighFps() {
     if (m_isDragging || m_pendingOleDrag || m_pendingScale > 0.0f || m_themeNeedsReposition || m_showCloseConfirm)
         return true;
 
-    if (m_shellEntranceAnimation < 0.999f || m_deviceSlots[0].isConnecting() || m_deviceSlots[1].isConnecting())
+    if (m_shellEntranceAnimation < 0.999f || deviceSession(0).client.isConnecting() || deviceSession(1).client.isConnecting())
         return true;
     for (const auto& [id, value] : m_buttonHoverAnimation) {
         if (value > 0.001f && value < 0.999f) return true;
@@ -2469,9 +2552,9 @@ void App::renderMenuBar() {
                     curSerial = m_devices[m_selectedDevice].serial;
                 }
             }
-            if (!hasDevice && m_slotConnected[0] && m_device.isServerRunning()) {
+            if (!hasDevice && deviceSession(0).connected && m_device.isServerRunning()) {
                 hasDevice = true;
-                curSerial = m_slotSerial[0];
+                curSerial = deviceSession(0).serial;
             }
 
             if (m_device.isServerRunning()) {
@@ -2573,11 +2656,11 @@ void App::renderMenuBar() {
                 ImGui::Separator();
 
                 // Dokan virtual drive mount (per device slot)
-                for (int slot = 0; slot < 2; slot++) {
-                    if (!m_slotConnected[slot]) continue;
+                for (int slot = 0; slot < deviceSessionCount(); slot++) {
+                    if (!deviceSession(slot).connected) continue;
                     auto& mgr = DeviceMountManager::instance(slot);
-                    std::string driveLetter = (slot == 0) ? "P:\\" : "Q:\\";
-                    std::string slotLabel = m_slotSerial[slot];
+                    std::string driveLetter = DeviceMountManager::availableMountPoint();
+                    std::string slotLabel = deviceSession(slot).serial;
                     if (slotLabel.size() > 12) slotLabel = slotLabel.substr(0, 12) + "..";
 
                     if (mgr.isMounted()) {
@@ -2596,9 +2679,9 @@ void App::renderMenuBar() {
                     } else {
                         std::string mountId = "Mount " + slotLabel + " as " + driveLetter + "##" + std::to_string(slot);
                         if (ImGui::MenuItem(mountId.c_str())) {
-                            std::string sr = m_slotStorageRoot[slot];
+                            std::string sr = deviceSession(slot).storageRoot;
                             postAsync("Mounting virtual drive...", [this, slot, sr, driveLetter]() {
-                                if (DeviceMountManager::instance(slot).mount(&m_deviceSlots[slot], sr, driveLetter)) {
+                                if (DeviceMountManager::instance(slot).mount(&deviceSession(slot).client, sr, driveLetter)) {
                                     m_statusMessage = "Mounted: " + driveLetter;
                                     ShellExecuteA(nullptr, "explore", driveLetter.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                                 } else {
@@ -2615,13 +2698,10 @@ void App::renderMenuBar() {
                 // WiFi ADB options
                 if (ImGui::BeginMenu("WiFi ADB")) {
                     if (ImGui::MenuItem("Setup Wizard...", nullptr, false, hasDevice)) {
-                        m_showWifiWizard = true;
-                        m_wizardStep = 0;
+                        openWifiWizard();
                     }
                     if (ImGui::MenuItem("Pair (Android 11+)...")) {
-                        m_showWifiPairing = true;
-                        m_pairingIp[0] = '\0';
-                        m_pairingCode[0] = '\0';
+                        openWifiPairing();
                     }
                     ImGui::Separator();
                     if (!m_prefs.savedWifiDevices.empty()) {
@@ -2979,11 +3059,11 @@ void App::renderFavoritesBar(FilePanel& panel, PanelSide side) {
     if (!panel.isAndroid) {
         for (const auto& drive:getWindowsDrives()) shortcuts.push_back({drive,drive+"\\"});
     } else {
-        int slot=panel.deviceSlot&1;
-        std::string root=m_slotStorageRoot[slot].empty()?"/sdcard":m_slotStorageRoot[slot];
-        for (size_t i=0; i<m_slotVolumes[slot].size(); ++i)
-            shortcuts.push_back({i==0?"Internal":"SD "+std::to_string(i),m_slotVolumes[slot][i]});
-        if (m_slotVolumes[slot].empty()) shortcuts.push_back({"Storage",root});
+        int slot=panel.deviceSlot;
+        std::string root=deviceSession(slot).storageRoot.empty()?"/sdcard":deviceSession(slot).storageRoot;
+        for (size_t i=0; i<deviceSession(slot).volumes.size(); ++i)
+            shortcuts.push_back({i==0?"Internal":"SD "+std::to_string(i),deviceSession(slot).volumes[i]});
+        if (deviceSession(slot).volumes.empty()) shortcuts.push_back({"Storage",root});
         for (const char* folder:{"Download","DCIM","Documents","Pictures","Music"})
             shortcuts.push_back({folder,root+"/"+folder});
         shortcuts.push_back({"/","/"});
@@ -3191,9 +3271,9 @@ void App::renderDeviceBar() {
             return serial;
         };
         const int adbSnapshotCount = (int)devSnap.size();
-        for (int slot = 0; slot < 2; ++slot) {
-            if (!m_slotConnected[slot] || !m_deviceSlots[slot].isServerRunning()) continue;
-            std::string identity = physicalIdentity(m_slotSerial[slot]);
+        for (int slot = 0; slot < deviceSessionCount(); ++slot) {
+            if (!deviceSession(slot).connected || !deviceSession(slot).client.isServerRunning()) continue;
+            std::string identity = physicalIdentity(deviceSession(slot).serial);
             bool represented = false;
             for (const auto& device : devSnap) {
                 if (physicalIdentity(device.serial) == identity) {
@@ -3203,7 +3283,7 @@ void App::renderDeviceBar() {
             }
             if (represented) continue;
             DeviceInfo connected;
-            connected.serial = m_slotSerial[slot];
+            connected.serial = deviceSession(slot).serial;
             connected.state = "device";
             auto nameIt = m_deviceDisplayNames.find(connected.serial);
             connected.model = nameIt != m_deviceDisplayNames.end() && !nameIt->second.empty()
@@ -3236,8 +3316,8 @@ void App::renderDeviceBar() {
                 return name + " (" + devSnap[idx].serial + ")";
             };
             int previewIndex = selSnap;
-            if (m_slotConnected[0] && m_device.isServerRunning()) {
-                auto current = physicalIndex.find(physicalIdentity(m_slotSerial[0]));
+            if (deviceSession(0).connected && m_device.isServerRunning()) {
+                auto current = physicalIndex.find(physicalIdentity(deviceSession(0).serial));
                 if (current != physicalIndex.end()) previewIndex = current->second;
             } else if (selSnap >= 0 && selSnap < adbSnapshotCount) {
                 auto current = physicalIndex.find(physicalIdentity(devSnap[selSnap].serial));
@@ -3248,8 +3328,8 @@ void App::renderDeviceBar() {
             if (ImGui::BeginCombo("##DeviceCombo", preview.c_str())) {
                 for (int i : physicalDeviceIndices) {
                     std::string label = getDevName(i);
-                    bool itemIsPrimary = m_slotConnected[0] && m_device.isServerRunning() &&
-                        physicalIdentity(m_slotSerial[0]) == physicalIdentity(devSnap[i].serial);
+                    bool itemIsPrimary = deviceSession(0).connected && m_device.isServerRunning() &&
+                        physicalIdentity(deviceSession(0).serial) == physicalIdentity(devSnap[i].serial);
                     if (devSnap[i].state != "device") {
                         label += " [" + devSnap[i].state + "]";
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,0.5f,0.5f,1));
@@ -3257,19 +3337,12 @@ void App::renderDeviceBar() {
                     if (ImGui::Selectable(label.c_str(), itemIsPrimary)) {
                         std::string selectedSerial = devSnap[i].serial;
                         bool alreadySelected = itemIsPrimary;
-                        bool alreadyConnected = (m_slotConnected[0] &&
-                            physicalIdentity(m_slotSerial[0]) == physicalIdentity(selectedSerial) &&
-                            m_device.isServerRunning()) ||
-                            (m_slotConnected[1] && physicalIdentity(m_slotSerial[1]) == physicalIdentity(selectedSerial) &&
-                             m_deviceSlots[1].isServerRunning());
+                        int existingSlot = m_deviceSessions.find(deviceIdentity(selectedSerial));
+                        bool alreadyConnected = existingSlot >= 0 && deviceSession(existingSlot).connected &&
+                            deviceForSlot(existingSlot).isServerRunning();
                         if (alreadyConnected && !alreadySelected) {
                             m_statusMessage = "Device is already connected. Select it from an Android pane.";
                             m_statusTime = std::chrono::steady_clock::now();
-                        } else if (i < adbSnapshotCount) {
-                            std::lock_guard<std::mutex> lk(m_deviceMutex);
-                            m_selectedDevice = i;
-                            if (!alreadySelected)
-                                m_lastDeviceSerial.clear();
                         }
                         if (i < adbSnapshotCount && devSnap[i].state == "device" &&
                             !alreadySelected && !alreadyConnected) {
@@ -3541,7 +3614,7 @@ void App::renderConnectionActivity() {
     };
 
     std::vector<ConnectionCard> cards;
-    cards.reserve(2);
+    cards.reserve(deviceSessionCount());
     std::set<std::string> onlineSerials;
     {
         std::lock_guard<std::mutex> lock(m_deviceMutex);
@@ -3550,17 +3623,15 @@ void App::renderConnectionActivity() {
         }
     }
     auto now = std::chrono::steady_clock::now();
-    for (int slot = 0; slot < 2; ++slot) {
-        DeviceClient& client = m_deviceSlots[slot];
+    for (int slot = 0; slot < deviceSessionCount(); ++slot) {
+        DeviceClient& client = deviceSession(slot).client;
         ConnectionCard card;
         card.slot = slot;
-        card.connected = m_slotConnected[slot] && client.isServerRunning();
+        card.connected = deviceSession(slot).connected && client.isServerRunning();
         card.connecting = client.isConnecting();
         card.serial = client.connectedSerial();
-        if (card.serial.empty()) card.serial = m_slotSerial[slot];
-        if (slot == 1 && card.serial.empty()) card.serial = m_secondaryRetrySerial;
-        card.retrying = slot == 1 && !card.connected && !card.connecting &&
-            card.serial == m_secondaryRetrySerial && now < m_secondaryRetryAfter;
+        if (card.serial.empty()) card.serial = deviceSession(slot).serial;
+        card.retrying = !card.connected && !card.connecting && now < deviceSession(slot).retryAfter;
         if (card.serial.empty()) continue;
 
         bool listedOnline = false;
@@ -3574,11 +3645,11 @@ void App::renderConnectionActivity() {
             }
         }
         if (listedOnline || card.connected || card.connecting) {
-            m_connectionCardMissingSince[slot] = {};
+            deviceSession(slot).missingSince = {};
         } else {
-            if (m_connectionCardMissingSince[slot].time_since_epoch().count() == 0)
-                m_connectionCardMissingSince[slot] = now;
-            bool graceExpired = now - m_connectionCardMissingSince[slot] >= std::chrono::seconds(8);
+            if (deviceSession(slot).missingSince.time_since_epoch().count() == 0)
+                deviceSession(slot).missingSince = now;
+            bool graceExpired = now - deviceSession(slot).missingSince >= std::chrono::seconds(8);
             if (graceExpired && !card.retrying) continue;
         }
 
@@ -3600,10 +3671,8 @@ void App::renderConnectionActivity() {
         bool activeTransferDual = card.slot == 0 && m_dualChannelAvailable &&
             ((primaryIsWifi && m_secondaryChannelType == "USB") ||
              (!primaryIsWifi && m_secondaryChannelType == "WiFi"));
-        bool slot1WifiStandby = card.slot == 1 && !primaryIsWifi &&
-            m_slot1WifiChannel.isServerRunning();
         card.dualTransport = card.connected &&
-            (companionTransportOnline || activeTransferDual || slot1WifiStandby);
+            (companionTransportOnline || activeTransferDual);
         if (card.connected) {
             card.stage = card.dualTransport ? "Connected over USB + WiFi" :
                 (primaryIsWifi ? "Connected over WiFi" : "Connected over USB");
@@ -3612,7 +3681,7 @@ void App::renderConnectionActivity() {
             if (card.stage.empty()) card.stage = "Preparing device connection";
         } else if (card.retrying) {
             auto seconds = std::max(1LL, std::chrono::duration_cast<std::chrono::seconds>(
-                m_secondaryRetryAfter - now).count() + 1);
+                deviceSession(card.slot).retryAfter - now).count() + 1);
             card.stage = "Retrying in " + std::to_string(seconds) + " seconds";
         } else {
             card.stage = listedOnline ? "Waiting for device" : "Device disconnected";
@@ -3829,283 +3898,33 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
     }
 
     renderPaneHeader(panel, side);
+    if (!panel.pendingDeviceSerial.empty()) {
+        ImGui::BeginDisabled();
+        renderPaneNavigation(panel);
+        ImGui::EndDisabled();
+        if (ImGui::BeginTable("##OpeningDeviceFiles", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 66 * ui::scale());
+            ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_WidthFixed, 128 * ui::scale());
+            ImGui::TableHeadersRow();
+            ImGui::EndTable();
+        }
+        ImGui::Spacing();
+        ImGui::TextWrapped("%s", panel.deviceOpenError.empty() ? "Loading files..." : panel.deviceOpenError.c_str());
+        if (!panel.deviceOpenError.empty() && ui::button("Try again", ui::Icon::Refresh, ui::Appearance::Secondary)) {
+            panel.deviceOpenError.clear();
+            connectFromManager(panel.pendingDeviceSerial, false);
+        }
+        return;
+    }
     const char* label = panel.isAndroid ? "Android" : "Windows";
     ImVec4 labelColor = panel.isAndroid ? ImVec4(0.3f,0.85f,0.4f,1) : ImVec4(0.40f,0.65f,1,1);
 
     // The connection manager is a persistent pane mode. It is also used as the
     // setup fallback when an Android pane has no connected device.
-    bool connectionSetupActive = deviceFor(panel).isConnecting() ||
-        (panel.deviceSlot == 0 && (m_primaryReconnectActive || m_wifiTransitionActive));
     if (panel.isConnections || (panel.isAndroid &&
-        (!deviceFor(panel).isServerRunning() || connectionSetupActive))) {
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 1.0f);
-
-        ImGui::BeginChild("##ConnectionContent",ImVec2(0,0));
-        float availH = ImGui::GetContentRegionAvail().y;
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY()+std::max(12.0f,availH*0.10f));
-        float availW = ImGui::GetContentRegionAvail().x;
-        float contentW = std::min(360*ui::scale(),availW);
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX()+std::max(0.0f,(availW-contentW)*0.5f));
-
-        ImGui::BeginGroup();
-
-        ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Connection Manager");
-        ImGui::Spacing();
-        ImGui::Spacing();
-
-        if (connectionSetupActive) {
-            std::string status = deviceFor(panel).statusText();
-            if (status.empty()) status = "Preparing USB and WiFi connections...";
-            float progressCardWidth = std::min(contentW, availW);
-
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.035f, 0.065f, 0.105f, 0.96f));
-            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.16f, 0.35f, 0.58f, 0.85f));
-            ImGui::BeginChild("##ConnectionProgressCard", ImVec2(progressCardWidth, 124.0f), ImGuiChildFlags_Borders,
-                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-
-            ImDrawList* drawList = ImGui::GetWindowDrawList();
-            ImVec2 cardPos = ImGui::GetWindowPos();
-            ImVec2 spinnerCenter(cardPos.x + 28.0f, cardPos.y + 52.0f);
-            float phase = (float)ImGui::GetTime() * 8.0f;
-            for (int i = 0; i < 12; ++i) {
-                float angle = ((float)i / 12.0f) * 6.2831853f - 1.5707963f;
-                float intensity = 0.20f + 0.80f * std::max(0.0f, std::cos(angle - phase));
-                ImVec2 dot(spinnerCenter.x + std::cos(angle) * 11.0f,
-                           spinnerCenter.y + std::sin(angle) * 11.0f);
-                drawList->AddCircleFilled(dot, 2.3f, IM_COL32(74, 174, 255, (int)(255.0f * intensity)));
-            }
-
-            ImGui::SetCursorPos(ImVec2(54.0f, 15.0f));
-            ImGui::TextColored(ImVec4(0.34f, 0.73f, 1.0f, 1.0f), "Establishing device connections");
-            ImGui::SetCursorPos(ImVec2(54.0f, 42.0f));
-            ImGui::PushTextWrapPos(progressCardWidth - 12.0f);
-            ImGui::TextDisabled("%s", status.c_str());
-            ImGui::PopTextWrapPos();
-            ImGui::SetCursorPos(ImVec2(54.0f, 78.0f));
-            ImGui::PushTextWrapPos(progressCardWidth - 12.0f);
-            ImGui::TextDisabled("File panes will appear when the active channels are ready.");
-            ImGui::PopTextWrapPos();
-
-            ImGui::EndChild();
-            ImGui::PopStyleColor(2);
-            ImGui::Spacing();
-        }
-
-        // Show other connected devices the user can switch to
-        int onlineDeviceCount = 0;
-        std::vector<int> physicalDeviceIndices;
-        {
-            std::lock_guard<std::mutex> lk(m_deviceMutex);
-            std::map<std::string, int> physicalDeviceIndex;
-            for (int i = 0; i < (int)m_devices.size(); ++i) {
-                const auto& device = m_devices[i];
-                if (device.state != "device") continue;
-
-                std::string identity = device.serial;
-                for (const auto& saved : m_prefs.savedWifiDevices) {
-                    if (saved.wifiIp.empty()) continue;
-                    std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
-                    if ((saved.serial == device.serial || wifiSerial == device.serial) &&
-                        !saved.serial.empty() && saved.serial != wifiSerial) {
-                        identity = saved.serial;
-                        break;
-                    }
-                }
-
-                auto existing = physicalDeviceIndex.find(identity);
-                if (existing == physicalDeviceIndex.end()) {
-                    physicalDeviceIndex.emplace(identity, i);
-                    physicalDeviceIndices.push_back(i);
-                } else if (isWifiSerial(m_devices[existing->second].serial) && !isWifiSerial(device.serial)) {
-                    int previousIndex = existing->second;
-                    existing->second = i;
-                    auto indexIt = std::find(physicalDeviceIndices.begin(), physicalDeviceIndices.end(), previousIndex);
-                    if (indexIt != physicalDeviceIndices.end()) *indexIt = i;
-                }
-            }
-            onlineDeviceCount = (int)physicalDeviceIndices.size();
-            auto samePhysicalDevice = [&](const std::string& first, const std::string& second) {
-                if (first == second) return true;
-                for (const auto& saved : m_prefs.savedWifiDevices) {
-                    if (saved.wifiIp.empty()) continue;
-                    std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
-                    if ((first == saved.serial && second == wifiSerial) ||
-                        (first == wifiSerial && second == saved.serial))
-                        return true;
-                }
-                return false;
-            };
-            if (onlineDeviceCount > 0) {
-                ImGui::TextDisabled("Available devices:");
-                ImGui::Spacing();
-                for (int i : physicalDeviceIndices) {
-                    bool isSel = (m_selectedDevice == i);
-                    std::string label = m_devices[i].serial;
-                    if (!m_devices[i].model.empty()) label = m_devices[i].model + " (" + m_devices[i].serial + ")";
-                    if (isSel) {
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
-                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
-                    }
-                    if (modernSmallButton(label.c_str())) {
-                        std::string selectedSerial = m_devices[i].serial;
-                        bool alreadyConnected = (m_slotConnected[0] &&
-                            samePhysicalDevice(m_slotSerial[0], selectedSerial) && m_device.isServerRunning()) ||
-                            (m_slotConnected[1] && samePhysicalDevice(m_slotSerial[1], selectedSerial) &&
-                             m_deviceSlots[1].isServerRunning());
-                        if (!isSel && alreadyConnected) {
-                            m_statusMessage = "Device is already connected. Select it from an Android pane.";
-                            m_statusTime = std::chrono::steady_clock::now();
-                        } else if (!isSel) {
-                            m_selectedDevice = i;
-                        }
-                        if (!isSel && !alreadyConnected) {
-                            m_lastDeviceSerial.clear();
-                            panel.needsRefresh = true;
-                            postAsync("Connecting to " + selectedSerial + "...", [this, selectedSerial]() {
-                                connectDeviceBySerialNow(selectedSerial);
-                            });
-                        }
-                    }
-                    if (isSel) ImGui::PopStyleColor(2);
-                }
-                ImGui::Spacing();
-                ImGui::Separator();
-                ImGui::Spacing();
-            }
-        }
-
-        // Show saved WiFi devices the user can connect to directly
-        if (!m_prefs.savedWifiDevices.empty()) {
-            ImGui::TextDisabled("Saved WiFi devices:");
-            ImGui::Spacing();
-            int deleteSavedDevice = -1;
-            for (int si = 0; si < (int)m_prefs.savedWifiDevices.size(); si++) {
-                auto& w = m_prefs.savedWifiDevices[si];
-                if (w.wifiIp.empty()) continue;
-                std::string connectAddr = w.wifiIp + ":" + std::to_string(w.port);
-                std::string displayLabel;
-                if (!w.model.empty())
-                    displayLabel = w.model + " (" + connectAddr + ")";
-                else if (!w.serial.empty() && w.serial != connectAddr)
-                    displayLabel = w.serial + " (" + connectAddr + ")";
-                else
-                    displayLabel = connectAddr;
-                std::string btnLabel = "Connect##saved" + std::to_string(si);
-                ImGui::TextWrapped("%s",displayLabel.c_str());
-                // Auto-connect on launch checkbox
-                std::string autoLabel = "Auto##auto" + std::to_string(si);
-                if (ImGui::Checkbox(autoLabel.c_str(), &w.autoConnect)) {
-                    m_prefs.save();
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Automatically connect to this device\nwhen the app launches");
-                ImGui::SameLine();
-                if (modernSmallButton(btnLabel.c_str())) {
-                    int savedIdx = si;
-                    postAsync("Connecting to " + connectAddr + "...", [this, connectAddr, savedIdx]() {
-                        std::string result = m_device.runAdbCommand("connect " + connectAddr);
-                        if (result.find("connected") != std::string::npos &&
-                            result.find("failed") == std::string::npos) {
-                            m_statusMessage = "Connected: " + connectAddr;
-                            m_prefs.wifiAutoConnect = true;
-                            // Backfill model if missing
-                            if (savedIdx < (int)m_prefs.savedWifiDevices.size() &&
-                                m_prefs.savedWifiDevices[savedIdx].model.empty()) {
-                                std::string displayName = queryDeviceDisplayName(connectAddr);
-                                if (!displayName.empty()) {
-                                    m_prefs.savedWifiDevices[savedIdx].model = displayName;
-                                    m_prefs.save();
-                                }
-                            }
-                            connectDeviceBySerialNow(connectAddr);
-                        } else {
-                            m_statusMessage = "Connect failed: " + result;
-                        }
-                        m_statusTime = std::chrono::steady_clock::now();
-                    });
-                }
-                ImGui::SameLine();
-                std::string delLabel = "Delete##saved" + std::to_string(si);
-                if (modernSmallButton(delLabel.c_str())) {
-                    deleteSavedDevice = si;
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Remove this saved device");
-                ImGui::Spacing();
-            }
-            if (deleteSavedDevice >= 0 && deleteSavedDevice < (int)m_prefs.savedWifiDevices.size()) {
-                std::string removed = m_prefs.savedWifiDevices[deleteSavedDevice].model;
-                if (removed.empty()) {
-                    auto& w = m_prefs.savedWifiDevices[deleteSavedDevice];
-                    removed = w.wifiIp + ":" + std::to_string(w.port);
-                }
-                m_prefs.savedWifiDevices.erase(m_prefs.savedWifiDevices.begin() + deleteSavedDevice);
-                m_prefs.save();
-                m_statusMessage = "Removed saved device: " + removed;
-                m_statusTime = std::chrono::steady_clock::now();
-            }
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-        }
-
-        if (!connectionSetupActive) {
-            ImGui::TextDisabled("1. Connect your phone via USB cable");
-            ImGui::TextDisabled("2. Enable Developer Options and USB Debugging");
-            ImGui::TextDisabled("3. When prompted, tap Allow to authorize this computer");
-            ImGui::Spacing();
-            ImGui::TextDisabled("For wireless transfers, use the setup wizard below.");
-            ImGui::Spacing();
-            ImGui::Spacing();
-
-            float btn1W = ImGui::CalcTextSize("Run Setup Wizard").x + ImGui::GetStyle().FramePadding.x * 2;
-            float btn2W = ImGui::CalcTextSize("WiFi ADB Pairing (Android 11+)").x + ImGui::GetStyle().FramePadding.x * 2;
-            float btnW = std::max(btn1W, btn2W);
-
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (contentW - btnW) * 0.5f);
-            if (modernButton("Run Setup Wizard", ImVec2(btnW, 0))) {
-                m_showWifiWizard = true;
-                m_wizardStep = 0;
-            }
-            ImGui::PopStyleColor(2);
-
-            ImGui::Spacing();
-
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f, 0.35f, 0.10f, 1));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.50f, 0.15f, 1));
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (contentW - btnW) * 0.5f);
-            if (modernButton("WiFi ADB Pairing (Android 11+)", ImVec2(btnW, 0))) {
-                m_showWifiPairing = true;
-                m_pairingIp[0] = '\0';
-                m_pairingCode[0] = '\0';
-            }
-            ImGui::PopStyleColor(2);
-
-            ImGui::Spacing();
-            ImGui::Spacing();
-        }
-
-        if (onlineDeviceCount == 0) {
-            char waitText[32];
-            float t = (float)fmod(ImGui::GetTime() * 0.8, 1.0);
-            int dots = (int)(t * 4) % 4;
-            snprintf(waitText, sizeof(waitText), "Waiting for device%.*s", dots, "...");
-            float textW = ImGui::CalcTextSize(waitText).x;
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (contentW - textW) * 0.5f);
-            ImGui::TextDisabled("%s", waitText);
-        } else {
-            std::string deviceText = std::to_string(onlineDeviceCount) +
-                (onlineDeviceCount == 1 ? " device available" : " devices available");
-            float textW = ImGui::CalcTextSize(deviceText.c_str()).x;
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (contentW - textW) * 0.5f);
-            ImGui::TextColored(ImVec4(0.3f, 0.85f, 0.45f, 1), "%s", deviceText.c_str());
-        }
-
-        ImGui::EndGroup();
-        ImGui::EndChild();
-        ImGui::PopStyleVar();
+        !deviceFor(panel).isServerRunning())) {
+        renderConnectionManager(panel);
         return;
     }
 
@@ -5191,7 +5010,7 @@ void App::startAppUninstall(FilePanel& panel, bool useRoot) {
         return;
 
     int slot = panel.deviceSlot;
-    std::string serial = m_slotSerial[slot];
+    std::string serial = deviceSession(slot).serial;
     m_appUninstallActive = true;
     m_appUninstallUseRoot = useRoot;
     m_appUninstallCurrent = 0;
@@ -5521,13 +5340,13 @@ std::string App::getBackupsRootPath() const {
 }
 
 void App::refreshBackupManagerApps() {
-    int slot = m_backupManagerSlot & 1;
-    if (!m_slotConnected[slot] || m_slotSerial[slot].empty()) {
+    int slot = m_backupManagerSlot;
+    if (!deviceSession(slot).connected || deviceSession(slot).serial.empty()) {
         m_backupManagerApps.clear();
         m_backupManagerNeedsAppRefresh = false;
         return;
     }
-    std::string serial = m_slotSerial[slot];
+    std::string serial = deviceSession(slot).serial;
     postAsync("Loading backup app list...", [this, slot, serial]() {
         std::vector<InstalledAppEntry> apps = deviceForSlot(slot).listInstalledApps(serial, true);
         std::vector<BackupManagerAppRow> rows;
@@ -5542,9 +5361,9 @@ void App::refreshBackupManagerApps() {
 }
 
 void App::probeBackupManagerRootAccess() {
-    int slot = m_backupManagerSlot & 1;
-    if (!m_slotConnected[slot] || m_slotSerial[slot].empty()) return;
-    std::string serial = m_slotSerial[slot];
+    int slot = m_backupManagerSlot;
+    if (!deviceSession(slot).connected || deviceSession(slot).serial.empty()) return;
+    std::string serial = deviceSession(slot).serial;
     if (m_backupRootAccess == BackupRootAccess::Checking && m_backupRootAccessSerial == serial) return;
     if (m_backupRootAccessSerial == serial && m_backupRootAccess != BackupRootAccess::Unknown) return;
 
@@ -5846,9 +5665,9 @@ std::vector<App::ArchiveTransportChannel> App::buildArchiveTransportChannels(
     DeviceClient& baseClient, int slot, int localPortBase) {
     std::vector<ArchiveTransportChannel> channels;
     const std::string baseSerial = baseClient.connectedSerial().empty()
-        ? m_slotSerial[slot & 1]
+        ? deviceSession(slot).serial
         : baseClient.connectedSerial();
-    const int remotePort = baseClient.localPort();
+    const int remotePort = baseClient.serverPort();
     std::string usbSerial;
     std::string wifiIp;
 
@@ -5932,7 +5751,7 @@ std::vector<App::ArchiveTransportChannel> App::buildArchiveTransportChannels(
 
     int usbCount = baseUsesWifi ? 0 : 1;
     int wifiCount = baseUsesWifi ? 1 : 0;
-    int nextPort = localPortBase + (slot & 1) * 32;
+    int nextPort = localPortBase;
 
     auto addUsbChannel = [&]() -> bool {
         if (usbSerial.empty()) return false;
@@ -5949,6 +5768,7 @@ std::vector<App::ArchiveTransportChannel> App::buildArchiveTransportChannels(
 
             auto client = std::make_unique<DeviceClient>();
             client->setAdbPath(baseClient.getAdbPath());
+            client->setServerPort(baseClient.serverPort());
             client->setLocalPort(localPort);
             if (!client->connectTcp("127.0.0.1", localPort) || !client->verifyConnection()) {
                 client->disconnectTcp();
@@ -5976,6 +5796,7 @@ std::vector<App::ArchiveTransportChannel> App::buildArchiveTransportChannels(
         if (wifiIp.empty()) return false;
         auto client = std::make_unique<DeviceClient>();
         client->setAdbPath(baseClient.getAdbPath());
+        client->setServerPort(baseClient.serverPort());
         if (!client->connectTcp(wifiIp, remotePort) || !client->verifyConnection()) return false;
 
         ArchiveTransportChannel channel;
@@ -6019,7 +5840,7 @@ void App::closeArchiveTransportChannels(
 }
 
 void App::startBackupManagerBackup() {
-    int slot = m_backupManagerSlot & 1;
+    int slot = m_backupManagerSlot;
     std::vector<std::string> packages;
     std::unordered_map<std::string, std::string> appLabels;
     for (const auto& row : m_backupManagerApps)
@@ -6032,7 +5853,7 @@ void App::startBackupManagerBackup() {
     std::string prompt = "Back up " + std::to_string(packages.size()) + " selected app(s) to the PC?";
     if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Backup", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
 
-    std::string serial = m_slotSerial[slot];
+    std::string serial = deviceSession(slot).serial;
     std::string adbPath = deviceForSlot(slot).getAdbPath();
     AppBackupOptions options;
     options.includeApk = m_backupIncludeApk;
@@ -6648,13 +6469,13 @@ void App::startBackupManagerRestore() {
 }
 
 void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
-    int slot = m_backupManagerSlot & 1;
+    int slot = m_backupManagerSlot;
     if (backups.empty()) return;
     LOG_INFO("BackupManager", "Restore requested for " + std::to_string(backups.size()) + " backup(s)");
     std::string prompt = "Restore " + std::to_string(backups.size()) + " selected backup(s) to the selected device?";
     if (MessageBoxA(g_mainHwnd, prompt.c_str(), "Confirm Restore", MB_YESNO | MB_ICONWARNING) != IDYES) return;
 
-    std::string serial = m_slotSerial[slot];
+    std::string serial = deviceSession(slot).serial;
     std::string adbPath = deviceForSlot(slot).getAdbPath();
     AppBackupOptions options;
     options.includeApk = m_backupIncludeApk;
@@ -7280,42 +7101,80 @@ void App::renderBackupManagerWindow() {
     if (m_backupManagerNeedsAppRefresh && !m_asyncBusy.load()) refreshBackupManagerApps();
     probeBackupManagerRootAccess();
 
-    ImGui::Separator();
-    ImGui::TextColored(m_theme.gradientPrimary, "Backup Manager");
-    ImGui::SameLine();
-    if (modernButton("Back to File Manager")) {
-        m_showBackupManager = false;
-        return;
-    }
+    ui::PanelStyle theme(m_resolvedLightTheme);
+    const float s = theme.s;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14 * s, 12 * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 9 * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8 * s, 8 * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(9 * s, 6 * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8 * s, 5 * s));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, theme.surface);
+    ImGui::PushStyleColor(ImGuiCol_Border, theme.border);
+    ImGui::PushStyleColor(ImGuiCol_Text, theme.text);
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, theme.muted);
+    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, theme.raised);
+    ImGui::PushStyleColor(ImGuiCol_TableRowBg, theme.background);
+    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, theme.surface);
 
-    std::string root = getBackupsRootPath();
-    ImGui::SameLine();
-    ImGui::TextDisabled("Storage: %s", root.c_str());
-    ImGui::SameLine();
-    if (modernSmallButton("Open Folder")) {
-        CreateDirectoryW(toWide(root).c_str(), nullptr);
-        ShellExecuteA(nullptr, "explore", root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    }
-
-    ImGui::Separator();
-    ImGui::Text("Device");
-    ImGui::SameLine();
-    auto slotLabel = [&](int slot) -> std::string {
-        if (!m_slotConnected[slot]) return "No device";
-        auto it = m_deviceDisplayNames.find(m_slotSerial[slot]);
-        if (it != m_deviceDisplayNames.end()) return it->second;
-        return m_slotSerial[slot];
+    struct BackupOption { const char* label; bool* value; bool rootOnly = false; };
+    BackupOption options[] = {
+        {"APK", &m_backupIncludeApk}, {"App data", &m_backupIncludeData, true},
+        {"Device protected", &m_backupIncludeDeData, true}, {"External", &m_backupIncludeExternalData},
+        {"OBB", &m_backupIncludeObb}, {"Media", &m_backupIncludeMedia},
+        {"Skip cache folders", &m_backupExcludeCache}, {"Show system apps", &m_backupShowSystemApps},
+        {"Restore permissions", &m_backupRestorePermissions}, {"Allow downgrade", &m_backupAllowDowngrade}
     };
-    ImGui::SetNextItemWidth(260);
+    const float toolbarWidth = ImGui::GetContentRegionAvail().x - 28 * s;
+    float optionX = 0;
+    int optionRows = 1;
+    for (const auto& option : options) {
+        float w = ImGui::CalcTextSize(option.label).x + ImGui::GetFrameHeight() + 26 * s;
+        if (optionX > 0 && optionX + w > toolbarWidth) { ++optionRows; optionX = 0; }
+        optionX += w;
+    }
+    const bool narrowToolbar = toolbarWidth < 980 * s;
+    const float titleRowH = (narrowToolbar ? 82 : 46) * s;
+    const float headerH = titleRowH + 60 * s + optionRows * (ImGui::GetFrameHeight() + 8 * s);
+    ImGui::BeginChild("##BackupToolbar", ImVec2(0, headerH), ImGuiChildFlags_Borders,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImVec2 toolbar = ImGui::GetCursorScreenPos();
+    float width = ImGui::GetContentRegionAvail().x;
+    theme.tile(ui::Icon::Backup, toolbar, 32);
+    theme.label(ImVec2(toolbar.x + 46 * s, toolbar.y + 4 * s), "Backup Manager", 202 * s, theme.text, 20, true);
+    if (theme.button("##BackupToFiles", "Back to File Manager", ui::Icon::Back,
+        ImVec2(toolbar.x + 253 * s, toolbar.y), ImVec2(188 * s, 32 * s), theme.muted)) m_showBackupManager = false;
+    std::string root = getBackupsRootPath();
+    float storageX = narrowToolbar ? toolbar.x : toolbar.x + 458 * s;
+    float storageY = toolbar.y + (narrowToolbar ? 44 * s : 0);
+    float folderX = toolbar.x + width - 128 * s;
+    theme.label(ImVec2(storageX, storageY + 8 * s), "Storage: " + root, folderX - storageX - 18 * s, theme.muted, 13);
+    ImGui::SetCursorScreenPos(ImVec2(storageX, storageY));
+    ImGui::InvisibleButton("##BackupStoragePath", ImVec2(std::max(1.0f, folderX - storageX - 18 * s), 32 * s));
+    ui::tooltip(root.c_str());
+    if (theme.button("##OpenBackupFolder", "Open Folder", ui::Icon::Folder,
+        ImVec2(folderX, storageY), ImVec2(128 * s, 32 * s), theme.text)) {
+        CreateDirectoryW(toWide(root).c_str(), nullptr);
+        ShellExecuteW(nullptr, L"explore", toWide(root).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    float deviceY = toolbar.y + titleRowH;
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(toolbar.x, deviceY - 6 * s), ImVec2(toolbar.x + width, deviceY - 6 * s), theme.color(theme.border));
+    theme.label(ImVec2(toolbar.x, deviceY + 9 * s), "Device", 48 * s, theme.muted, 13);
+    auto slotLabel = [&](int slot) -> std::string {
+        if (!deviceSession(slot).connected) return "No device";
+        auto it = m_deviceDisplayNames.find(deviceSession(slot).serial);
+        return it != m_deviceDisplayNames.end() ? it->second : deviceSession(slot).serial;
+    };
+    ImGui::SetCursorScreenPos(ImVec2(toolbar.x + 56 * s, deviceY));
+    ImGui::SetNextItemWidth(240 * s);
     if (ImGui::BeginCombo("##BackupDevice", slotLabel(m_backupManagerSlot).c_str())) {
-        for (int slot = 0; slot < 2; slot++) {
-            bool enabled = m_slotConnected[slot];
-            ImGui::BeginDisabled(!enabled);
+        for (int slot = 0; slot < deviceSessionCount(); ++slot) {
+            ImGui::BeginDisabled(!deviceSession(slot).connected);
             bool selected = m_backupManagerSlot == slot;
             std::string label = slotLabel(slot) + "##backupSlot" + std::to_string(slot);
             if (ImGui::Selectable(label.c_str(), selected)) {
                 m_backupManagerSlot = slot;
                 m_backupManagerApps.clear();
+                m_backupManagerAppPage = 0;
                 m_backupManagerAppSelectionAnchor = -1;
                 m_backupManagerNeedsAppRefresh = true;
                 m_backupRootAccess = BackupRootAccess::Unknown;
@@ -7328,47 +7187,37 @@ void App::renderBackupManagerWindow() {
         }
         ImGui::EndCombo();
     }
-    ImGui::SameLine();
-    if (modernSmallButton("Refresh")) {
+    if (theme.button("##RefreshBackups", "Refresh", ui::Icon::Refresh,
+        ImVec2(toolbar.x + 310 * s, deviceY), ImVec2(104 * s, 32 * s), theme.text)) {
         m_backupManagerNeedsAppRefresh = true;
         m_backupManagerNeedsBackupRefresh = true;
     }
-    bool hasDevice = m_slotConnected[m_backupManagerSlot & 1];
+    bool hasDevice = deviceSession(m_backupManagerSlot).connected;
     bool backupRootEnabled = m_backupRootAccess == BackupRootAccess::Available;
-    ImGui::SameLine();
-    if (m_backupRootAccess == BackupRootAccess::Checking)
-        ImGui::TextColored(ImVec4(0.35f, 0.70f, 1.0f, 1), "Checking root access...");
-    else if (backupRootEnabled)
-        ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1), "Root access available, full backup enabled");
-    else if (m_backupRootAccess == BackupRootAccess::Unavailable)
-        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1), "Standard backup, private app data unavailable");
-    else
-        ImGui::TextDisabled("Select a connected device to check backup capabilities");
-
-    ImGui::Separator();
-    ImGui::Checkbox("APK", &m_backupIncludeApk);
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!backupRootEnabled);
-    ImGui::Checkbox("App data", &m_backupIncludeData);
-    ImGui::SameLine();
-    ImGui::Checkbox("Device protected", &m_backupIncludeDeData);
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::Checkbox("External", &m_backupIncludeExternalData);
-    ImGui::SameLine();
-    ImGui::Checkbox("OBB", &m_backupIncludeObb);
-    ImGui::SameLine();
-    ImGui::Checkbox("Media", &m_backupIncludeMedia);
-    ImGui::Checkbox("Skip cache folders", &m_backupExcludeCache);
-    ImGui::SameLine();
-    if (ImGui::Checkbox("Show system apps", &m_backupShowSystemApps) && !m_backupShowSystemApps) {
-        for (auto& row : m_backupManagerApps)
-            if (row.app.isSystem) row.selected = false;
+    const char* capability = !hasDevice ? "Connect a device to check backup capabilities" :
+        m_backupRootAccess == BackupRootAccess::Checking ? "Checking root access..." :
+        backupRootEnabled ? "Root access available, full backup enabled" :
+        m_backupRootAccess == BackupRootAccess::Unavailable ? "Standard backup, private app data unavailable" : "Checking backup capabilities...";
+    theme.status(ImVec2(toolbar.x + 438 * s, deviceY + 8 * s), capability,
+        backupRootEnabled, width - 438 * s);
+    float optionsY = deviceY + 45 * s;
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(toolbar.x, optionsY - 6 * s), ImVec2(toolbar.x + width, optionsY - 6 * s), theme.color(theme.border));
+    optionX = 0;
+    for (auto& option : options) {
+        float w = ImGui::CalcTextSize(option.label).x + ImGui::GetFrameHeight() + 26 * s;
+        if (optionX > 0 && optionX + w > width) { optionsY += ImGui::GetFrameHeight() + 8 * s; optionX = 0; }
+        ImGui::SetCursorScreenPos(ImVec2(toolbar.x + optionX, optionsY));
+        ImGui::BeginDisabled(option.rootOnly && !backupRootEnabled);
+        if (ImGui::Checkbox(option.label, option.value) && option.value == &m_backupShowSystemApps) {
+            m_backupManagerAppPage = 0;
+            if (!m_backupShowSystemApps)
+                for (auto& row : m_backupManagerApps) if (row.app.isSystem) row.selected = false;
+        }
+        ImGui::EndDisabled();
+        if (option.rootOnly && !backupRootEnabled) ui::tooltip("Root access is required for private app data.");
+        optionX += w;
     }
-    ImGui::SameLine();
-    ImGui::Checkbox("Restore permissions", &m_backupRestorePermissions);
-    ImGui::SameLine();
-    ImGui::Checkbox("Allow downgrade", &m_backupAllowDowngrade);
+    ImGui::EndChild();
 
     if (m_showBackupRootChoice) {
         if (!ImGui::IsPopupOpen("Backup capabilities")) {
@@ -7406,7 +7255,6 @@ void App::renderBackupManagerWindow() {
         ImGui::EndPopup();
     }
 
-    ImGui::Separator();
     bool anyApp = false;
     for (const auto& row : m_backupManagerApps)
         if (row.selected && (m_backupShowSystemApps || !row.app.isSystem)) { anyApp = true; break; }
@@ -7419,11 +7267,11 @@ void App::renderBackupManagerWindow() {
     bool showBackupProgress = m_backupProgressActive || (!m_backupProgressStageLabel.empty() && m_asyncBusy.load());
     float bottomBarH = showBackupProgress
         ? (ImGui::GetFrameHeightWithSpacing() * (!m_backupAppProgress.empty() ? 6.0f : 4.0f) + 18.0f)
-        : (ImGui::GetFrameHeightWithSpacing() + 12.0f);
+        : (52 * s);
     float availableY = ImGui::GetContentRegionAvail().y;
     float bodyH = availableY - bottomBarH - ImGui::GetStyle().ItemSpacing.y;
     if (bodyH < 80.0f) bodyH = 80.0f;
-    float columnW = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
+    float columnW = (ImGui::GetContentRegionAvail().x - 12 * s) * 0.54f;
 
     std::string filter(m_backupManagerSearch);
     std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
@@ -7503,117 +7351,214 @@ void App::renderBackupManagerWindow() {
         });
     };
 
+    auto link = [&](const char* title) {
+        ImGui::PushStyleColor(ImGuiCol_Text, theme.blue);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme.raised);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, theme.raised);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * s, 4 * s));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
+        bool clicked = ImGui::Button(title);
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(4);
+        return clicked;
+    };
+    auto paneHeading = [&](const std::string& title, const char* id, const char* hint, char* search, size_t capacity) {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float w = ImGui::GetContentRegionAvail().x;
+        bool stacked = w < 470 * s;
+        float titleWidth = std::min(230 * s, w * .46f);
+        theme.label(ImVec2(p.x + 2 * s, p.y + 8.5f * s), title, stacked ? w : titleWidth, theme.text, 19, true);
+        bool changed = theme.search(id, hint, search, capacity,
+            ImVec2(stacked ? p.x : p.x + titleWidth, p.y + (stacked ? 36 * s : 0)), stacked ? w : w - titleWidth);
+        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + (stacked ? 80 : 44) * s));
+        return changed;
+    };
+    auto cellText = [&](const std::string& value, ImVec4 ink) {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float w = ImGui::GetContentRegionAvail().x;
+        theme.label(ImVec2(p.x, p.y + 3 * s), value, w, ink, 13);
+        ImGui::Dummy(ImVec2(std::max(1.0f, w), 22 * s));
+        if (ImGui::IsItemHovered() && ImGui::CalcTextSize(value.c_str()).x > w) ImGui::SetTooltip("%s", value.c_str());
+    };
+    auto selectionCheckbox = [&](const char* id, bool& selected) {
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3 * s);
+        bool changed = ImGui::Checkbox(id, &selected);
+        ImGui::PopStyleVar();
+        return changed;
+    };
+    auto restoreTarget = [&](const char* id, const char* title) {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        ImVec2 size(ImGui::GetContentRegionAvail().x, 46 * s);
+        bool pressed = theme.button(id, title, ui::Icon::Up, p, size, theme.blue);
+        auto* draw = ImGui::GetWindowDrawList();
+        for (float x = p.x + 6 * s; x < p.x + size.x - 6 * s; x += 7 * s) {
+            float end = std::min(x + 3 * s, p.x + size.x - 6 * s);
+            draw->AddLine(ImVec2(x, p.y), ImVec2(end, p.y), theme.color(theme.blue));
+            draw->AddLine(ImVec2(x, p.y + size.y), ImVec2(end, p.y + size.y), theme.color(theme.blue));
+        }
+        for (float y = p.y + 6 * s; y < p.y + size.y - 6 * s; y += 7 * s) {
+            float end = std::min(y + 3 * s, p.y + size.y - 6 * s);
+            draw->AddLine(ImVec2(p.x, y), ImVec2(p.x, end), theme.color(theme.blue));
+            draw->AddLine(ImVec2(p.x + size.x, y), ImVec2(p.x + size.x, end), theme.color(theme.blue));
+        }
+        return pressed;
+    };
+    const ImGuiTableFlags tableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+        ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY |
+        ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoBordersInBody;
+    float tableH = 0;
     ImGui::BeginChild("##BackupAppsPane", ImVec2(columnW, bodyH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
-            ImGui::TextColored(m_theme.gradientPrimary, "Installed Apps");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::InputText("##BackupAppSearch", m_backupManagerSearch, sizeof(m_backupManagerSearch));
-        if (modernSmallButton("Select Visible")) setBackupManagerAppSelection(true, true);
-        ImGui::SameLine();
-        if (modernSmallButton("Select All")) setBackupManagerAppSelection(true, false);
-        ImGui::SameLine();
-        if (modernSmallButton("Clear")) setBackupManagerAppSelection(false, false);
-        ImGui::SameLine();
-        if (modernSmallButton("Invert Visible")) invertBackupManagerAppSelection(true);
-        if (!hasDevice) ImGui::TextDisabled("Connect a device to list installed apps.");
-        float tableH = ImGui::GetContentRegionAvail().y;
-        if (tableH < 80.0f) tableH = 80.0f;
-        std::vector<int> visibleAppIndices;
-        for (int i = 0; i < (int)m_backupManagerApps.size(); ++i) {
-            const auto& row = m_backupManagerApps[i];
-            if (row.app.isSystem && !m_backupShowSystemApps) continue;
-            std::string hay = row.app.appName + " " + row.app.packageName + " " + row.app.apkPath;
-            std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
-            if (filter.empty() || hay.find(filter) != std::string::npos) visibleAppIndices.push_back(i);
-        }
-        bool appsLoading = m_backupManagerNeedsAppRefresh;
-        if (appsLoading && m_backupManagerApps.empty()) {
-            ImGui::BeginChild("##BackupAppsLoading", ImVec2(0, tableH), 0, ImGuiWindowFlags_NoScrollbar);
-            ImVec2 panelPos = ImGui::GetWindowPos();
-            ImVec2 panelSize = ImGui::GetWindowSize();
-            float cardWidth = std::min(420.0f, std::max(180.0f, panelSize.x - 24.0f));
-            float cardHeight = 122.0f;
-            ImGui::SetCursorPos(ImVec2(std::max(12.0f, (panelSize.x - cardWidth) * 0.5f),
-                                       std::max(12.0f, (panelSize.y - cardHeight) * 0.38f)));
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.035f, 0.065f, 0.105f, 0.96f));
-            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.16f, 0.35f, 0.58f, 0.85f));
-            ImGui::BeginChild("##BackupAppsLoadingCard", ImVec2(cardWidth, cardHeight),
-                              ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            ImVec2 cardPos = ImGui::GetWindowPos();
-            ImVec2 spinnerCenter(cardPos.x + 28.0f, cardPos.y + 52.0f);
-            ImDrawList* drawList = ImGui::GetWindowDrawList();
-            float phase = (float)ImGui::GetTime() * 8.0f;
-            for (int dotIndex = 0; dotIndex < 12; ++dotIndex) {
-                float angle = ((float)dotIndex / 12.0f) * 6.2831853f - 1.5707963f;
-                float intensity = 0.20f + 0.80f * std::max(0.0f, std::cos(angle - phase));
-                ImVec2 dot(spinnerCenter.x + std::cos(angle) * 12.0f,
-                           spinnerCenter.y + std::sin(angle) * 12.0f);
-                drawList->AddCircleFilled(dot, 2.4f, IM_COL32(74, 174, 255, (int)(255.0f * intensity)));
+    int appCount = 0;
+    for (const auto& row : m_backupManagerApps) if (m_backupShowSystemApps || !row.app.isSystem) ++appCount;
+    if (paneHeading("Installed Apps (" + std::to_string(appCount) + ")", "##BackupAppSearch", "Search apps...",
+        m_backupManagerSearch, sizeof(m_backupManagerSearch))) {
+        m_backupManagerAppPage = 0;
+        filter = m_backupManagerSearch;
+        std::transform(filter.begin(), filter.end(), filter.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    }
+    std::vector<int> visibleAppIndices;
+    for (int i = 0; i < (int)m_backupManagerApps.size(); ++i) {
+        const auto& row = m_backupManagerApps[i];
+        if (row.app.isSystem && !m_backupShowSystemApps) continue;
+        std::string hay = row.app.appName + " " + row.app.packageName + " " + row.app.apkPath;
+        std::transform(hay.begin(), hay.end(), hay.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        if (filter.empty() || hay.find(filter) != std::string::npos) visibleAppIndices.push_back(i);
+    }
+    const int filteredCount = (int)visibleAppIndices.size();
+    const int pageSize = m_backupManagerAppsPerPage > 0 ? m_backupManagerAppsPerPage : std::max(1, filteredCount);
+    const int pageCount = std::max(1, (filteredCount + pageSize - 1) / pageSize);
+    m_backupManagerAppPage = std::clamp(m_backupManagerAppPage, 0, pageCount - 1);
+    int firstApp = m_backupManagerAppPage * pageSize;
+    int lastApp = std::min(filteredCount, firstApp + pageSize);
+    std::vector<int> pageIndices(visibleAppIndices.begin() + firstApp, visibleAppIndices.begin() + lastApp);
+    if (link("Select Visible")) for (int i : pageIndices) m_backupManagerApps[i].selected = true;
+    ImGui::SameLine();
+    if (link("Select All")) setBackupManagerAppSelection(true, false);
+    ImGui::SameLine();
+    if (link("Clear")) setBackupManagerAppSelection(false, false);
+    ImGui::SameLine();
+    if (link("Invert Visible")) for (int i : pageIndices) m_backupManagerApps[i].selected = !m_backupManagerApps[i].selected;
+    tableH = std::max(60 * s, ImGui::GetContentRegionAvail().y - 44 * s);
+    ImVec2 tableOrigin = ImGui::GetCursorScreenPos();
+    if (ImGui::BeginTable("##BackupAppsTable", 5, tableFlags, ImVec2(0, tableH))) {
+        ImGui::TableSetupColumn("##Selected", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize, 24 * s);
+        ImGui::TableSetupColumn("App Name", ImGuiTableColumnFlags_WidthStretch, .30f);
+        ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch, .40f);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 74 * s);
+        ImGui::TableSetupColumn("APK Path", ImGuiTableColumnFlags_WidthStretch, .30f);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+        ImGui::TableSetColumnIndex(0);
+        bool allSelected = !pageIndices.empty() && std::all_of(pageIndices.begin(), pageIndices.end(), [&](int i) { return m_backupManagerApps[i].selected; });
+        ImGui::BeginDisabled(pageIndices.empty());
+        if (selectionCheckbox("##AllBackupApps", allSelected)) for (int i : pageIndices) m_backupManagerApps[i].selected = allSelected;
+        ImGui::EndDisabled();
+        for (int i : pageIndices) {
+            auto& row = m_backupManagerApps[i];
+            ImGui::PushID(i);
+            ImGui::TableNextRow(0, 32 * s);
+            ImGui::TableSetColumnIndex(1);
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float nameW = ImGui::GetContentRegionAvail().x;
+            if (ImGui::Selectable("##BackupAppRow", row.selected,
+                ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap, ImVec2(0, 22 * s)) &&
+                ImGui::GetIO().MousePos.x >= p.x)
+                applyRowSelection(m_backupManagerApps, visibleAppIndices, i, m_backupManagerAppSelectionAnchor);
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && !row.selected) {
+                for (auto& candidate : m_backupManagerApps) candidate.selected = false;
+                row.selected = true;
+                m_backupManagerAppSelectionAnchor = i;
             }
-            const char* loadingTitle = "Loading installed apps";
-            const char* loadingStatus = "Reading apps from the selected device";
-            const char* loadingDetail = "This can take longer on devices with many installed apps.";
-            ImGui::SetCursorPos(ImVec2(54.0f, 16.0f));
-            ImGui::TextColored(ImVec4(0.36f, 0.72f, 1.0f, 1.0f), "%s", loadingTitle);
-            ImGui::SetCursorPos(ImVec2(54.0f, 43.0f));
-            ImGui::TextDisabled("%s", loadingStatus);
-            ImGui::SetCursorPos(ImVec2(54.0f, 69.0f));
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-            ImGui::PushTextWrapPos(cardWidth - 12.0f);
-            ImGui::TextWrapped("%s", loadingDetail);
-            ImGui::PopTextWrapPos();
-            ImGui::PopStyleColor();
-            ImGui::EndChild();
-            ImGui::PopStyleColor(2);
-            ImGui::EndChild();
-        } else if (ImGui::BeginTable("##BackupAppsTable", 4,
-                ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_Borders |
-                ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
-                ImVec2(0, tableH))) {
-            ImGui::TableSetupColumn("App Name", ImGuiTableColumnFlags_WidthStretch, 0.30f);
-            ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch, 0.36f);
-            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-            ImGui::TableSetupColumn("APK Path", ImGuiTableColumnFlags_WidthStretch, 0.34f);
-            ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableHeadersRow();
-            for (int i : visibleAppIndices) {
-                auto& row = m_backupManagerApps[i];
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                std::string displayName = row.app.appName.empty() ? row.app.packageName : row.app.appName;
-                std::string id = displayName + "##bmapp" + std::to_string(i);
-                if (ImGui::Selectable(id.c_str(), row.selected, ImGuiSelectableFlags_SpanAllColumns))
-                    applyRowSelection(m_backupManagerApps, visibleAppIndices, i, m_backupManagerAppSelectionAnchor);
-                if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && !row.selected) {
-                    for (auto& candidate : m_backupManagerApps) candidate.selected = false;
-                    row.selected = true;
-                    m_backupManagerAppSelectionAnchor = i;
-                }
-                if (ImGui::BeginPopupContextItem(("##BackupAppsContext" + std::to_string(i)).c_str())) {
-                    int selectedCount = 0;
-                    for (const auto& candidate : m_backupManagerApps)
-                        if (candidate.selected) selectedCount++;
-                    ImGui::TextDisabled("%d app%s selected", selectedCount, selectedCount == 1 ? "" : "s");
-                    ImGui::Separator();
-                    ImGui::BeginDisabled(!hasDevice || m_asyncBusy.load());
-                    if (ImGui::MenuItem("Back Up Selected Apps")) startBackupManagerBackup();
-                    ImGui::EndDisabled();
-                    ImGui::EndPopup();
-                }
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted(row.app.packageName.c_str());
-                ImGui::TableNextColumn();
-                ImGui::TextDisabled("%s", row.app.isSystem ? "System" : "User");
-                ImGui::TableNextColumn();
-                ImGui::TextDisabled("%s", row.app.apkPath.c_str());
+            if (ImGui::BeginPopupContextItem("##BackupAppContext")) {
+                ImGui::BeginDisabled(!hasDevice || m_asyncBusy.load());
+                if (ImGui::MenuItem("Back Up Selected Apps")) startBackupManagerBackup();
+                ImGui::EndDisabled();
+                ImGui::EndPopup();
             }
-            ImGui::EndTable();
+            std::string name = row.app.appName.empty() ? row.app.packageName : row.app.appName;
+            theme.box(p, ImVec2(22 * s, 22 * s), theme.raised, theme.surface, theme.border, 5);
+            ui::icon(ui::Icon::Apps, ImVec2(p.x + 4 * s, p.y + 4 * s), 14 * s, theme.color(theme.blue));
+            theme.label(ImVec2(p.x + 31 * s, p.y + 3 * s), name, nameW - 31 * s, theme.text, 13);
+            if (ImGui::IsItemHovered() && ImGui::CalcTextSize(name.c_str()).x > nameW - 31 * s) ImGui::SetTooltip("%s", name.c_str());
+            ImGui::TableSetColumnIndex(2);
+            cellText(row.app.packageName, theme.muted);
+            ImGui::TableSetColumnIndex(3);
+            p = ImGui::GetCursorScreenPos();
+            ImVec4 ink = row.app.isSystem ? theme.gold : theme.blue;
+            ImVec4 fill = ink; fill.w = .12f;
+            ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + 62 * s, p.y + 22 * s), theme.color(fill), 11 * s);
+            const char* typeLabel = row.app.isSystem ? "System" : "User";
+            float typeWidth = ImGui::GetFont()->CalcTextSizeA(12 * s, FLT_MAX, 0, typeLabel).x;
+            theme.label(ImVec2(p.x + (62 * s - typeWidth) * .5f, p.y + 5 * s), typeLabel, typeWidth + s, ink, 12);
+            ImGui::Dummy(ImVec2(62 * s, 22 * s));
+            ImGui::TableSetColumnIndex(4);
+            cellText(row.app.apkPath, theme.muted);
+            ImGui::TableSetColumnIndex(0);
+            if (selectionCheckbox("##SelectApp", row.selected)) m_backupManagerAppSelectionAnchor = i;
+            ImGui::PopID();
         }
+        ImGui::EndTable();
+    }
+    if (visibleAppIndices.empty()) {
+        ImVec2 p(tableOrigin.x + 24 * s, tableOrigin.y + 66 * s);
+        bool loading = hasDevice && (m_backupManagerNeedsAppRefresh || m_asyncBusy.load()) && m_backupManagerApps.empty();
+        theme.label(p, !hasDevice ? "Connect a device to see its apps" : loading ? "Loading installed apps..." : "No apps match your search",
+            columnW - 70 * s, theme.text, 17, true);
+        theme.label(ImVec2(p.x, p.y + 31 * s), !hasDevice ? "Choose a phone from Connections to get started." : loading ?
+            "Reading the app list from your phone." : "Try another app name or package.", columnW - 70 * s, theme.muted, 13);
+    }
+    ImVec2 pagination = ImGui::GetCursorScreenPos();
+    float paneWidth = ImGui::GetContentRegionAvail().x;
+    ImGui::BeginDisabled(m_backupManagerAppPage == 0);
+    if (theme.button("##PreviousAppsPage", "", ui::Icon::Back, pagination, ImVec2(28 * s, 30 * s), theme.muted)) --m_backupManagerAppPage;
+    ImGui::EndDisabled();
+    float pageX = pagination.x + 34 * s;
+    int startPage = std::max(0, std::min(m_backupManagerAppPage - 2, pageCount - 5));
+    for (int page = startPage; page < std::min(pageCount, startPage + 5); ++page) {
+        ImGui::PushID(page);
+        if (theme.button("##AppsPage", std::to_string(page + 1).c_str(), ui::Icon::None,
+            ImVec2(pageX, pagination.y), ImVec2(28 * s, 30 * s), page == m_backupManagerAppPage ? theme.blue : theme.muted,
+            page == m_backupManagerAppPage ? 4 : 0)) m_backupManagerAppPage = page;
+        ImGui::PopID();
+        pageX += 33 * s;
+    }
+    ImGui::BeginDisabled(m_backupManagerAppPage + 1 >= pageCount);
+    if (theme.button("##NextAppsPage", "", ui::Icon::Forward, ImVec2(pageX, pagination.y), ImVec2(28 * s, 30 * s), theme.muted)) ++m_backupManagerAppPage;
+    ImGui::EndDisabled();
+    float pageSizeX = pagination.x + paneWidth - 104 * s;
+    std::string pageSummary = std::to_string(filteredCount == 0 ? 0 : firstApp + 1) + " to " + std::to_string(lastApp) + " of " + std::to_string(filteredCount) + " apps";
+    float summaryX = std::max(pageX + 42 * s, pageSizeX - 170 * s);
+    theme.label(ImVec2(summaryX, pagination.y + 8 * s), pageSummary, pageSizeX - summaryX - 10 * s, theme.muted, 12);
+    ImGui::SetCursorScreenPos(ImVec2(pageSizeX, pagination.y));
+    ImGui::SetNextItemWidth(104 * s);
+    std::string pageSizeLabel = m_backupManagerAppsPerPage == 0 ? "All apps" : std::to_string(m_backupManagerAppsPerPage) + " / page";
+    if (ImGui::BeginCombo("##BackupPageSize", pageSizeLabel.c_str())) {
+        for (int count : {15, 30, 50, 0}) {
+            std::string label = count ? std::to_string(count) + " / page" : "All apps";
+            if (ImGui::Selectable(label.c_str(), count == m_backupManagerAppsPerPage)) {
+                m_backupManagerAppsPerPage = count;
+                m_backupManagerAppPage = 0;
+            }
+        }
+        ImGui::EndCombo();
+    }
     ImGui::EndChild();
-
-    ImGui::SameLine(0, 12.0f);
+    ImGui::SameLine(0, 12 * s);
 
     ImGui::BeginChild("##BackupRestorePane", ImVec2(0, bodyH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+        if (m_backupManagerJobOpen) {
+            paneHeading("Backup Job", "##BackupJobAppSearch", "Search app name or package...",
+                m_backupManagerJobAppSearch, sizeof(m_backupManagerJobAppSearch));
+            jobAppFilter = m_backupManagerJobAppSearch;
+            std::transform(jobAppFilter.begin(), jobAppFilter.end(), jobAppFilter.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        } else {
+            paneHeading("Saved Backups", "##BackupSearch", "Search jobs, apps, or packages...",
+                m_backupManagerBackupSearch, sizeof(m_backupManagerBackupSearch));
+            backupFilter = m_backupManagerBackupSearch;
+            std::transform(backupFilter.begin(), backupFilter.end(), backupFilter.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        }
         if (m_backupManagerJobOpen) {
             std::vector<int> visibleJobAppIndices;
             for (int i = 0; i < (int)m_backupManagerJobApps.size(); ++i) {
@@ -7624,36 +7569,28 @@ void App::renderBackupManagerWindow() {
                 if (jobAppFilter.empty() || hay.find(jobAppFilter) != std::string::npos)
                     visibleJobAppIndices.push_back(i);
             }
-            ImGui::TextColored(m_theme.gradientSecondary, "Backup Job");
+            if (link("Back to Jobs")) closeBackupManagerJob();
             ImGui::SameLine();
-            ImGui::TextDisabled("%s", m_backupManagerOpenJobTitle.c_str());
-            ImGui::SameLine();
-            if (modernSmallButton("Back to Jobs")) closeBackupManagerJob();
-            ImGui::SameLine();
-            if (modernSmallButton("Select Visible")) {
+            if (link("Select Visible")) {
                 for (int index : visibleJobAppIndices) m_backupManagerJobApps[index].selected = true;
             }
             ImGui::SameLine();
-            if (modernSmallButton("Clear")) {
+            if (link("Clear")) {
                 for (auto& row : m_backupManagerJobApps) row.selected = false;
             }
             bool anyJobApp = false;
             for (const auto& row : m_backupManagerJobApps) if (row.selected) { anyJobApp = true; break; }
             ImGui::SameLine();
             ImGui::BeginDisabled(!hasDevice || m_asyncBusy.load() || m_backupManagerJobApps.empty());
-            if (modernSmallButton("Restore Whole Job")) {
+            if (link("Restore Whole Job")) {
                 std::vector<std::string> paths;
                 for (const auto& row : m_backupManagerJobApps) paths.push_back(row.record.backupPath);
                 startBackupManagerRestorePaths(std::move(paths));
             }
             ImGui::EndDisabled();
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            ImGui::InputTextWithHint("##BackupJobAppSearch", "Search app name or package...",
-                m_backupManagerJobAppSearch, sizeof(m_backupManagerJobAppSearch));
-
             bool restoreJobSelection = false;
             ImGui::BeginDisabled(!hasDevice || m_asyncBusy.load() || !anyJobApp);
-            restoreJobSelection = modernButton("Restore Selected Apps  |  Drop Selection Here", ImVec2(-1.0f, 0.0f));
+            restoreJobSelection = restoreTarget("##RestoreJobTarget", "Restore Selected Apps  |  Drop Selection Here");
             ImGui::EndDisabled();
             if (ImGui::BeginDragDropTarget()) {
                 if (ImGui::AcceptDragDropPayload("BM_JOB_APP_SELECTION") && hasDevice && !m_asyncBusy.load())
@@ -7669,17 +7606,21 @@ void App::renderBackupManagerWindow() {
 
             tableH = ImGui::GetContentRegionAvail().y;
             if (tableH < 80.0f) tableH = 80.0f;
-            if (ImGui::BeginTable("##BackupJobAppsTable", 5,
-                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_Borders |
-                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+            if (ImGui::BeginTable("##BackupJobAppsTable", 6, tableFlags,
                     ImVec2(0, tableH))) {
+                ImGui::TableSetupColumn("##Selected", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize, 24 * s);
                 ImGui::TableSetupColumn("App Name", ImGuiTableColumnFlags_WidthStretch, 0.25f);
                 ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch, 0.29f);
-                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 145 * s);
                 ImGui::TableSetupColumn("Contents", ImGuiTableColumnFlags_WidthStretch, 0.32f);
-                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 68 * s);
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
+                ImGui::TableSetColumnIndex(0);
+                bool allSelected = !visibleJobAppIndices.empty() && std::all_of(visibleJobAppIndices.begin(), visibleJobAppIndices.end(), [&](int i) { return m_backupManagerJobApps[i].selected; });
+                ImGui::BeginDisabled(visibleJobAppIndices.empty());
+                if (selectionCheckbox("##AllJobApps", allSelected)) for (int i : visibleJobAppIndices) m_backupManagerJobApps[i].selected = allSelected;
+                ImGui::EndDisabled();
                 for (int i : visibleJobAppIndices) {
                     auto& row = m_backupManagerJobApps[i];
                     std::string contents;
@@ -7689,13 +7630,17 @@ void App::renderBackupManagerWindow() {
                     if (row.record.hasExternalData) contents += "Ext ";
                     if (row.record.hasObb) contents += "OBB ";
                     if (row.record.hasMedia) contents += "Media ";
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
+                    ImGui::PushID(i);
+                    ImGui::TableNextRow(0, 32 * s);
+                    ImGui::TableSetColumnIndex(1);
+                    ImVec2 rowPos = ImGui::GetCursorScreenPos();
+                    float nameWidth = ImGui::GetContentRegionAvail().x;
                     std::string displayName = appDisplayName(row.record);
                     std::string id = displayName + "##bmjobapp" + std::to_string(i);
-                    if (ImGui::Selectable(id.c_str(), row.selected, ImGuiSelectableFlags_SpanAllColumns))
+                    if (ImGui::Selectable(("##" + id).c_str(), row.selected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap, ImVec2(0, 22 * s)) && ImGui::GetIO().MousePos.x >= rowPos.x)
                         applyRowSelection(m_backupManagerJobApps, visibleJobAppIndices, i,
                             m_backupManagerJobAppSelectionAnchor);
+                    theme.label(ImVec2(rowPos.x, rowPos.y + 3 * s), displayName, nameWidth, theme.text, 13);
                     if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && !row.selected) {
                         for (auto& candidate : m_backupManagerJobApps) candidate.selected = false;
                         row.selected = true;
@@ -7731,14 +7676,17 @@ void App::renderBackupManagerWindow() {
                         ImGui::EndDragDropSource();
                     }
                     ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(row.record.packageName.c_str());
+                    cellText(row.record.packageName, theme.muted);
                     ImGui::TableNextColumn();
                     std::string createdText = formatBackupCreated(row.record.created);
-                    ImGui::TextDisabled("%s", createdText.c_str());
+                    cellText(createdText, theme.muted);
                     ImGui::TableNextColumn();
-                    ImGui::TextDisabled("%s", contents.c_str());
+                    cellText(contents, theme.muted);
                     ImGui::TableNextColumn();
-                    ImGui::TextDisabled("%s", formatSize(row.record.sizeBytes).c_str());
+                    cellText(formatSize(row.record.sizeBytes), theme.muted);
+                    ImGui::TableSetColumnIndex(0);
+                    if (selectionCheckbox("##SelectJobApps", row.selected)) m_backupManagerJobAppSelectionAnchor = i;
+                    ImGui::PopID();
                 }
                 ImGui::EndTable();
             }
@@ -7752,26 +7700,21 @@ void App::renderBackupManagerWindow() {
                 if (backupFilter.empty() || hay.find(backupFilter) != std::string::npos)
                     visibleBackupIndices.push_back(i);
             }
-            ImGui::TextColored(m_theme.gradientSecondary, "Saved Backups");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            ImGui::InputTextWithHint("##BackupSearch", "Search jobs, app names, or packages...",
-                m_backupManagerBackupSearch, sizeof(m_backupManagerBackupSearch));
-            if (modernSmallButton("Open Job")) {
+            if (link("Open Job")) {
                 for (const auto& row : m_backupManagerBackups) {
                     if (!row.selected) continue;
                     openBackupManagerJob(row);
                     break;
                 }
             }
+            ImGui::SameLine();
             ImGui::BeginDisabled(selectedJobCount == 0 || m_asyncBusy.load());
-            if (modernSmallButton("Delete Selected Jobs")) deleteSelectedBackupJobs();
+            if (link("Delete Selected Jobs")) deleteSelectedBackupJobs();
             ImGui::EndDisabled();
 
             bool restoreBackupSelection = false;
             ImGui::BeginDisabled(!hasDevice || !anyBackup || m_asyncBusy.load());
-            restoreBackupSelection = modernButton(
-                "Restore Selected Backups  |  Drop Selection Here", ImVec2(-1.0f, 0.0f));
+            restoreBackupSelection = restoreTarget("##RestoreBackupsTarget", "Restore Selected Backups  |  Drop Selection Here");
             ImGui::EndDisabled();
             if (ImGui::BeginDragDropTarget()) {
                 if (ImGui::AcceptDragDropPayload("BM_BACKUP_SELECTION") && hasDevice && !m_asyncBusy.load())
@@ -7782,25 +7725,33 @@ void App::renderBackupManagerWindow() {
 
             tableH = ImGui::GetContentRegionAvail().y;
             if (tableH < 80.0f) tableH = 80.0f;
-            if (ImGui::BeginTable("##BackupsTable", 4,
-                    ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_Borders |
-                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+            if (ImGui::BeginTable("##BackupsTable", 5, tableFlags,
                     ImVec2(0, tableH))) {
+                ImGui::TableSetupColumn("##Selected", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize, 24 * s);
                 ImGui::TableSetupColumn("Backup", ImGuiTableColumnFlags_WidthStretch, 0.42f);
-                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                ImGui::TableSetupColumn("Created", ImGuiTableColumnFlags_WidthFixed, 145 * s);
                 ImGui::TableSetupColumn("Contents", ImGuiTableColumnFlags_WidthStretch, 0.35f);
-                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 68 * s);
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
+                ImGui::TableSetColumnIndex(0);
+                bool allSelected = !visibleBackupIndices.empty() && std::all_of(visibleBackupIndices.begin(), visibleBackupIndices.end(), [&](int i) { return m_backupManagerBackups[i].selected; });
+                ImGui::BeginDisabled(visibleBackupIndices.empty());
+                if (selectionCheckbox("##AllSavedBackups", allSelected)) for (int i : visibleBackupIndices) m_backupManagerBackups[i].selected = allSelected;
+                ImGui::EndDisabled();
                 for (int i : visibleBackupIndices) {
                     auto& row = m_backupManagerBackups[i];
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
+                    ImGui::PushID(i);
+                    ImGui::TableNextRow(0, 32 * s);
+                    ImGui::TableSetColumnIndex(1);
+                    ImVec2 rowPos = ImGui::GetCursorScreenPos();
+                    float nameWidth = ImGui::GetContentRegionAvail().x;
                     std::string displayName = row.isJob ? row.record.packageName : appDisplayName(row.record);
                     std::string id = displayName + "##bmbak" + std::to_string(i);
-                    if (ImGui::Selectable(id.c_str(), row.selected, ImGuiSelectableFlags_SpanAllColumns))
+                    if (ImGui::Selectable(("##" + id).c_str(), row.selected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap, ImVec2(0, 22 * s)) && ImGui::GetIO().MousePos.x >= rowPos.x)
                         applyRowSelection(m_backupManagerBackups, visibleBackupIndices, i,
                             m_backupManagerBackupSelectionAnchor);
+                    theme.label(ImVec2(rowPos.x, rowPos.y + 3 * s), displayName, nameWidth, theme.text, 13);
                     if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && !row.selected) {
                         for (auto& candidate : m_backupManagerBackups) candidate.selected = false;
                         row.selected = true;
@@ -7840,28 +7791,42 @@ void App::renderBackupManagerWindow() {
                     }
                     ImGui::TableNextColumn();
                     std::string createdText = formatBackupCreated(row.record.created);
-                    ImGui::TextDisabled("%s", createdText.c_str());
+                    cellText(createdText, theme.muted);
                     ImGui::TableNextColumn();
-                    ImGui::TextDisabled("%s", row.contentsSummary.c_str());
+                    cellText(row.contentsSummary, theme.muted);
                     ImGui::TableNextColumn();
-                    ImGui::TextDisabled("%s", formatSize(row.record.sizeBytes).c_str());
+                    cellText(formatSize(row.record.sizeBytes), theme.muted);
+                    ImGui::TableSetColumnIndex(0);
+                    if (selectionCheckbox("##SelectSavedBackups", row.selected)) m_backupManagerBackupSelectionAnchor = i;
+                    ImGui::PopID();
                 }
                 ImGui::EndTable();
             }
         }
     ImGui::EndChild();
 
-    float backupButtonW = ImGui::CalcTextSize("Back Up Selected Apps").x + ImGui::GetStyle().FramePadding.x * 2.0f + 28.0f;
-    float restoreButtonW = ImGui::CalcTextSize("Restore Selected Backups").x + ImGui::GetStyle().FramePadding.x * 2.0f + 28.0f;
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_ChildBg));
-    ImGui::BeginChild("##BackupManagerBottomBar", ImVec2(0, bottomBarH), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
-    ImGui::SetCursorPosX(8.0f);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, theme.background);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 6 * s));
+    ImGui::BeginChild("##BackupManagerBottomBar", ImVec2(0, bottomBarH), 0, ImGuiWindowFlags_NoScrollbar);
+    ImVec2 actions = ImGui::GetCursorScreenPos();
     ImGui::BeginDisabled(!hasDevice || !anyApp || m_asyncBusy.load());
-    if (modernButton("Back Up Selected Apps", ImVec2(backupButtonW, 0))) startBackupManagerBackup();
+    if (theme.button("##BackupSelectedAction", "Back Up Selected Apps", ui::Icon::Backup,
+        actions, ImVec2(218 * s, 34 * s), ui::rgb(255, 255, 255), 1)) startBackupManagerBackup();
     ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!hasDevice || !anyBackup || m_asyncBusy.load());
-    if (modernButton("Restore Selected Backups", ImVec2(restoreButtonW, 0))) startBackupManagerRestore();
+    bool hasRestoreSelection = anyBackup;
+    if (m_backupManagerJobOpen) {
+        hasRestoreSelection = std::any_of(m_backupManagerJobApps.begin(), m_backupManagerJobApps.end(),
+            [](const auto& row) { return row.selected; });
+    }
+    ImGui::BeginDisabled(!hasDevice || !hasRestoreSelection || m_asyncBusy.load());
+    if (theme.button("##RestoreSelectedAction", m_backupManagerJobOpen ? "Restore Selected Apps" : "Restore Selected Backups", ui::Icon::Refresh,
+        ImVec2(actions.x + 230 * s, actions.y), ImVec2(230 * s, 34 * s), theme.muted)) {
+        if (m_backupManagerJobOpen) {
+            std::vector<std::string> paths;
+            for (const auto& row : m_backupManagerJobApps) if (row.selected) paths.push_back(row.record.backupPath);
+            startBackupManagerRestorePaths(std::move(paths));
+        } else startBackupManagerRestore();
+    }
     ImGui::EndDisabled();
     if (m_backupProgressActive) {
         const char* operation = m_backupProgressIsRestore ? "Restore" : "Backup";
@@ -7896,16 +7861,16 @@ void App::renderBackupManagerWindow() {
         if (!m_statusMessage.empty() && elapsed < std::chrono::seconds(15))
             statusText = m_statusMessage;
         else if (hasDevice)
-            statusText = "Ready";
+            statusText = "Backup capability ready";
         else
             statusText = "No device connected";
     }
-    float statusW = ImGui::CalcTextSize(statusText.c_str()).x;
-    float rightX = ImGui::GetWindowWidth() - statusW - 16.0f;
-    if (rightX > ImGui::GetCursorPosX() + 20.0f) ImGui::SameLine(rightX);
-    else ImGui::SameLine(0, 20);
-    ImGui::TextColored(hasDevice ? ImVec4(0.3f, 0.9f, 0.5f, 1) : ImVec4(0.9f, 0.65f, 0.25f, 1),
-        "%s", statusText.c_str());
+    float usedWidth = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x;
+    float statusW = std::min(ImGui::CalcTextSize(statusText.c_str()).x + 24 * s,
+        ImGui::GetWindowWidth() - usedWidth - 24 * s);
+    theme.status(ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth() - statusW - 6 * s, actions.y + 9 * s),
+        statusText, hasDevice, statusW);
+    ImGui::SetCursorScreenPos(ImVec2(actions.x, actions.y + 43 * s));
 
     if (showBackupProgress && !m_backupAppProgress.empty()) {
         if (m_backupProgressTotalBytes > 0) {
@@ -8071,6 +8036,9 @@ void App::renderBackupManagerWindow() {
     }
     ImGui::EndChild();
     ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(7);
+    ImGui::PopStyleVar(5);
 
 }
 
@@ -8194,123 +8162,13 @@ void App::renderCopyMoveDialog() {
     }
 }
 
-bool App::prepareSlot1WifiFallback(const std::string& serial) {
-    m_slot1WifiChannel.disconnectTcp();
-    m_slot1WifiIp.clear();
-    if (!m_prefs.wifiAutoConnect || serial.empty()) return false;
-    if (m_prefs.pipePreferencesFor(serial).wifiPipeCount < 1) return false;
-
-    std::string wlanOut = m_deviceSlots[1].runAdbCommand(
-        "-s " + serial + " shell \"ip -4 addr show wlan0 2>/dev/null\"");
-    auto inetPos = wlanOut.find("inet ");
-    if (inetPos == std::string::npos) return false;
-    auto start = inetPos + 5;
-    auto slash = wlanOut.find('/', start);
-    if (slash == std::string::npos) return false;
-    std::string wifiIp = wlanOut.substr(start, slash - start);
-    int helperPort = m_deviceSlots[1].localPort();
-
-    m_slot1WifiChannel.setAdbPath(m_device.getAdbPath());
-    if (!m_slot1WifiChannel.connectTcp(wifiIp, helperPort) ||
-        !m_slot1WifiChannel.verifyConnection()) {
-        m_slot1WifiChannel.disconnectTcp();
-        LOG_WARN("Poll", "Second device WiFi standby failed at " + wifiIp + ":" +
-            std::to_string(helperPort));
-        return false;
-    }
-
-    m_slot1WifiIp = wifiIp;
-    LOG_INFO("Poll", "Second device WiFi standby ready at " + wifiIp + ":" +
-        std::to_string(helperPort));
-    return true;
-}
-
-bool App::recoverSecondarySlotConnection(const std::string& serial) {
-    if (serial.empty()) return false;
-
-    DeviceClient& slotClient = m_deviceSlots[1];
-    const int helperPort = slotClient.localPort();
-    std::string wifiIp = slotClient.deviceIp();
-    if (wifiIp.empty()) wifiIp = m_slot1WifiIp;
-
-    std::string physicalSerial = serial;
-    std::vector<std::string> adbCandidates{serial};
-    for (const auto& saved : m_prefs.savedWifiDevices) {
-        std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
-        if (saved.serial != serial && wifiSerial != serial) continue;
-        physicalSerial = saved.serial;
-        if (wifiIp.empty()) wifiIp = saved.wifiIp;
-        adbCandidates.push_back(saved.serial);
-        adbCandidates.push_back(wifiSerial);
-        break;
-    }
-
-    slotClient.disconnectTcp();
-    if (!wifiIp.empty()) {
-        LOG_INFO("Poll", "Reconnecting secondary directly over WiFi at " + wifiIp + ":" +
-            std::to_string(helperPort));
-        if (slotClient.connectDirectForSerial(physicalSerial, wifiIp, helperPort)) {
-            m_slotSerial[1] = physicalSerial;
-            m_slotConnected[1] = true;
-            m_secondaryRetrySerial.clear();
-            m_secondaryRetryAfter = {};
-            m_slot1WifiChannel.disconnectTcp();
-            forEachAndroidPanel([&](FilePanel& p) {
-                if (p.deviceSlot == 1) p.needsRefresh = true;
-            });
-            LOG_INFO("Poll", "Secondary slot recovered directly over WiFi: " + physicalSerial);
-            return true;
-        }
-    }
-
-    std::string adbSerial;
-    {
-        std::lock_guard<std::mutex> lk(m_deviceMutex);
-        for (const auto& candidate : adbCandidates) {
-            auto found = std::find_if(m_devices.begin(), m_devices.end(), [&](const DeviceInfo& device) {
-                return device.serial == candidate && device.state == "device";
-            });
-            if (found != m_devices.end()) {
-                adbSerial = candidate;
-                break;
-            }
-        }
-    }
-    if (adbSerial.empty()) {
-        LOG_WARN("Poll", "Secondary WiFi reconnect failed and no ADB transport is available: " +
-            physicalSerial);
-        return false;
-    }
-
-    bool useRoot = m_prefs.rootEnabledForSerial(physicalSerial);
-    bool started = slotClient.startServer(adbSerial, true, useRoot);
-    if (!started && useRoot) {
-        LOG_WARN("Poll", "Secondary root reconnect failed, retrying without root: " +
-            slotClient.lastError());
-        started = slotClient.startServer(adbSerial, true, false);
-    }
-    if (!started) return false;
-
-    m_slotSerial[1] = adbSerial;
-    m_slotStorageRoot[1] = slotClient.detectStoragePath();
-    m_slotVolumes[1].clear();
-    m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
-    m_slotConnected[1] = true;
-    m_secondaryRetrySerial.clear();
-    m_secondaryRetryAfter = {};
-    prepareSlot1WifiFallback(adbSerial);
-    forEachAndroidPanel([&](FilePanel& p) {
-        if (p.deviceSlot == 1) p.needsRefresh = true;
-    });
-    LOG_INFO("Poll", "Secondary slot reconnected through ADB: " + adbSerial);
-    return true;
-}
 
 void App::tryAutoWifiConnect(const std::string& serial) {
     if (m_wifiAutoSetupDone || m_dualChannelAvailable) return;
     if (!m_prefs.wifiAutoConnect) return; // user disabled WiFi auto-connect
 
     for (auto& w : m_prefs.savedWifiDevices) {
+        if (w.wirelessDebugging) continue;
         if (w.serial == serial && w.autoConnect && !w.wifiIp.empty()) {
             // Check if WiFi serial is already in the device list (tcpip already active)
             std::string wifiSerial = w.wifiIp + ":" + std::to_string(w.port);
@@ -8430,8 +8288,7 @@ void App::renderWifiBanner() {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
     if (modernSmallButton("Set Up")) {
-        m_showWifiWizard = true;
-        m_wizardStep = 0;
+        openWifiWizard();
     }
     ImGui::PopStyleColor(2);
     ImGui::SameLine();
@@ -8474,302 +8331,81 @@ void App::requestWizardWifiProbe() {
     });
 }
 
-void App::renderWifiWizard() {
-    if (!m_showWifiWizard) {
-        if (m_wizardProbeBusy) {
-            ++m_wizardProbeGeneration;
-            m_wizardProbeBusy = false;
-        }
-        return;
-    }
-
-    ImGui::OpenPopup("WiFi Setup Wizard");
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_Appearing);
-
-    if (ImGui::BeginPopupModal("WiFi Setup Wizard", &m_showWifiWizard,
-            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
-
-        if (m_wizardStep == 0) {
-            // Step 1: Select device
-            ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Step 1: Select Device");
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            // List available devices
-            std::vector<DeviceInfo> devSnap;
-            {
-                std::lock_guard<std::mutex> lk(m_deviceMutex);
-                devSnap = m_devices;
-            }
-
-            int onlineCount = 0;
-            for (auto& d : devSnap) if (d.state == "device") onlineCount++;
-
-            if (onlineCount > 0) {
-                ImGui::TextDisabled("Select the device to set up WiFi ADB:");
-                ImGui::Spacing();
-
-                for (int i = 0; i < (int)devSnap.size(); i++) {
-                    if (devSnap[i].state != "device") continue;
-                    bool isWifi = isWifiSerial(devSnap[i].serial);
-
-                    std::string label = devSnap[i].serial;
-                    if (!devSnap[i].model.empty()) label = devSnap[i].model + " (" + devSnap[i].serial + ")";
-                    if (isWifi) label += "  [WiFi]";
-                    else label += "  [USB]";
-
-                    bool selected = (m_wizardSerial == devSnap[i].serial);
-                    if (ImGui::Selectable(label.c_str(), selected)) {
-                        m_wizardSerial = devSnap[i].serial;
-                    }
-                }
-
-                ImGui::Spacing();
-                if (!m_wizardSerial.empty()) {
-                    if (modernButton("Next", ImVec2(120, 0))) {
-                        m_wizardStep = 1;
-                        requestWizardWifiProbe();
-                    }
-                } else {
-                    ImGui::TextDisabled("Click a device above to select it.");
-                }
-            } else {
-                ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "No device detected.");
-                ImGui::Spacing();
-                ImGui::TextDisabled("1. Connect your phone with a USB cable");
-                ImGui::Spacing();
-                ImGui::TextDisabled("2. On your phone, go to Settings > Developer Options");
-                ImGui::TextDisabled("   and enable USB Debugging");
-                ImGui::Spacing();
-                ImGui::TextDisabled("3. If this is your first time connecting, a pairing");
-                ImGui::TextDisabled("   prompt will appear on your phone - tap Allow");
-                ImGui::Spacing();
-                ImGui::TextDisabled("If you don't see Developer Options, go to");
-                ImGui::TextDisabled("Settings > About Phone and tap Build Number 7 times.");
-            }
-        } else if (m_wizardStep == 1) {
-            // Step 2: Check WiFi
-            ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Step 2: WiFi Connection");
-            ImGui::Separator();
-            ImGui::Spacing();
-            ImGui::TextDisabled("Device: %s", m_wizardSerial.c_str());
-            ImGui::Spacing();
-
-            std::string serial = m_wizardSerial;
-            if (m_wizardProbeBusy) {
-                ImGui::TextDisabled("Checking this phone's WiFi connection...");
-            } else if (!m_wizardWifiIp.empty()) {
-                ImGui::TextColored(ImVec4(0.3f, 1, 0.5f, 1), "WiFi connected: %s", m_wizardWifiIp.c_str());
-                ImGui::Spacing();
-                if (modernButton("Set Up Wireless Connection", ImVec2(250, 0))) {
-                    m_wizardStep = 2;
-                    m_wizardBusy = true;
-                    m_wizardStatus = "Enabling WiFi ADB...";
-                    std::string ip = m_wizardWifiIp;
-                    postAsync("Setting up WiFi ADB...", [this, serial, ip]() {
-                        // Enable tcpip on port 5555
-                        m_wizardStatus = "Running adb tcpip 5555...";
-                        m_device.runAdbCommand("-s " + serial + " tcpip 5555");
-                        std::this_thread::sleep_for(std::chrono::seconds(2));
-
-                        // Connect via WiFi
-                        m_wizardStatus = "Connecting to " + ip + ":5555...";
-                        std::string result = m_device.runAdbCommand("connect " + ip + ":5555");
-                        bool ok = (result.find("connected") != std::string::npos ||
-                                   result.find("already") != std::string::npos);
-
-                        if (ok) {
-                            // Save for auto-reconnect
-                            SavedWifiDevice saved;
-                            saved.serial = serial;
-                            saved.wifiIp = ip;
-                            saved.port = 5555;
-                            saved.autoConnect = true;
-                            // Query display name (marketing name preferred)
-                            saved.model = queryDeviceDisplayName(ip + ":5555");
-                            // Track USB↔WiFi serial mapping
-                            m_usbToWifiSerial = ip + ":5555";
-                            m_wifiToUsbSerial = serial;
-                            // Remove old entry for same serial
-                            auto& devices = m_prefs.savedWifiDevices;
-                            devices.erase(std::remove_if(devices.begin(), devices.end(),
-                                [&](auto& d) { return d.serial == serial; }), devices.end());
-                            devices.push_back(saved);
-                            m_prefs.wifiAutoConnect = true; // enable auto-connect after successful wizard
-                            m_prefs.save();
-
-                            // Try dual channel
-                            std::this_thread::sleep_for(std::chrono::seconds(1));
-                            m_secondaryChannel.setAdbPath(m_device.getAdbPath());
-                            if (m_secondaryChannel.connectTcp(ip, AFM_PORT) && m_secondaryChannel.verifyConnection()) {
-                                m_dualChannelAvailable = true;
-                                m_secondaryChannelType = "WiFi";
-                                m_wizardStatus = "Dual channel active!";
-                            } else {
-                                m_wizardStatus = "WiFi connected (dual channel will activate on next transfer)";
-                            }
-                            m_wifiAutoSetupDone = true;
-                        } else {
-                            m_wizardStatus = "Failed: " + result;
-                        }
-                        m_wizardBusy = false;
-                        m_wizardStep = 3;
-                    });
-                }
-            } else {
-                if (!m_wizardProbeError.empty()) ImGui::TextWrapped("%s", m_wizardProbeError.c_str());
-                else {
-                    ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Phone is not connected to WiFi.");
-                    ImGui::TextDisabled("Connect your phone to a WiFi network,\nthen click Check Again.");
-                }
-                ImGui::Spacing();
-                if (modernButton("Check Again", ImVec2(120, 0))) requestWizardWifiProbe();
-            }
-            ImGui::SameLine();
-            if (modernButton("Back", ImVec2(80, 0))) {
-                ++m_wizardProbeGeneration;
-                m_wizardProbeBusy = false;
-                m_wizardStep = 0;
-            }
-        } else if (m_wizardStep == 2) {
-            // Step 3: Setting up
-            ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Step 3: Setting Up");
-            ImGui::Separator();
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", m_wizardStatus.c_str());
-            // Animated dots
-            float t = (float)fmod(ImGui::GetTime(), 1.0);
-            int dots = (int)(t * 4) % 4;
-            ImGui::SameLine();
-            ImGui::Text("%.*s", dots, "...");
-        } else if (m_wizardStep == 3) {
-            // Step 4: Done
-            ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Setup Complete");
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            if (m_dualChannelAvailable) {
-                ImGui::TextColored(ImVec4(0.3f, 1, 0.5f, 1), "Dual-channel is active!");
-                ImGui::Spacing();
-                ImGui::TextDisabled("Transfers will now use both USB and WiFi simultaneously.\n"
-                                    "This device will auto-connect via WiFi on future launches.\n"
-                                    "You can unplug USB and WiFi will keep working.");
-            } else if (m_wizardStatus.find("Failed") != std::string::npos) {
-                ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "%s", m_wizardStatus.c_str());
-            } else {
-                ImGui::TextColored(ImVec4(0.3f, 1, 0.5f, 1), "%s", m_wizardStatus.c_str());
-            }
-
-            ImGui::Spacing();
-            if (modernButton("Close", ImVec2(120, 0))) {
-                m_showWifiWizard = false;
-                m_wifiBannerDismissed = true;
-                ImGui::CloseCurrentPopup();
-            }
-        }
-
-        ImGui::EndPopup();
-    }
+void App::openWifiWizard() {
+    m_showWifiWizard = true;
+    if (m_wizardBusy) return;
+    ++m_wizardProbeGeneration;
+    m_wizardProbeBusy = false;
+    m_wizardStep = 0;
+    m_wizardSucceeded = false;
+    m_wizardStatus.clear();
+    m_wizardWifiIp.clear();
+    m_wizardProbeError.clear();
 }
 
-void App::renderWifiPairingDialog() {
-    if (!m_showWifiPairing) return;
-
-    ImGui::OpenPopup("WiFi ADB Pairing");
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-
-    if (ImGui::BeginPopupModal("WiFi ADB Pairing", &m_showWifiPairing,
-            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
-        ImGui::TextColored(ImVec4(0.45f, 0.70f, 1, 1), "Android 11+ Wireless Debugging");
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        if (!m_pairingDone) {
-            // Step 1: Pair
-            ImGui::TextDisabled("On your phone: Settings > Developer Options > Wireless Debugging");
-            ImGui::TextDisabled("Tap 'Pair device with pairing code' and enter the details below.");
-            ImGui::Spacing();
-
-            ImGui::SetNextItemWidth(250);
-            ImGui::InputTextWithHint("Pairing IP:Port", "e.g. 192.168.1.100:37000", m_pairingIp, sizeof(m_pairingIp));
-            ImGui::SetNextItemWidth(250);
-            ImGui::InputTextWithHint("Pairing Code", "e.g. 123456", m_pairingCode, sizeof(m_pairingCode));
-            ImGui::Spacing();
-
-            if (modernButton("Pair", ImVec2(120, 0))) {
-                std::string ip(m_pairingIp);
-                std::string code(m_pairingCode);
-                postAsync("Pairing...", [this, ip, code]() {
-                    std::string result = m_device.runAdbCommand("pair " + ip + " " + code);
-                    if (result.find("Successfully") != std::string::npos) {
-                        m_pairingDone = true;
-                        m_statusMessage = "Paired! Enter the connect IP:port from Wireless Debugging.";
-                    } else {
-                        m_statusMessage = "Pairing failed: " + result;
-                    }
-                    m_statusTime = std::chrono::steady_clock::now();
-                });
+void App::startWizardWifiSetup() {
+    if (m_wizardBusy || m_wizardSerial.empty() || m_wizardWifiIp.empty()) return;
+    m_wizardStep = 2;
+    m_wizardBusy = true;
+    m_wizardSucceeded = false;
+    m_wizardStatus = "Preparing your wireless connection...";
+    const auto generation = ++m_wizardSetupGeneration;
+    const std::string serial = m_wizardSerial;
+    const std::string ip = m_wizardWifiIp;
+    postAsync("Setting up WiFi ADB...", [this, generation, serial, ip]() {
+        auto report = [&](std::string status, bool finished = false, bool succeeded = false) {
+            UiMessage message;
+            message.hasWizardSetupProgress = true;
+            message.wizardSetupGeneration = generation;
+            message.wizardSetupSerial = serial;
+            message.wizardSetupStatus = std::move(status);
+            message.wizardSetupFinished = finished;
+            message.wizardSetupSucceeded = succeeded;
+            postUiMessage(std::move(message));
+        };
+        try {
+            report("Enabling wireless access on your phone...");
+            m_device.runAdbCommand("-s " + serial + " tcpip 5555");
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            report("Connecting to your phone over WiFi...");
+            std::string result = m_device.runAdbCommand("connect " + ip + ":5555");
+            bool connected = result.find("connected") != std::string::npos && result.find("failed") == std::string::npos;
+            if (!connected) {
+                report("Could not connect over WiFi. " + result, true, false);
+                return;
             }
-        } else {
-            // Step 2: Connect (after successful pairing)
-            ImGui::TextColored(ImVec4(0.3f, 1, 0.5f, 1), "Paired successfully!");
-            ImGui::Spacing();
-            ImGui::TextDisabled("Now enter the connect IP:port shown at the top of");
-            ImGui::TextDisabled("the Wireless Debugging screen (NOT the pairing port).");
-            ImGui::Spacing();
-
-            ImGui::SetNextItemWidth(250);
-            ImGui::InputTextWithHint("Connect IP:Port", "e.g. 192.168.1.100:42135", m_connectIp, sizeof(m_connectIp));
-            ImGui::Spacing();
-
-            if (modernButton("Connect", ImVec2(120, 0))) {
-                std::string connectAddr(m_connectIp);
-                postAsync("Connecting...", [this, connectAddr]() {
-                    std::string result = m_device.runAdbCommand("connect " + connectAddr);
-                    if (result.find("connected") != std::string::npos || result.find("already") != std::string::npos) {
-                        // Parse IP and port from the connect address
-                        std::string ip = connectAddr;
-                        int port = 5555;
-                        auto colon = connectAddr.rfind(':');
-                        if (colon != std::string::npos) {
-                            ip = connectAddr.substr(0, colon);
-                            try { port = std::stoi(connectAddr.substr(colon + 1)); } catch (...) {}
-                        }
-                        // Save for auto-reconnect
-                        SavedWifiDevice saved;
-                        saved.serial = connectAddr; // WiFi serial IS the connect address
-                        saved.wifiIp = ip;
-                        saved.port = port;
-                        saved.autoConnect = true;
-                        // Query display name from newly connected device
-                        saved.model = queryDeviceDisplayName(connectAddr);
-                        m_prefs.savedWifiDevices.push_back(saved);
-                        m_prefs.save();
-                        m_statusMessage = "Connected via WiFi: " + connectAddr;
-                        connectDeviceBySerialNow(connectAddr);
-                    } else {
-                        m_statusMessage = "Connect failed: " + result;
-                    }
-                    m_statusTime = std::chrono::steady_clock::now();
-                });
-                m_showWifiPairing = false;
-                m_pairingDone = false;
-                ImGui::CloseCurrentPopup();
+            report("Saving your wireless connection...");
+            SavedWifiDevice saved;
+            saved.serial = serial;
+            saved.wifiIp = ip;
+            saved.port = 5555;
+            saved.autoConnect = true;
+            saved.model = queryDeviceDisplayName(ip + ":5555");
+            m_usbToWifiSerial = ip + ":5555";
+            m_wifiToUsbSerial = serial;
+            auto& devices = m_prefs.savedWifiDevices;
+            devices.erase(std::remove_if(devices.begin(), devices.end(),
+                [&](const auto& device) { return device.serial == serial; }), devices.end());
+            devices.push_back(saved);
+            m_prefs.wifiAutoConnect = true;
+            m_prefs.save();
+            report("Finishing wireless setup...");
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (deviceSession(0).serial == serial || deviceSession(0).serial == ip + ":5555") {
+                m_secondaryChannel.setAdbPath(m_device.getAdbPath());
+                if (m_secondaryChannel.connectTcp(ip, AFM_PORT) && m_secondaryChannel.verifyConnection()) {
+                    m_dualChannelAvailable = true;
+                    m_secondaryChannelType = "WiFi";
+                }
             }
+            m_wifiAutoSetupDone = true;
+            report("Your phone is saved and will reconnect automatically on future launches.", true, true);
+        } catch (const std::exception& error) {
+            report("Could not finish setup. " + std::string(error.what()), true, false);
+        } catch (...) {
+            report("Could not finish setup. Check your connection and try again.", true, false);
         }
-
-        ImGui::SameLine();
-        if (modernButton("Cancel", ImVec2(80, 0))) {
-            m_showWifiPairing = false;
-            m_pairingDone = false;
-            ImGui::CloseCurrentPopup();
-        }
-
-        ImGui::EndPopup();
-    }
+    });
 }
 
 void App::renderCrossDeviceDialog() {
@@ -9727,6 +9363,8 @@ void App::applyScale(float newScale) {
     std::string semiboldPath=std::string(winDir)+"\\Fonts\\seguisb.ttf";
     ui::semiboldFont=io.Fonts->AddFontFromFileTTF(semiboldPath.c_str(),fontSize,&fontCfg,glyphRanges);
     if(!ui::semiboldFont)ui::semiboldFont=mainFont;
+    ui::connectionHeadingFont=io.Fonts->AddFontFromFileTTF(semiboldPath.c_str(),fontSize*29.0f/14.0f,&fontCfg,glyphRanges);
+    if(!ui::connectionHeadingFont)ui::connectionHeadingFont=ui::semiboldFont;
 
     io.Fonts->Build();
 
@@ -10594,7 +10232,7 @@ void App::refreshAppsPanel(FilePanel& panel) {
     panel.selectedIndices.clear();
     DeviceClient& dev = deviceFor(panel);
     if (!dev.isServerRunning()) return;
-    std::string serial = m_slotSerial[panel.deviceSlot];
+    std::string serial = deviceSession(panel.deviceSlot).serial;
     panel.appEntries = dev.listInstalledApps(serial, true);
     int col = panel.sortColumn;
     bool desc = panel.sortDescending;
@@ -10668,7 +10306,7 @@ void App::navigateToDirectory(FilePanel& panel, const std::string& path) {
 bool App::isOwnMountedDevicePath(const std::string& path, std::string* mountPoint) const {
     if (path.size() < 2 || path[1] != ':') return false;
     char pathDrive = (char)std::toupper((unsigned char)path[0]);
-    for (int slot = 0; slot < 2; ++slot) {
+    for (int slot = 0; slot < deviceSessionCount(); ++slot) {
         const auto& manager = DeviceMountManager::instance(slot);
         if (!manager.isMounted()) continue;
         const std::string& mounted = manager.mountPoint();
@@ -10681,6 +10319,12 @@ bool App::isOwnMountedDevicePath(const std::string& path, std::string* mountPoin
 }
 
 void App::switchPanelMode(FilePanel& panel, bool toAndroid) {
+    rememberDeviceView(panel);
+    ++panel.listingGeneration;
+    panel.refreshInProgress = false;
+    panel.pendingDeviceSerial.clear();
+    panel.pendingDeviceName.clear();
+    panel.deviceOpenError.clear();
     if (!panel.isApps && !panel.isConnections && panel.isAndroid == toAndroid) return;
     panel.isAndroid = toAndroid;
     panel.isApps = false;
@@ -10696,15 +10340,21 @@ void App::switchPanelMode(FilePanel& panel, bool toAndroid) {
     if (toAndroid) {
         panel.windowsEntries.clear();
         panel.appEntries.clear();
-        // If the other panel is already Android on slot 0, use slot 1
         FilePanel& other = (&panel == &m_leftPanel) ? m_rightPanel : m_leftPanel;
-        if ((other.isAndroid || other.isApps) && other.deviceSlot == 0 && m_slotConnected[1])
-            panel.deviceSlot = 1;
-        else
-            panel.deviceSlot = 0;
-        std::string root = m_slotStorageRoot[panel.deviceSlot];
+        panel.deviceSlot = 0;
+        for (int slot = 0; slot < deviceSessionCount(); ++slot) {
+            if (!deviceSession(slot).connected || !deviceForSlot(slot).isServerRunning()) continue;
+            panel.deviceSlot = slot;
+            if (!(other.isAndroid || other.isApps) || slot != other.deviceSlot) break;
+        }
+        std::string root = deviceSession(panel.deviceSlot).storageRoot;
         panel.currentPath = root.empty() ? "/" : root;
         strcpy_s(panel.pathInput, panel.currentPath.c_str());
+        {
+            auto& session = deviceSession(panel.deviceSlot);
+            std::lock_guard<std::mutex> lock(session.cacheMutex);
+            panel.androidEntries = session.rootEntries;
+        }
         panel.needsRefresh = true;
     } else {
         panel.androidEntries.clear();
@@ -10716,6 +10366,12 @@ void App::switchPanelMode(FilePanel& panel, bool toAndroid) {
 }
 
 void App::switchPanelToApps(FilePanel& panel) {
+    rememberDeviceView(panel);
+    ++panel.listingGeneration;
+    panel.refreshInProgress = false;
+    panel.pendingDeviceSerial.clear();
+    panel.pendingDeviceName.clear();
+    panel.deviceOpenError.clear();
     if (panel.isApps && !panel.isConnections) return;
     panel.isAndroid = false;
     panel.isApps = true;
@@ -10731,16 +10387,24 @@ void App::switchPanelToApps(FilePanel& panel) {
     panel.navHistory.clear();
     panel.navHistoryPos = -1;
     FilePanel& other = (&panel == &m_leftPanel) ? m_rightPanel : m_leftPanel;
-    if ((other.isAndroid || other.isApps) && other.deviceSlot == 0 && m_slotConnected[1])
-        panel.deviceSlot = 1;
-    else
-        panel.deviceSlot = 0;
+    panel.deviceSlot = 0;
+    for (int slot = 0; slot < deviceSessionCount(); ++slot) {
+        if (!deviceSession(slot).connected || !deviceForSlot(slot).isServerRunning()) continue;
+        panel.deviceSlot = slot;
+        if (!(other.isAndroid || other.isApps) || slot != other.deviceSlot) break;
+    }
     panel.currentPath = "apps://installed";
     strcpy_s(panel.pathInput, "Installed apps");
     panel.needsRefresh = true;
 }
 
 void App::switchPanelToConnections(FilePanel& panel) {
+    rememberDeviceView(panel);
+    ++panel.listingGeneration;
+    panel.refreshInProgress = false;
+    panel.pendingDeviceSerial.clear();
+    panel.pendingDeviceName.clear();
+    panel.deviceOpenError.clear();
     if (panel.isConnections) return;
     panel.isAndroid = false;
     panel.isApps = false;
@@ -10804,7 +10468,7 @@ void App::devicePollLoop() {
     m_device.findAdb();
     // Share ADB path with secondary device client
     if (!m_device.getAdbPath().empty())
-        m_deviceSlots[1].setAdbPath(m_device.getAdbPath());
+        deviceSession(1).client.setAdbPath(m_device.getAdbPath());
 
     if (!m_device.getAdbPath().empty()) {
         if (m_prefs.restartAdbOnLaunch) {
@@ -10841,16 +10505,11 @@ void App::devicePollLoop() {
         if (m_shutdownPoll) return;
         m_pollBusy = true;
         std::string curSerial;
+        discoverDeviceIdentities(devices);
         bool primaryServerRunning = m_device.isServerRunning();
         bool primaryListedOnline = false;
         {
             std::lock_guard<std::mutex> lk(m_deviceMutex);
-            std::string previousSelectedSerial;
-            if (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size())
-                previousSelectedSerial = m_devices[m_selectedDevice].serial;
-            if (previousSelectedSerial.empty())
-                previousSelectedSerial = m_lastDeviceSerial;
-
             m_devices = devices;
 
             // Build list of online devices only
@@ -10866,95 +10525,35 @@ void App::devicePollLoop() {
                     if (m_devices[i].state == "device") return i;
                 return -1;
             };
-            auto findSerial = [&](const std::string& serial) -> int {
-                if (serial.empty()) return -1;
-                for (int i = 0; i < (int)m_devices.size(); i++) {
-                    if (m_devices[i].serial == serial && m_devices[i].state == "device")
-                        return i;
-                }
-                return -1;
-            };
-
-            // Keep slot 0 stable while its server is alive. Panel device dropdowns
-            // browse slots, they must not cause slot 1 to be promoted to primary.
+            const auto identities = m_deviceSessions.identities();
+            const std::string primaryIdentity = identities.front();
             int primaryIdx = -1;
-            if (primaryServerRunning && m_slotConnected[0]) {
-                std::set<std::string> primaryTransports;
-                addKnownPrimarySerials(primaryTransports, m_slotSerial[0]);
-                if (!m_wifiToUsbSerial.empty() && !m_usbToWifiSerial.empty() &&
-                    (m_slotSerial[0] == m_wifiToUsbSerial || m_slotSerial[0] == m_usbToWifiSerial)) {
-                    primaryTransports.insert(m_wifiToUsbSerial);
-                    primaryTransports.insert(m_usbToWifiSerial);
+            for (int i = 0; i < (int)m_devices.size(); ++i) {
+                if (m_devices[i].state == "device" &&
+                    deviceIdentity(m_devices[i].serial) == primaryIdentity) {
+                    primaryIdx = i;
+                    if (!isWifiSerial(m_devices[i].serial)) break;
                 }
-                for (const auto& transport : primaryTransports) {
-                    primaryIdx = findSerial(transport);
-                    if (primaryIdx >= 0) break;
+            }
+            if (primaryIdentity.empty()) {
+                primaryIdx = findOnline(true);
+                if (primaryIdx >= 0) {
+                    m_deviceSessions.ensure(deviceIdentity(m_devices[primaryIdx].serial));
+                    deviceSession(0).serial = m_devices[primaryIdx].serial;
+                    UiMessage message;
+                    message.saveDeviceSessions = true;
+                    postUiMessage(std::move(message));
                 }
             }
             primaryListedOnline = primaryIdx >= 0;
-
-            // During `adb tcpip`, Android briefly removes the USB serial before
-            // publishing its WiFi serial. Keep the verified direct connection as
-            // primary through that gap instead of promoting the other phone.
-            bool retainingDirectWifiPrimary = false;
-            if (primaryIdx < 0 && primaryServerRunning && m_slotConnected[0])
-                retainingDirectWifiPrimary = m_device.isDirectConnection() ||
+            bool retainingDirectWifiPrimary = primaryIdx < 0 && primaryServerRunning &&
+                deviceSession(0).connected && (m_device.isDirectConnection() ||
                     (m_dualChannelAvailable && m_secondaryChannelType == "WiFi" &&
                      m_secondaryChannel.isServerRunning() &&
-                     m_secondaryChannel.connectedHost() != "127.0.0.1");
+                     m_secondaryChannel.connectedHost() != "127.0.0.1"));
+            m_selectedDevice = primaryIdx;
 
-            if (primaryIdx >= 0) {
-                m_selectedDevice = primaryIdx;
-            } else if (!retainingDirectWifiPrimary) {
-                int preserved = findSerial(previousSelectedSerial);
-                if (preserved >= 0)
-                    m_selectedDevice = preserved;
-            }
-
-            // Check if currently selected device went offline
-            bool selectedOffline = (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size() &&
-                                    m_devices[m_selectedDevice].state != "device");
-            bool selectedGone = (m_selectedDevice >= 0 && m_selectedDevice >= (int)m_devices.size());
-
-            if (m_selectedDevice < 0 || selectedOffline || selectedGone) {
-                // Release keep-awake if device went away (process death auto-releases the wakelock on the device)
-                if ((selectedOffline || selectedGone) && m_keepAwake) {
-                    if (m_wakeLockProcess) {
-                        TerminateProcess(m_wakeLockProcess, 0);
-                        CloseHandle(m_wakeLockProcess);
-                        m_wakeLockProcess = nullptr;
-                    }
-                    m_keepAwake = false;
-                }
-                // Try to find the same physical device via the other serial
-                int found = -1;
-                if (selectedOffline || selectedGone) {
-                    std::string lostSerial = (selectedOffline && m_selectedDevice < (int)m_devices.size())
-                        ? m_devices[m_selectedDevice].serial : m_lastDeviceSerial;
-                    // Check if the partner serial (USB↔WiFi) is online
-                    std::string partnerSerial;
-                    if (isWifiSerial(lostSerial) && lostSerial == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
-                        partnerSerial = m_wifiToUsbSerial;
-                    else if (!isWifiSerial(lostSerial) && lostSerial == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
-                        partnerSerial = m_usbToWifiSerial;
-
-                    if (!partnerSerial.empty()) {
-                        for (int i = 0; i < (int)m_devices.size(); i++) {
-                            if (m_devices[i].serial == partnerSerial && m_devices[i].state == "device") {
-                                found = i;
-                                LOG_INFO("Poll", "Auto-switching to partner serial: " + partnerSerial);
-                                break;
-                            }
-                        }
-                    }
-                }
-                m_selectedDevice = (found >= 0) ? found : findOnline(true);
-            }
-
-            if (retainingDirectWifiPrimary)
-                m_selectedDevice = -1;
-
-            curSerial = retainingDirectWifiPrimary ? m_slotSerial[0] :
+            curSerial = retainingDirectWifiPrimary ? deviceSession(0).serial :
                 (m_selectedDevice >= 0 && m_selectedDevice < (int)m_devices.size()
                                      && m_devices[m_selectedDevice].state == "device")
                 ? m_devices[m_selectedDevice].serial : "";
@@ -11144,7 +10743,7 @@ void App::devicePollLoop() {
 
         // A direct WiFi transfer channel remains independent of ADB. Promote it
         // before treating an empty ADB device list as a full device disconnect.
-        if (!primaryListedOnline && !m_lastDeviceSerial.empty() && m_slotConnected[0] &&
+        if (!primaryListedOnline && !m_lastDeviceSerial.empty() && deviceSession(0).connected &&
             !m_device.isDirectConnection() && !m_wifiTransitionActive &&
             m_dualChannelAvailable && m_secondaryChannelType == "WiFi") {
             const std::string wifiIp = m_secondaryChannel.connectedHost();
@@ -11190,7 +10789,7 @@ void App::devicePollLoop() {
                     std::string wifiIp = curSerial.substr(0, curSerial.rfind(':'));
                     LOG_INFO("Poll", "USB disconnected, failing over primary directly to " + curSerial);
                     if (m_device.connectDirectForSerial(curSerial, wifiIp)) {
-                        m_slotSerial[0] = curSerial;
+                        deviceSession(0).serial = curSerial;
                         m_statusMessage = "USB disconnected, continuing over WiFi";
                         m_statusTime = std::chrono::steady_clock::now();
                         m_lastDeviceSerial = curSerial;
@@ -11211,15 +10810,13 @@ void App::devicePollLoop() {
                 m_statusTime = std::chrono::steady_clock::now();
                 m_androidStorageRoot.clear();
                 m_androidVolumes.clear();
-                m_slotStorageRoot[0].clear();
-                m_slotVolumes[0].clear();
-                m_slotConnected[0] = false;
+                deviceSession(0).storageRoot.clear();
+                deviceSession(0).volumes.clear();
+                deviceSession(0).connected = false;
                 forEachAndroidPanel([](FilePanel& p) {
                     if (p.deviceSlot != 0) return;
-                    p.androidEntries.clear();
                     p.selectedIndices.clear();
-                    p.currentPath = "/";
-                    strcpy_s(p.pathInput, "/");
+                    p.needsRefresh = true;
                 });
             } else if (!handledSerialChange && !curSerial.empty()) {
                 if (m_device.isServerRunning() && m_device.connectedSerial() == curSerial) {
@@ -11261,160 +10858,7 @@ void App::devicePollLoop() {
             }
         }
 
-        // Auto-connect secondary device slot when a new device appears
-        std::set<std::string> primarySerials;
-        if (!curSerial.empty()) {
-            addKnownPrimarySerials(primarySerials, curSerial);
-            if (curSerial == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
-                primarySerials.insert(m_usbToWifiSerial);
-            if (curSerial == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
-                primarySerials.insert(m_wifiToUsbSerial);
-        }
-        if (m_slotConnected[1] && primarySerials.count(m_slotSerial[1])) {
-            LOG_INFO("Poll", "Clearing slot 1 because it is another path to the primary device: " + m_slotSerial[1]);
-            m_deviceSlots[1].disconnectTcp();
-            m_slotConnected[1] = false;
-            m_slotSerial[1].clear();
-            m_slotStorageRoot[1].clear();
-            m_slotVolumes[1].clear();
-            forEachDevicePanel([&](FilePanel& p) {
-                if (p.deviceSlot == 1) {
-                    p.deviceSlot = 0;
-                    if (p.isAndroid) {
-                        p.currentPath = m_slotStorageRoot[0].empty() ? "/" : m_slotStorageRoot[0];
-                        strcpy_s(p.pathInput, p.currentPath.c_str());
-                    } else if (p.isApps) {
-                        p.appEntries.clear();
-                        p.selectedIndices.clear();
-                    }
-                    p.needsRefresh = true;
-                }
-            });
-        }
-        if (!curSerial.empty() && m_device.isServerRunning() && !m_slotConnected[1] && !isBatchActive()) {
-            std::string serial2;
-            {
-                std::lock_guard<std::mutex> lk(m_deviceMutex);
-                for (int i = 0; i < (int)m_devices.size(); i++) {
-                    if (primarySerials.count(m_devices[i].serial)) continue; // skip primary device (any serial)
-                    if (m_devices[i].state != "device") continue;
-                    serial2 = m_devices[i].serial;
-                    break; // only one secondary
-                }
-            }
-            if (!serial2.empty() && serial2 == m_secondaryRetrySerial &&
-                std::chrono::steady_clock::now() < m_secondaryRetryAfter) {
-                serial2.clear();
-            }
-            if (!serial2.empty()) {
-                LOG_INFO("Poll", "Auto-connecting secondary device slot: " + serial2);
-                auto startSecondary = [&](const std::string& s) {
-                    bool root = m_prefs.rootEnabledForSerial(s);
-                    if (m_deviceSlots[1].startServer(s, true /*ADB forward*/, root)) return true;
-                    if (!root) return false;
-                    LOG_WARN("Poll", "Secondary root start failed, retrying without root: " + m_deviceSlots[1].lastError());
-                    m_prefs.setRootEnabledForSerial(s, false);
-                    m_prefs.save();
-                    return m_deviceSlots[1].startServer(s, true /*ADB forward*/, false);
-                };
-                if (startSecondary(serial2)) {
-                    m_slotSerial[1] = serial2;
-                    m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
-                    m_slotVolumes[1].clear();
-                    m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
-                    m_slotConnected[1] = true;
-                    prepareSlot1WifiFallback(serial2);
-                    m_secondaryRetrySerial.clear();
-                    LOG_INFO("Poll", "Secondary slot connected: " + serial2 + " storage: " + m_slotStorageRoot[1]);
-                    // Navigate any slot-1 panels
-                    forEachDevicePanel([&](FilePanel& p) {
-                        if (p.deviceSlot == 1) {
-                            if (p.isAndroid) {
-                                p.currentPath = m_slotStorageRoot[1];
-                                strcpy_s(p.pathInput, p.currentPath.c_str());
-                            } else if (p.isApps) {
-                                p.appEntries.clear();
-                                p.selectedIndices.clear();
-                            }
-                            p.needsRefresh = true;
-                        }
-                    });
-                } else {
-                    LOG_WARN("Poll", "Failed to start server on secondary: " + serial2 + ": " + m_deviceSlots[1].lastError());
-                    m_secondaryRetrySerial = serial2;
-                    m_secondaryRetryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(15);
-                }
-            }
-        }
-
-        // Disconnect secondary slot if that device went offline
-        if (m_slotConnected[1]) {
-            bool slot1Online = m_deviceSlots[1].isDirectConnection() &&
-                m_deviceSlots[1].isServerRunning();
-            std::string wifiFallbackSerial;
-            {
-                std::lock_guard<std::mutex> lk(m_deviceMutex);
-                for (auto& d : m_devices) {
-                    if (d.serial == m_slotSerial[1] && d.state == "device") { slot1Online = true; break; }
-                }
-                if (!slot1Online) {
-                    for (const auto& saved : m_prefs.savedWifiDevices) {
-                        std::string wifiSerial = saved.wifiIp + ":" + std::to_string(saved.port);
-                        if (!saved.wifiIp.empty() && saved.serial == m_slotSerial[1]) {
-                            for (const auto& device : m_devices) {
-                                if (device.serial == wifiSerial && device.state == "device") {
-                                    wifiFallbackSerial = wifiSerial;
-                                    break;
-                                }
-                            }
-                        }
-                        if (!wifiFallbackSerial.empty()) break;
-                    }
-                }
-            }
-            if (!slot1Online) {
-                std::string wifiIp = m_slot1WifiIp;
-                if (!wifiFallbackSerial.empty())
-                    wifiIp = wifiFallbackSerial.substr(0, wifiFallbackSerial.rfind(':'));
-                if (!wifiIp.empty()) {
-                    std::string failoverSerial = wifiFallbackSerial.empty()
-                        ? m_slotSerial[1] : wifiFallbackSerial;
-                    LOG_INFO("Poll", "USB disconnected, failing over secondary directly to " +
-                        wifiIp + ":" + std::to_string(m_deviceSlots[1].localPort()));
-                    if (m_deviceSlots[1].connectDirectForSerial(
-                        failoverSerial, wifiIp, m_deviceSlots[1].localPort())) {
-                        m_slotSerial[1] = failoverSerial;
-                        m_slot1WifiChannel.disconnectTcp();
-                        m_statusMessage = "USB disconnected, secondary device continuing over WiFi";
-                        m_statusTime = std::chrono::steady_clock::now();
-                        slot1Online = true;
-                    }
-                }
-                if (!slot1Online) {
-                    LOG_INFO("Poll", "Secondary device disconnected: " + m_slotSerial[1]);
-                    m_slot1WifiChannel.disconnectTcp();
-                    m_slot1WifiIp.clear();
-                    m_slotConnected[1] = false;
-                    m_slotSerial[1].clear();
-                    m_slotStorageRoot[1].clear();
-                    m_slotVolumes[1].clear();
-                    // Move any slot-1 panels back to slot 0
-                    forEachDevicePanel([&](FilePanel& p) {
-                        if (p.deviceSlot == 1) {
-                            p.deviceSlot = 0;
-                            if (p.isAndroid) {
-                                p.currentPath = m_slotStorageRoot[0].empty() ? "/" : m_slotStorageRoot[0];
-                                strcpy_s(p.pathInput, p.currentPath.c_str());
-                            } else if (p.isApps) {
-                                p.appEntries.clear();
-                                p.selectedIndices.clear();
-                            }
-                            p.needsRefresh = true;
-                        }
-                    });
-                }
-            }
-        }
+        maintainDeviceSessions(devices);
 
         // Health check
         if (m_device.isServerRunning() && !curSerial.empty() && !m_tetheringInProgress && !m_wifiTransitionActive) {
@@ -11439,36 +10883,13 @@ void App::devicePollLoop() {
             }
         }
 
-        if (m_slotConnected[1] && !isBatchActive() && !m_tetheringInProgress) {
-            auto sinceLast = std::chrono::steady_clock::now() - m_lastTransferActivity;
-            if (sinceLast >= std::chrono::seconds(15) && !m_deviceSlots[1].verifyConnection()) {
-                std::string secondarySerial = m_slotSerial[1];
-                LOG_WARN("Poll", "Secondary health check failed, reconnecting: " + secondarySerial);
-                if (!recoverSecondarySlotConnection(secondarySerial)) {
-                    m_secondaryRetrySerial = secondarySerial;
-                    m_secondaryRetryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(15);
-                    m_slotConnected[1] = false;
-                    m_slotSerial[1].clear();
-                    m_slotStorageRoot[1].clear();
-                    m_slotVolumes[1].clear();
-                    forEachAndroidPanel([&](FilePanel& p) {
-                        if (p.deviceSlot == 1) {
-                            p.androidEntries.clear();
-                            p.selectedIndices.clear();
-                            p.needsRefresh = true;
-                        }
-                    });
-                }
-            }
-        }
-
         // Try to reconnect saved WiFi devices
         if (!isBatchActive() && m_prefs.wifiAutoConnect) {
             bool hasUsbDevice = !curSerial.empty() && !isWifiSerial(curSerial);
             bool noDeviceAtAll = !m_device.isServerRunning();
 
             for (auto& w : m_prefs.savedWifiDevices) {
-                if (!w.autoConnect || w.wifiIp.empty()) continue;
+                if (!w.autoConnect || w.wifiIp.empty() || w.wirelessDebugging) continue;
                 if (hasUsbDevice && w.serial != curSerial) continue;
                 if (!noDeviceAtAll && !hasUsbDevice) continue;
                 std::string connectAddr = w.wifiIp + ":" + std::to_string(w.port);
@@ -11538,7 +10959,7 @@ void App::devicePollLoop() {
                 std::lock_guard<std::mutex> adbDiscovery(m_deviceWorkMutex);
                 if (m_shutdownPoll) return;
                 if (m_device.findAdb()) {
-                    m_deviceSlots[1].setAdbPath(m_device.getAdbPath());
+                    deviceSession(1).client.setAdbPath(m_device.getAdbPath());
                     m_statusMessage = "ADB ready - waiting for device...";
                     m_statusTime = std::chrono::steady_clock::now();
                     continue;
@@ -11585,9 +11006,9 @@ void App::devicePollLoop() {
                             && m_devices[m_selectedDevice].state == "device")
                             ? m_devices[m_selectedDevice].serial : "";
                     }
-                    if (curSerial.empty() && m_slotConnected[0] &&
+                    if (curSerial.empty() && deviceSession(0).connected &&
                         m_device.isDirectConnection() && m_device.isServerRunning())
-                        curSerial = m_slotSerial[0];
+                        curSerial = deviceSession(0).serial;
                     if (m_device.isServerRunning() && !curSerial.empty() && !m_tetheringInProgress && !m_wifiTransitionActive) {
                         auto sinceLast = std::chrono::steady_clock::now() - m_lastTransferActivity;
                         if (!isBatchActive() && sinceLast >= std::chrono::seconds(15)) {
@@ -11608,32 +11029,12 @@ void App::devicePollLoop() {
                             }
                         }
                     }
-                    if (m_slotConnected[1] && !isBatchActive() && !m_tetheringInProgress) {
-                        auto sinceLast = std::chrono::steady_clock::now() - m_lastTransferActivity;
-                        auto retryNow = std::chrono::steady_clock::now();
-                        bool secondaryBackoff = m_slotSerial[1] == m_secondaryRetrySerial &&
-                            retryNow < m_secondaryRetryAfter;
-                        if (!secondaryBackoff && sinceLast >= std::chrono::seconds(15) &&
-                            !m_deviceSlots[1].verifyConnection()) {
-                            std::string secondarySerial = m_slotSerial[1];
-                            LOG_WARN("Poll", "Secondary health check failed, reconnecting: " + secondarySerial);
-                            if (!recoverSecondarySlotConnection(secondarySerial)) {
-                                m_secondaryRetrySerial = secondarySerial;
-                                m_secondaryRetryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(15);
-                                m_slotConnected[1] = false;
-                                m_slotSerial[1].clear();
-                                m_slotStorageRoot[1].clear();
-                                m_slotVolumes[1].clear();
-                                forEachAndroidPanel([&](FilePanel& p) {
-                                    if (p.deviceSlot == 1) {
-                                        p.androidEntries.clear();
-                                        p.selectedIndices.clear();
-                                        p.needsRefresh = true;
-                                    }
-                                });
-                            }
-                        }
+                    std::vector<DeviceInfo> sessionDevices;
+                    {
+                        std::lock_guard<std::mutex> lock(m_deviceMutex);
+                        sessionDevices = m_devices;
                     }
+                    maintainDeviceSessions(sessionDevices);
                     if (!curSerial.empty() && !m_device.isServerRunning() && !isBatchActive() && !m_wifiTransitionActive) {
                         if (!isBatchActive()) {
                             LOG_INFO("Poll", "Device present but server not running - retrying");
@@ -11657,7 +11058,7 @@ void App::devicePollLoop() {
                             m_lastWifiProbeTime = now;
                             bool anyAutoConnect = false;
                             for (auto& w : m_prefs.savedWifiDevices) {
-                                if (!w.autoConnect || w.wifiIp.empty()) continue;
+                                if (!w.autoConnect || w.wifiIp.empty() || w.wirelessDebugging) continue;
                                 anyAutoConnect = true;
                                 std::string connectAddr = w.wifiIp + ":" + std::to_string(w.port);
 
@@ -11742,12 +11143,12 @@ void App::onDeviceChanged() {
         if (m_selectedDevice < 0 || m_selectedDevice >= (int)m_devices.size()) return;
         serial = m_devices[m_selectedDevice].serial;
     }
+    if (m_deviceSessions.find(deviceIdentity(serial)) != 0) return;
     m_primaryReconnectActive = true;
     struct ReconnectFlagReset {
         std::atomic<bool>& flag;
         ~ReconnectFlagReset() { flag = false; }
     } reconnectFlagReset{m_primaryReconnectActive};
-    bool reconnectingSamePrimary = m_slotConnected[0] && m_slotSerial[0] == serial;
 
     bool useRootForDevice = m_prefs.rootEnabledForSerial(serial);
     // Start the TCP server on the device (status updates come from m_device.statusText())
@@ -11788,138 +11189,19 @@ void App::onDeviceChanged() {
     m_statusTime = std::chrono::steady_clock::now();
 
     // Detect storage root via TCP server
-    m_slotStorageRoot[0] = m_device.detectStoragePath();
-    m_androidStorageRoot = m_slotStorageRoot[0];
-    m_slotVolumes[0].clear();
-    m_slotVolumes[0].push_back(m_slotStorageRoot[0]);
-    m_androidVolumes = m_slotVolumes[0];
+    deviceSession(0).storageRoot = m_device.detectStoragePath();
+    m_androidStorageRoot = deviceSession(0).storageRoot;
+    deviceSession(0).volumes.clear();
+    deviceSession(0).volumes.push_back(deviceSession(0).storageRoot);
+    m_androidVolumes = deviceSession(0).volumes;
 
-    // Track slot 0 — if the new primary was previously in slot 1, clear slot 1
-    std::string oldSlot1Serial;
-    if (m_slotConnected[1] && m_slotSerial[1] == serial) {
-        LOG_INFO("Poll", "New primary was in slot 1, clearing slot 1");
-        m_slotConnected[1] = false;
-        oldSlot1Serial.clear(); // it's now the primary, no need to reassign
-        m_slotSerial[1].clear();
-        m_slotStorageRoot[1].clear();
-        m_slotVolumes[1].clear();
-    }
-    // Remember old slot 0 serial so we can move it to slot 1
-    std::string oldSlot0Serial;
-    if (m_slotConnected[0] && m_slotSerial[0] != serial)
-        oldSlot0Serial = m_slotSerial[0];
-
-    m_slotSerial[0] = serial;
-    m_slotConnected[0] = true;
-
-    // Preserve panel navigation when reconnecting the same primary device.
-    // A transport retry must not throw healthy panels back to the storage root.
-    forEachDevicePanel([&](FilePanel& p) {
-        if ((p.deviceSlot < 0 || p.deviceSlot >= 2 || !m_slotConnected[p.deviceSlot]) && m_slotConnected[0]) {
-            p.deviceSlot = 0;
-            p.navHistory.clear();
-            p.navHistoryPos = -1;
-        }
-        if (p.deviceSlot == 0) {
-            if (!reconnectingSamePrimary) {
-                if (p.isAndroid) {
-                    p.currentPath = m_androidStorageRoot;
-                    strcpy_s(p.pathInput, p.currentPath.c_str());
-                } else if (p.isApps) {
-                    p.appEntries.clear();
-                    p.selectedIndices.clear();
-                }
-            }
-            p.needsRefresh = true;
-        }
-    });
-
-    // Try to connect a second device if available. Keep ADB/server work outside
-    // m_deviceMutex so the UI can keep drawing device selectors while detection runs.
-    std::set<std::string> primarySerials;
-    addKnownPrimarySerials(primarySerials, serial);
-    if (serial == m_wifiToUsbSerial && !m_usbToWifiSerial.empty())
-        primarySerials.insert(m_usbToWifiSerial);
-    if (serial == m_usbToWifiSerial && !m_wifiToUsbSerial.empty())
-        primarySerials.insert(m_wifiToUsbSerial);
-
-    if (m_slotConnected[1] && primarySerials.count(m_slotSerial[1])) {
-        LOG_INFO("Poll", "Clearing slot 1 because it is another path to the new primary device: " + m_slotSerial[1]);
-        m_deviceSlots[1].disconnectTcp();
-        m_slotConnected[1] = false;
-        m_slotSerial[1].clear();
-        m_slotStorageRoot[1].clear();
-        m_slotVolumes[1].clear();
-    }
-
-    std::string candidateSerial;
-    {
-        std::lock_guard<std::mutex> lk(m_deviceMutex);
-        // Prefer reassigning the old primary to slot 1 if it's still online
-        if (!oldSlot0Serial.empty() && !primarySerials.count(oldSlot0Serial)) {
-            for (auto& d : m_devices) {
-                if (d.serial == oldSlot0Serial && d.state == "device") {
-                    candidateSerial = oldSlot0Serial;
-                    break;
-                }
-            }
-        }
-        // Otherwise find any other online device
-        if (candidateSerial.empty()) {
-            for (int di = 0; di < (int)m_devices.size(); di++) {
-                if (primarySerials.count(m_devices[di].serial)) continue;
-                if (m_devices[di].state != "device") continue;
-                candidateSerial = m_devices[di].serial;
-                break;
-            }
-        }
-    }
-
-    auto candidateRetryNow = std::chrono::steady_clock::now();
-    bool candidateBackoff = candidateSerial == m_secondaryRetrySerial &&
-        candidateRetryNow < m_secondaryRetryAfter;
-    if (!candidateSerial.empty() && !candidateBackoff &&
-        (!m_slotConnected[1] || m_slotSerial[1] != candidateSerial)) {
-        LOG_INFO("Poll", "Starting server on second device: " + candidateSerial);
-        bool candidateStarted = false;
-        bool candidateRoot = m_prefs.rootEnabledForSerial(candidateSerial);
-        candidateStarted = m_deviceSlots[1].startServer(candidateSerial, true /*ADB forward*/, candidateRoot);
-        if (!candidateStarted && candidateRoot) {
-            LOG_WARN("Poll", "Second device root start failed, retrying without root: " + m_deviceSlots[1].lastError());
-            m_prefs.setRootEnabledForSerial(candidateSerial, false);
-            m_prefs.save();
-            candidateStarted = m_deviceSlots[1].startServer(candidateSerial, true /*ADB forward*/, false);
-        }
-        if (candidateStarted) {
-            m_secondaryRetrySerial.clear();
-            m_secondaryRetryAfter = {};
-            m_slotSerial[1] = candidateSerial;
-            m_slotStorageRoot[1] = m_deviceSlots[1].detectStoragePath();
-            m_slotVolumes[1].clear();
-            m_slotVolumes[1].push_back(m_slotStorageRoot[1]);
-            m_slotConnected[1] = true;
-            prepareSlot1WifiFallback(candidateSerial);
-            LOG_INFO("Poll", "Second device connected: " + candidateSerial + " storage: " + m_slotStorageRoot[1]);
-
-            // Navigate slot-1 Android panels
-            forEachDevicePanel([&](FilePanel& p) {
-                if (p.deviceSlot == 1) {
-                    if (p.isAndroid) {
-                        p.currentPath = m_slotStorageRoot[1];
-                        strcpy_s(p.pathInput, p.currentPath.c_str());
-                    } else if (p.isApps) {
-                        p.appEntries.clear();
-                        p.selectedIndices.clear();
-                    }
-                    p.needsRefresh = true;
-                }
-            });
-        } else {
-            m_secondaryRetrySerial = candidateSerial;
-            m_secondaryRetryAfter = std::chrono::steady_clock::now() + std::chrono::seconds(15);
-            LOG_WARN("Poll", "Failed to start server on " + candidateSerial + ": " + m_deviceSlots[1].lastError());
-        }
-    }
+    deviceSession(0).serial = serial;
+    cacheDeviceRoot(0);
+    deviceSession(0).connected = m_device.isServerRunning();
+    UiMessage readyMessage;
+    readyMessage.deviceSessionReady = true;
+    readyMessage.readyDeviceSlot = 0;
+    postUiMessage(std::move(readyMessage));
 
     // Reset the previous channel state before WiFi auto-connect begins. The
     // asynchronous connection must not be cleared after it succeeds.
@@ -12299,7 +11581,7 @@ void App::startTransfer(bool pullFromAndroid, bool move) {
     } else {
         // Mixed: need device
         FilePanel& devicePanel = m_leftPanel.isAndroid ? m_leftPanel : m_rightPanel;
-        if (!m_slotConnected[devicePanel.deviceSlot & 1] ||
+        if (!deviceSession(devicePanel.deviceSlot).connected ||
             !deviceForSlot(devicePanel.deviceSlot).isServerRunning()) return;
         if (pullFromAndroid) {
             srcPtr = m_leftPanel.isAndroid ? &m_leftPanel : &m_rightPanel;
@@ -12368,7 +11650,7 @@ void App::queuePanelTransfer(FilePanel& src, FilePanel& dst, bool move) {
         batch->isPull = !localCopy && src.isAndroid;
     }
     const FilePanel& transferDevicePanel = src.isAndroid ? src : dst;
-    auto transferPipes = m_prefs.pipePreferencesFor(m_slotSerial[transferDevicePanel.deviceSlot & 1]);
+    auto transferPipes = m_prefs.pipePreferencesFor(deviceSession(transferDevicePanel.deviceSlot).serial);
     batch->useParallelChannels = !localCopy &&
         (transferPipes.usbPipeCount > 1 || transferPipes.wifiPipeCount > 1);
 
@@ -12420,7 +11702,7 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
     uint64_t total = 0;
     if (target->isAndroid) {
         batch->dstDeviceSlot = target->deviceSlot;
-        auto transferPipes = m_prefs.pipePreferencesFor(m_slotSerial[target->deviceSlot & 1]);
+        auto transferPipes = m_prefs.pipePreferencesFor(deviceSession(target->deviceSlot).serial);
         batch->useParallelChannels = transferPipes.usbPipeCount > 1 || transferPipes.wifiPipeCount > 1;
     }
 
@@ -12470,7 +11752,7 @@ void App::handleExternalFileDrop(const std::vector<std::string>& paths, int mous
     if (batch->files.empty()) return;
 
     if (!batch->isLocalCopy) {
-        if (!m_slotConnected[target->deviceSlot & 1] ||
+        if (!deviceSession(target->deviceSlot).connected ||
             !deviceForSlot(target->deviceSlot).isServerRunning()) {
             m_statusMessage = "No device connected for transfer";
             m_statusTime = std::chrono::steady_clock::now();
@@ -12586,7 +11868,7 @@ void App::processBatchQueue() {
         // Single-device transfers use whichever panel is Android:
         // pulls read from the Android source slot, pushes write to the Android destination slot.
         int batchDeviceSlot = batch->isPull ? batch->srcDeviceSlot : batch->dstDeviceSlot;
-        DeviceClient& batchDev = m_deviceSlots[batchDeviceSlot & 1];
+        DeviceClient& batchDev = deviceSession(batchDeviceSlot).client;
 
         if (!batch->isLocalCopy && !batch->isCrossDevice && !batchDev.isServerRunning()) {
             batch->state = BatchState::Failed;
@@ -12697,7 +11979,7 @@ void App::processBatchQueue() {
                     m_nicLocalIps.clear();
                     for (int i = 0; i < (int)activeNics.size(); i++) {
                         auto ch = std::make_unique<DeviceClient>();
-                        if (ch->connectTcp(multiNicDeviceIp, batchDev.localPort(), activeNics[i].localIp) &&
+                        if (ch->connectTcp(multiNicDeviceIp, batchDev.serverPort(), activeNics[i].localIp) &&
                             ch->verifyConnection()) {
                             multiNicDevPtrs.push_back(ch.get());
                             multiNicBindIps.push_back(activeNics[i].localIp);
@@ -12809,14 +12091,15 @@ void App::processBatchQueue() {
 
             int usbChannels = primaryIsUsb ? 1 : 0;
             int wifiChannels = primaryUsesWifi ? 1 : 0;
-            int nextPort = 5840 + (batchDeviceSlot & 1) * 20;
-            int remoteHelperPort = batchDev.localPort();
+            int nextPort = 5840;
+            int remoteHelperPort = batchDev.serverPort();
 
             auto addUsbChannel = [&]() -> bool {
                 if (batchUsbSerial.empty()) return false;
                 for (int attempt = 0; attempt < 32; attempt++) {
                     auto ch = std::make_unique<DeviceClient>();
                     ch->setAdbPath(batchDev.getAdbPath());
+                    ch->setServerPort(batchDev.serverPort());
                     ch->setLocalPort(nextPort++);
                     int localPort = ch->localPort();
                     std::string fwd = batchDev.runAdbCommand("-s " + batchUsbSerial + " forward tcp:" +
@@ -12852,6 +12135,7 @@ void App::processBatchQueue() {
                 if (batchWifiIp.empty()) return false;
                 auto ch = std::make_unique<DeviceClient>();
                 ch->setAdbPath(batchDev.getAdbPath());
+                ch->setServerPort(batchDev.serverPort());
                 ch->setLocalPort(nextPort++);
                 if (!ch->connectTcp(batchWifiIp, remoteHelperPort) || !ch->verifyConnection())
                     return false;
@@ -13281,7 +12565,7 @@ void App::processBatchQueue() {
                                             if (hw != deviceHwSerial) continue;
                                         }
                                         std::string fwd = dev.runAdbCommand("-s " + s + " forward tcp:" +
-                                            std::to_string(dev.localPort()) + " tcp:" + std::to_string(AFM_PORT));
+                                            std::to_string(dev.localPort()) + " tcp:" + std::to_string(dev.serverPort()));
                                         if (fwd.find("error") == std::string::npos && fwd.find("offline") == std::string::npos) {
                                             dev.disconnectTcp();
                                             if (dev.connectTcp("127.0.0.1", dev.localPort()) && dev.verifyConnection()) {
@@ -13309,7 +12593,7 @@ void App::processBatchQueue() {
                                             ioctlsocket(probe, FIONBIO, &nonBlock);
                                             struct sockaddr_in addr = {};
                                             addr.sin_family = AF_INET;
-                                            addr.sin_port = htons(AFM_PORT);
+                                            addr.sin_port = htons(dev.serverPort());
                                             inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
                                             connect(probe, (struct sockaddr*)&addr, sizeof(addr));
                                             fd_set wset;
@@ -13321,7 +12605,7 @@ void App::processBatchQueue() {
                                             if (reachable) {
                                                 // WiFi is reachable, now switch for real
                                                 dev.disconnectTcp();
-                                                if (dev.connectTcp(ip, AFM_PORT) && dev.verifyConnection()) {
+                                                if (dev.connectTcp(ip, dev.serverPort()) && dev.verifyConnection()) {
                                                     ch.channelName = "WiFi (Direct)";
                                                     LOG_INFO("Transfer", ch.channelName + " upgraded back to WiFi");
                                                     upgraded = true;
@@ -13619,7 +12903,7 @@ void App::processBatchQueue() {
                             std::string actualTransport = ch.channelName; // default to current name
                             if (!bindLocalIp.empty()) {
                                 // Multi-NIC channel: reconnect with same NIC binding
-                                connected = dev.connectTcp(reconnectIp, AFM_PORT, bindLocalIp) && dev.verifyConnection();
+                                connected = dev.connectTcp(reconnectIp, dev.serverPort(), bindLocalIp) && dev.verifyConnection();
                             } else {
                                 // Universal reconnect: try all available transports
                                 // 1. Try original transport first
@@ -13636,7 +12920,7 @@ void App::processBatchQueue() {
                                         ip = reconnectIp;
                                     }
                                     if (!ip.empty()) {
-                                        connected = dev.connectTcp(ip, AFM_PORT) && dev.verifyConnection();
+                                        connected = dev.connectTcp(ip, dev.serverPort()) && dev.verifyConnection();
                                         if (connected) actualTransport = "WiFi (Direct)";
                                     }
                                 }
@@ -13668,7 +12952,7 @@ void App::processBatchQueue() {
                                             if (hwCheck != deviceHwSerial) continue;
                                         }
                                         std::string fwdResult = dev.runAdbCommand("-s " + cand + " forward tcp:" +
-                                            std::to_string(dev.localPort()) + " tcp:" + std::to_string(AFM_PORT));
+                                            std::to_string(dev.localPort()) + " tcp:" + std::to_string(dev.serverPort()));
                                         if (fwdResult.find("error") == std::string::npos &&
                                             fwdResult.find("offline") == std::string::npos) {
                                             connected = dev.connectTcp("127.0.0.1", dev.localPort()) && dev.verifyConnection();
@@ -13683,7 +12967,7 @@ void App::processBatchQueue() {
 
                                 // 3. If ADB-forward channel, also try WiFi direct as last resort
                                 if (!connected && origIsAdbForward && !reconnectIp.empty()) {
-                                    connected = dev.connectTcp(reconnectIp, AFM_PORT) && dev.verifyConnection();
+                                    connected = dev.connectTcp(reconnectIp, dev.serverPort()) && dev.verifyConnection();
                                     if (connected) actualTransport = "WiFi (Direct)";
                                 }
                             }
@@ -14047,14 +13331,15 @@ void App::processBatchQueue() {
 
             int usbChannels = primaryIsUsb ? 1 : 0;
             int wifiChannels = primaryUsesWifi ? 1 : 0;
-            int nextPort = portBase + (slot & 1) * 32;
-            int remoteHelperPort = baseDev.localPort();
+            int nextPort = portBase;
+            int remoteHelperPort = baseDev.serverPort();
 
             auto addUsbChannel = [&]() -> bool {
                 if (usbSerial.empty()) return false;
                 for (int attempt = 0; attempt < 32; attempt++) {
                     auto ch = std::make_unique<DeviceClient>();
                     ch->setAdbPath(baseDev.getAdbPath());
+                    ch->setServerPort(baseDev.serverPort());
                     ch->setLocalPort(nextPort++);
                     int localPort = ch->localPort();
                     std::string fwd = baseDev.runAdbCommand("-s " + usbSerial + " forward tcp:" +
@@ -14090,6 +13375,7 @@ void App::processBatchQueue() {
                 if (wifiIp.empty()) return false;
                 auto ch = std::make_unique<DeviceClient>();
                 ch->setAdbPath(baseDev.getAdbPath());
+                ch->setServerPort(baseDev.serverPort());
                 ch->setLocalPort(nextPort++);
                 if (!ch->connectTcp(wifiIp, remoteHelperPort) || !ch->verifyConnection())
                     return false;
@@ -14111,8 +13397,8 @@ void App::processBatchQueue() {
         };
 
         if (batch->isCrossDevice && !batch->useDokanRelay) {
-            DeviceClient& srcDev = m_deviceSlots[batch->srcDeviceSlot & 1];
-            DeviceClient& dstDev = m_deviceSlots[batch->dstDeviceSlot & 1];
+            DeviceClient& srcDev = deviceSession(batch->srcDeviceSlot).client;
+            DeviceClient& dstDev = deviceSession(batch->dstDeviceSlot).client;
             buildCrossDeviceChannels(srcDev, batch->srcDeviceSlot, 5920, crossSrcChannels);
             buildCrossDeviceChannels(dstDev, batch->dstDeviceSlot, 5984, crossDstChannels);
 
@@ -14132,8 +13418,8 @@ void App::processBatchQueue() {
 
         if (batch->isCrossDevice && !batch->useDokanRelay &&
             !crossSrcChannels.empty() && !crossDstChannels.empty()) {
-            DeviceClient& srcDev = m_deviceSlots[batch->srcDeviceSlot & 1];
-            DeviceClient& dstDev = m_deviceSlots[batch->dstDeviceSlot & 1];
+            DeviceClient& srcDev = deviceSession(batch->srcDeviceSlot).client;
+            DeviceClient& dstDev = deviceSession(batch->dstDeviceSlot).client;
             int pairCount = std::min((int)crossSrcChannels.size(), (int)crossDstChannels.size());
             pairCount = std::min(pairCount, (int)TransferBatch::MAX_CHANNELS);
 
@@ -14817,7 +14103,7 @@ void App::processBatchQueue() {
                 } else {
                     // Destination is Android — use the DESTINATION device client
                     DeviceClient& destDev = batch->isCrossDevice
-                        ? m_deviceSlots[batch->dstDeviceSlot & 1] : batchDev;
+                        ? deviceSession(batch->dstDeviceSlot).client : batchDev;
                     uint64_t remoteSize = destDev.getFileSize(item.destPath);
                     destExists = (remoteSize > 0);
                 }
@@ -14983,8 +14269,8 @@ void App::processBatchQueue() {
 
             // --- Cross-device Android-to-Android transfer ---
             if (batch->isCrossDevice) {
-                DeviceClient& srcDev = m_deviceSlots[batch->srcDeviceSlot & 1];
-                DeviceClient& dstDev = m_deviceSlots[batch->dstDeviceSlot & 1];
+                DeviceClient& srcDev = deviceSession(batch->srcDeviceSlot).client;
+                DeviceClient& dstDev = deviceSession(batch->dstDeviceSlot).client;
                 bool ok = false;
 
                 if (!srcDev.isServerRunning() || !dstDev.isServerRunning()) {

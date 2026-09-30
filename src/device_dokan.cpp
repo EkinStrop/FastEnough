@@ -38,11 +38,10 @@ struct WriteBuffer {
     bool needsFlush() const { return buffer.size() >= FLUSH_SIZE || !sequential; }
 };
 
-// Global write buffer map — keyed by device path
-static std::mutex g_wbMutex;
-static std::unordered_map<std::string, std::unique_ptr<WriteBuffer>> g_writeBuffers;
-
 struct DokanContext {
+    int slot = 0;
+    std::mutex writeMutex;
+    std::unordered_map<std::string, std::unique_ptr<WriteBuffer>> writeBuffers;
     DeviceClient* device = nullptr;
     std::string storageRoot;  // e.g. "/storage/emulated/0"
 
@@ -156,12 +155,20 @@ struct DokanContext {
     }
 };
 
-static DokanContext g_ctx[2]; // one per device slot
+static DokanContext& contextForSlot(int slot) {
+    static std::mutex mutex;
+    static std::unordered_map<int, std::unique_ptr<DokanContext>> contexts;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& context = contexts[slot];
+    if (!context) {
+        context = std::make_unique<DokanContext>();
+        context->slot = slot;
+    }
+    return *context;
+}
 
-// Get the DokanContext from a DOKAN_FILE_INFO (slot stored in GlobalContext)
 static DokanContext& ctxFromInfo(PDOKAN_FILE_INFO info) {
-    int slot = (int)(uintptr_t)info->DokanOptions->GlobalContext;
-    return g_ctx[slot & 1];
+    return *reinterpret_cast<DokanContext*>(info->DokanOptions->GlobalContext);
 }
 
 // Shorthand: declare ctx from DokanFileInfo at top of each callback
@@ -231,9 +238,9 @@ static NTSTATUS DOKAN_CALLBACK FsCreateFile(
 
     // Handle directory creation
     if (!exists && (CreateOptions & FILE_DIRECTORY_FILE)) {
-        DeviceMountManager::instance().ioActive = true;
+        DeviceMountManager::instance(ctx.slot).ioActive = true;
         bool ok = ctx.device->createDirectory(devPath);
-        DeviceMountManager::instance().ioActive = false;
+        DeviceMountManager::instance(ctx.slot).ioActive = false;
         if (!ok) return STATUS_ACCESS_DENIED;
         DokanFileInfo->IsDirectory = TRUE;
         auto s = devPath.rfind('/');
@@ -262,10 +269,10 @@ static NTSTATUS DOKAN_CALLBACK FsCreateFile(
 
         // Register write buffer for batching
         {
-            std::lock_guard<std::mutex> lk(g_wbMutex);
+            std::lock_guard<std::mutex> lk(ctx.writeMutex);
             auto wb = std::make_unique<WriteBuffer>();
             wb->devicePath = devPath;
-            g_writeBuffers[devPath] = std::move(wb);
+            ctx.writeBuffers[devPath] = std::move(wb);
         }
 
         return STATUS_SUCCESS;
@@ -295,13 +302,13 @@ static NTSTATUS DOKAN_CALLBACK FsDeleteDirectory(LPCWSTR FileName, PDOKAN_FILE_I
     return STATUS_SUCCESS;
 }
 
-// Flush a write buffer to the device (caller holds g_wbMutex or has exclusive access)
+// Flush a write buffer to the device (caller holds ctx.writeMutex or has exclusive access)
 static void flushWriteBuffer(DokanContext& ctx, WriteBuffer* wb) {
     if (!wb || wb->buffer.empty()) return;
-    DeviceMountManager::instance().ioActive = true;
+    DeviceMountManager::instance(ctx.slot).ioActive = true;
     ctx.device->writeRange(wb->devicePath, wb->fileOffset,
                               wb->buffer.data(), (uint32_t)wb->buffer.size());
-    DeviceMountManager::instance().ioActive = false;
+    DeviceMountManager::instance(ctx.slot).ioActive = false;
     wb->buffer.clear();
 }
 
@@ -309,11 +316,11 @@ static void flushWriteBuffer(DokanContext& ctx, WriteBuffer* wb) {
 static void flushAndRemoveWriteBuffer(DokanContext& ctx, const std::string& devPath) {
     std::unique_ptr<WriteBuffer> wb;
     {
-        std::lock_guard<std::mutex> lk(g_wbMutex);
-        auto it = g_writeBuffers.find(devPath);
-        if (it == g_writeBuffers.end()) return;
+        std::lock_guard<std::mutex> lk(ctx.writeMutex);
+        auto it = ctx.writeBuffers.find(devPath);
+        if (it == ctx.writeBuffers.end()) return;
         wb = std::move(it->second);
-        g_writeBuffers.erase(it);
+        ctx.writeBuffers.erase(it);
     }
     flushWriteBuffer(ctx, wb.get());
 }
@@ -334,9 +341,9 @@ static void DOKAN_CALLBACK FsCleanup(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFil
     if (DokanFileInfo->DeletePending && FileName) {
         std::string devPath = toDevicePath(FileName, ctx);
         LOG_INFO("Dokan", "Deleting: " + devPath);
-        DeviceMountManager::instance().ioActive = true;
+        DeviceMountManager::instance(ctx.slot).ioActive = true;
         ctx.device->deleteFile(devPath);
-        DeviceMountManager::instance().ioActive = false;
+        DeviceMountManager::instance(ctx.slot).ioActive = false;
         auto slash = devPath.rfind('/');
         if (slash != std::string::npos)
             ctx.invalidateDir(devPath.substr(0, slash));
@@ -379,9 +386,9 @@ static NTSTATUS DOKAN_CALLBACK FsMoveFile(
     std::string oldPath = toDevicePath(FileName, ctx);
     std::string newPath = toDevicePath(NewFileName, ctx);
 
-    DeviceMountManager::instance().ioActive = true;
+    DeviceMountManager::instance(ctx.slot).ioActive = true;
     bool ok = ctx.device->renameFile(oldPath, newPath);
-    DeviceMountManager::instance().ioActive = false;
+    DeviceMountManager::instance(ctx.slot).ioActive = false;
 
     if (!ok) return STATUS_ACCESS_DENIED;
 
@@ -403,9 +410,9 @@ static NTSTATUS DOKAN_CALLBACK FsWriteFile(
 
     // Try buffered write
     {
-        std::lock_guard<std::mutex> lk(g_wbMutex);
-        auto it = g_writeBuffers.find(devPath);
-        if (it != g_writeBuffers.end()) {
+        std::lock_guard<std::mutex> lk(ctx.writeMutex);
+        auto it = ctx.writeBuffers.find(devPath);
+        if (it != ctx.writeBuffers.end()) {
             auto* wb = it->second.get();
 
             // Flush if needed before writing
@@ -427,12 +434,12 @@ static NTSTATUS DOKAN_CALLBACK FsWriteFile(
     }
 
     // Fallback: direct write
-    DeviceMountManager::instance().ioActive = true;
+    DeviceMountManager::instance(ctx.slot).ioActive = true;
     DokanResetTimeout(60000, DokanFileInfo);
 
     uint64_t written = ctx.device->writeRange(devPath, (uint64_t)Offset,
                                                  Buffer, NumberOfBytesToWrite);
-    DeviceMountManager::instance().ioActive = false;
+    DeviceMountManager::instance(ctx.slot).ioActive = false;
 
     if (written == 0) {
         *NumberOfBytesWritten = 0;
@@ -457,7 +464,7 @@ static NTSTATUS DOKAN_CALLBACK FsReadFile(
         return STATUS_SUCCESS;
     }
 
-    DeviceMountManager::instance().ioActive = true;
+    DeviceMountManager::instance(ctx.slot).ioActive = true;
     DokanResetTimeout(60000, DokanFileInfo);
 
     // Fetch a larger chunk than requested for read-ahead
@@ -467,7 +474,7 @@ static NTSTATUS DOKAN_CALLBACK FsReadFile(
 
     uint64_t bytesRead = ctx.device->readRange(devPath, (uint64_t)Offset, (uint64_t)fetchSize, fetchBuf.data());
 
-    DeviceMountManager::instance().ioActive = false;
+    DeviceMountManager::instance(ctx.slot).ioActive = false;
 
     if (bytesRead == 0) {
         *ReadLength = 0;
@@ -571,19 +578,33 @@ static NTSTATUS DOKAN_CALLBACK FsGetDiskFreeSpace(
 }
 
 DeviceMountManager& DeviceMountManager::instance(int slot) {
-    static DeviceMountManager s[2];
-    s[0].m_slot = 0;
-    s[1].m_slot = 1;
-    return s[slot & 1];
+    static std::mutex mutex;
+    static std::unordered_map<int, std::unique_ptr<DeviceMountManager>> managers;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& manager = managers[slot];
+    if (!manager) {
+        manager.reset(new DeviceMountManager());
+        manager->m_slot = slot;
+    }
+    return *manager;
+}
+
+std::string DeviceMountManager::availableMountPoint() {
+    const DWORD occupied = GetLogicalDrives();
+    for (int offset = 0; offset < 23; ++offset) {
+        const int letter = 3 + (12 + offset) % 23;
+        if (!(occupied & (1u << letter))) return std::string(1, char('A' + letter)) + ":\\";
+    }
+    return {};
 }
 
 bool DeviceMountManager::mount(DeviceClient* device, const std::string& storageRoot,
                                 const std::string& mountPoint) {
     std::lock_guard<std::mutex> lk(m_mutex);
-    if (m_mounted) return false;
+    if (m_mounted || mountPoint.empty()) return false;
 
-    g_ctx[m_slot].device = device;
-    g_ctx[m_slot].storageRoot = storageRoot;
+    contextForSlot(m_slot).device = device;
+    contextForSlot(m_slot).storageRoot = storageRoot;
     m_mountPoint = mountPoint;
 
     // Convert mount point to wide string
@@ -598,7 +619,7 @@ bool DeviceMountManager::mount(DeviceClient* device, const std::string& storageR
         options.Options = DOKAN_OPTION_CURRENT_SESSION;
         options.SingleThread = FALSE;
         options.Timeout = 60000; // 60s timeout
-        options.GlobalContext = (ULONG64)m_slot;
+        options.GlobalContext = reinterpret_cast<ULONG64>(&contextForSlot(m_slot));
 
         DOKAN_OPERATIONS ops = {};
         ops.ZwCreateFile = FsCreateFile;
@@ -624,7 +645,7 @@ bool DeviceMountManager::mount(DeviceClient* device, const std::string& storageR
         if (result == DOKAN_SUCCESS) {
             m_dokanInstance = instance;
             m_mounted = true;
-            LOG_INFO("Dokan", "Mounted: " + g_ctx[m_slot].storageRoot + " -> " + m_mountPoint);
+            LOG_INFO("Dokan", "Mounted: " + contextForSlot(m_slot).storageRoot + " -> " + m_mountPoint);
 
             // Wait until unmount
             DokanWaitForFileSystemClosed(instance, INFINITE);
