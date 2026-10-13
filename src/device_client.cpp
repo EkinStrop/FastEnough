@@ -1568,22 +1568,23 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
         std::atomic<bool>& active;
         ~ConnectActivityReset() { active = false; }
     } connectActivityReset{m_startServerActive};
-    bool canReuseConnection = m_connected && m_serial == serial &&
-        (!useRoot || (m_useRoot && m_serverIsRoot));
-    m_useRoot = useRoot;
+    bool changingPrivilege = m_connected && m_serial == serial && m_serverIsRoot != useRoot;
+    bool canReuseConnection = m_connected && m_serial == serial && m_serverIsRoot == useRoot;
     LOG_INFO("Server", std::string("startServer(serial=") + serial + " prefer=" + (preferAdbForward ? "ADBForward" : "DirectTCP") + " root=" + (useRoot ? "Y" : "N") + ") begin");
     if (canReuseConnection) {
+        m_useRoot = useRoot;
         LOG_INFO("Server", "Already connected to " + serial + " with the requested privilege mode");
         return true;
     }
     if (m_connected && m_serial == serial && useRoot)
         LOG_INFO("Server", "Existing helper is not verified as root, replacing it");
-    if (m_useRoot && !isRootAvailable(serial)) {
+    if (useRoot && !isRootAvailable(serial)) {
         m_lastError = "Root access is not available or was denied. Check that this device is rooted and grant root access to ADB in Magisk or KernelSU.";
         LOG_ERROR("Server", m_lastError);
         m_statusText = "ERROR: " + m_lastError;
         return false;
     }
+    m_useRoot = useRoot;
 
     // If we previously had a connection to this device that died, kill the old server
     // so it releases its dead client socket and can accept new connections
@@ -1600,8 +1601,8 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
     int launchPort = m_localPort == AFM_PORT ? AFM_PORT : m_localPort;
     m_serverPort = AFM_PORT;
 
-    if (m_useRoot) {
-        LOG_INFO("Server", "Root mode requested - restarting helper as root");
+    if (m_useRoot || changingPrivilege) {
+        LOG_INFO("Server", "Restarting helper with the requested privilege mode");
         stopDeviceServerProcesses(serial);
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
@@ -1632,8 +1633,8 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
     std::string deviceIp = detectDeviceIp(serial);
     LOG_INFO("Server", "detectDeviceIp -> '" + deviceIp + "'");
     if (deviceIp.empty() && !savedIp.empty()) { deviceIp = savedIp; LOG_INFO("Server", "Using savedIp: " + savedIp); }
-    if (m_useRoot) {
-        LOG_INFO("Server", "Skipping existing-server probe (root restart required)");
+    if (m_useRoot || changingPrivilege) {
+        LOG_INFO("Server", "Skipping existing-server probe for privilege change");
     } else if (!deviceIp.empty() && !preferAdbForward) {
         LOG_INFO("Server", "Step 1a: Trying existing server via Direct TCP (" + deviceIp + ")");
         m_statusText = "Trying Direct TCP (" + deviceIp + ")...";
@@ -1650,7 +1651,7 @@ bool DeviceClient::startServer(const std::string& serial, bool preferAdbForward,
         LOG_WARN("Server", "No device IP available, skipping direct TCP");
     }
 
-    if (!m_useRoot) {
+    if (!m_useRoot && !changingPrivilege) {
         LOG_INFO("Server", "Step 1b: Trying existing server via ADB Forward");
         m_statusText = "Trying ADB Forward...";
         runAdbCommand("-s " + serial + " forward --remove tcp:" + std::to_string(m_localPort));
@@ -2065,7 +2066,7 @@ bool DeviceClient::connectParallelFrom(const DeviceClient& source) {
     m_adbPath = source.m_adbPath;
     m_serial = source.m_serial;
     m_useRoot = source.m_useRoot;
-    m_serverIsRoot = source.m_serverIsRoot;
+    m_serverIsRoot = source.m_serverIsRoot.load();
     m_directConnection = source.m_directConnection;
     m_deviceIp = source.m_deviceIp;
     m_serverPort = source.m_serverPort;

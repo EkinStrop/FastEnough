@@ -18,7 +18,12 @@ enum class Appearance { Quiet, Secondary, Primary, Selected };
 inline ImFont* semiboldFont=nullptr;
 inline ImFont* connectionHeadingFont=nullptr;
 
-inline float scale() { return ImGui::GetFontSize() / 14.0f; }
+inline float layoutScale = 1.0f;
+inline float scale() { return layoutScale; }
+inline float textScale() { return ImGui::GetFontSize() / 14.0f; }
+inline float controlHeight(float height = 32.0f) {
+    return std::max(height * scale(), ImGui::GetFontSize() + 8.0f * scale());
+}
 
 template<typename T>
 inline std::optional<T> endDropTargetChild(const char* payloadType, bool enabled) {
@@ -121,7 +126,7 @@ inline void drawTextClipped(ImVec2 position, const std::string& text, float widt
     if (width <= 0) return;
     if (fontSize<=0) fontSize=ImGui::GetFontSize();
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->PushClipRect(position, ImVec2(position.x + width, position.y + ImGui::GetTextLineHeight()), true);
+    draw->PushClipRect(position, ImVec2(position.x + width, position.y + fontSize), true);
     if (ImGui::GetFont()->CalcTextSizeA(fontSize,FLT_MAX,0,text.c_str()).x <= width+1.0f) {
         draw->AddText(ImGui::GetFont(),fontSize,position,color,text.c_str());
     } else {
@@ -146,7 +151,8 @@ inline bool button(const char* label, Icon glyph = Icon::None,
     float gap = iconWidth > 0 && !visible.empty() ? 7.0f*s : 0.0f;
     ImVec2 textSize = ImGui::CalcTextSize(visible.c_str());
     if (size.x == 0) size.x = textSize.x + iconWidth + gap + 20.0f*s;
-    if (size.y == 0) size.y = 32.0f*s;
+    if (size.y == 0) size.y = controlHeight();
+    if (!visible.empty()) size.y = std::max(size.y, textSize.y + 8.0f*s);
     ImVec4 fill = style.Colors[ImGuiCol_Button];
     ImVec4 text = style.Colors[ImGuiCol_Text];
     if (appearance == Appearance::Quiet) { fill.w=0; text=style.Colors[ImGuiCol_TextDisabled]; }

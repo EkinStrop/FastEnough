@@ -113,10 +113,10 @@ public:
     // Server lifecycle
     bool startServer(const std::string& serial, bool preferAdbForward = false, bool useRoot = false);
 
-    // Set/get whether the server should be launched and killed via `su -c`.
-    // Caller should restart the server after changing this.
+    // Change the requested privilege mode before restarting the helper.
     void setUseRoot(bool on) { m_useRoot = on; }
-    bool useRoot() const { return m_useRoot && m_serverIsRoot; }
+    // Report the privileges verified by the connected helper.
+    bool useRoot() const { return m_connected && m_serverIsRoot; }
     // Probe whether `su -c id` returns uid=0 on the given device.
     bool isRootAvailable(const std::string& serial);
     std::vector<InstalledAppEntry> listInstalledApps(const std::string& serial, bool includeSystem = true);
@@ -338,7 +338,7 @@ private:
     // When true, the server is launched and killed via `su -c` so it runs as
     // root and can access paths the shell user can't reach.
     bool m_useRoot = false;
-    bool m_serverIsRoot = false;
+    std::atomic<bool> m_serverIsRoot{false};
     bool m_ownsServer = true;
 
     // Reusable transfer buffer — avoids per-chunk heap allocation

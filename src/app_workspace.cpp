@@ -60,7 +60,33 @@ std::string App::panelDisplayName(const FilePanel& panel) const {
 bool App::panelAvailable(const FilePanel& panel) const {
     if (panel.isConnections || !panel.pendingDeviceSerial.empty()) return false;
     return !panel.isAndroid && !panel.isApps ||
-        (deviceSession(panel.deviceSlot).connected && deviceSession(panel.deviceSlot).client.isServerRunning());
+        (deviceSession(panel.deviceSlot).connected && !deviceSession(panel.deviceSlot).rootRequestPending &&
+            deviceSession(panel.deviceSlot).client.isServerRunning());
+}
+
+void App::renderDeviceRootButton(int slot, FilePanel* panel) {
+    auto& session = deviceSession(slot);
+    bool pending = session.rootRequestPending;
+    bool root = session.connected && session.client.useRoot();
+    bool canChange = canChangeDeviceRoot(slot);
+    ImGui::BeginDisabled(pending || (!root && !canChange));
+    const char* hint = pending ? "Approve the root request on your phone." :
+        root ? "Root access is active. Browse the filesystem or disable root." :
+        canChange ? "Request root access on this device and open /. The phone must already be rooted." :
+        "Connect the device, finish its transfers and unmount its drive before changing root access.";
+    if (ui::button(pending ? "ROOT..." : root ? "ROOT ON" : "ROOT", ui::Icon::None,
+            root ? ui::Appearance::Selected : ui::Appearance::Secondary, ImVec2(0, ui::controlHeight()), hint)) {
+        if (root) ImGui::OpenPopup("##RootActions");
+        else requestDeviceRoot(slot, true, panel);
+    }
+    ImGui::EndDisabled();
+    if (ImGui::BeginPopup("##RootActions")) {
+        ImGui::TextUnformatted("Root access is active");
+        ImGui::Separator();
+        if (panel && ImGui::MenuItem("Open filesystem /")) navigateToDirectory(*panel, "/");
+        if (ImGui::MenuItem("Disable root access", nullptr, false, canChange)) requestDeviceRoot(slot, false);
+        ImGui::EndPopup();
+    }
 }
 
 void App::renderWorkspaceHeader() {
@@ -68,9 +94,9 @@ void App::renderWorkspaceHeader() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16*s,8*s));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0);
     ImGui::PushStyleColor(ImGuiCol_ChildBg,ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
-    ImGui::BeginChild("##WorkspaceHeader", ImVec2(0,48*s), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_AlwaysUseWindowPadding);
+    ImGui::BeginChild("##WorkspaceHeader", ImVec2(0,ui::controlHeight()+16*s), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_AlwaysUseWindowPadding);
     ui::button("F##Brand", ui::Icon::None, ui::Appearance::Selected, ImVec2(28*s,32*s));
-    if (ImGui::GetWindowWidth() > 760*s) {
+    if (ImGui::GetWindowWidth() > 760*ui::textScale()) {
         ImGui::SameLine(0,10*s); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Fast Enough");
     }
     ImGui::SameLine(0,24*s);
@@ -119,6 +145,8 @@ void App::renderWorkspaceHeader() {
     int ready=0;
     for (int i=0;i < deviceSessionCount();++i) if (deviceSession(i).connected&&deviceSession(i).client.isServerRunning()) ++ready;
     std::string deviceLabel=std::to_string(ready)+(ready==1?" phone ready":" phones ready");
+    if (ImGui::GetContentRegionAvail().x < ImGui::CalcTextSize(deviceLabel.c_str()).x+156*s)
+        deviceLabel=std::to_string(ready);
     float rightWidth=ImGui::CalcTextSize(deviceLabel.c_str()).x+132*s;
     ImGui::SameLine(std::max(ImGui::GetItemRectMax().x-ImGui::GetWindowPos().x+12*s,ImGui::GetWindowWidth()-rightWidth));
     if (ui::button((deviceLabel+"##Devices").c_str(),ui::Icon::Phone)) ImGui::OpenPopup("##WorkspaceDevices");
@@ -158,11 +186,11 @@ void App::renderWorkspaceToolbar() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(16*s,6*s));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,0);
     ImGui::PushStyleColor(ImGuiCol_ChildBg,ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
-    ImGui::BeginChild("##WorkspaceToolbar",ImVec2(0,44*s),ImGuiChildFlags_None,ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_AlwaysUseWindowPadding);
+    ImGui::BeginChild("##WorkspaceToolbar",ImVec2(0,ui::controlHeight()+12*s),ImGuiChildFlags_None,ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_AlwaysUseWindowPadding);
     ImGui::AlignTextToFramePadding();
     std::string selection=hasSelection?std::to_string(source.selectedIndices.size())+" selected, "+formatSize(source.selectedFileSize()):"Select files to copy";
-    bool wide=ImGui::GetWindowWidth()>980*s;
-    ui::textClipped(selection,(wide?150.0f:110.0f)*s,ImGui::GetColorU32(ImGuiCol_TextDisabled),32*s);
+    bool wide=ImGui::GetWindowWidth()>980*ui::textScale();
+    ui::textClipped(selection,(wide?150.0f:110.0f)*s,ImGui::GetColorU32(ImGuiCol_TextDisabled),ui::controlHeight());
     ImGui::SameLine(0,10*s);
     ImGui::BeginDisabled(!canTransfer);
     std::string name=panelDisplayName(destination);
@@ -230,19 +258,31 @@ void App::renderPaneHeader(FilePanel& panel, PanelSide side) {
     }
     ImVec2 origin=ImGui::GetCursorScreenPos();
     float width=ImGui::GetContentRegionAvail().x;
-    if(ui::button("##PaneLocation",ui::Icon::None,ui::Appearance::Quiet,ImVec2(width-40*s,44*s),"Choose a location"))
+    bool showRoot = panel.isAndroid && !panel.isApps && !panel.isConnections && panel.pendingDeviceSerial.empty();
+    float rootWidth = showRoot ? ImGui::CalcTextSize(deviceSession(panel.deviceSlot).rootRequestPending ? "ROOT..." :
+        deviceSession(panel.deviceSlot).client.useRoot() ? "ROOT ON" : "ROOT").x + 28*s : 0;
+    float headerHeight = std::max(44*s, ImGui::GetFontSize() + 12*ui::textScale() + 14*s);
+    if (showRoot && deviceSession(panel.deviceSlot).rootRequestPending) caption = "Changing root access...";
+    float locationWidth = std::max(40*s, width - 40*s - rootWidth);
+    if(ui::button("##PaneLocation",ui::Icon::None,ui::Appearance::Quiet,ImVec2(locationWidth,headerHeight),"Choose a location"))
         ImGui::OpenPopup("##PaneLocationMenu");
     auto* draw=ImGui::GetWindowDrawList();
     draw->AddRectFilled(ImVec2(origin.x,origin.y+5*s),ImVec2(origin.x+32*s,origin.y+39*s),ImGui::GetColorU32(ImGuiCol_Button),6*s);
     ui::icon(panel.isAndroid||panel.isApps||panel.isConnections?ui::Icon::Phone:ui::Icon::Computer,
         ImVec2(origin.x+6*s,origin.y+11*s),20*s,ImGui::GetColorU32(ImGuiCol_TextDisabled));
-    float textWidth=std::max(20*s,width-102*s);
+    float textWidth=std::max(1.0f,locationWidth-62*s);
     if(ui::semiboldFont)ImGui::PushFont(ui::semiboldFont);
     ui::drawTextClipped(ImVec2(origin.x+44*s,origin.y+4*s),title,textWidth,ImGui::GetColorU32(ImGuiCol_Text));
     float arrowX=origin.x+44*s+std::min(textWidth,ImGui::CalcTextSize(title.c_str()).x)+6*s;
     if(ui::semiboldFont)ImGui::PopFont();
     ui::icon(ui::Icon::Down,ImVec2(arrowX,origin.y+4*s),14*s,ImGui::GetColorU32(ImGuiCol_TextDisabled));
-    ui::drawTextClipped(ImVec2(origin.x+44*s,origin.y+25*s),caption,width-88*s,ImGui::GetColorU32(ImGuiCol_TextDisabled),12*s);
+    ui::drawTextClipped(ImVec2(origin.x+44*s,origin.y+ImGui::GetFontSize()+11*s),caption,
+        std::max(1.0f,locationWidth-48*s),ImGui::GetColorU32(ImGuiCol_TextDisabled),12*ui::textScale());
+    if (showRoot) {
+        ImGui::SameLine(0,8*s);
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + locationWidth + 8*s, origin.y + (headerHeight-ui::controlHeight())*0.5f));
+        renderDeviceRootButton(panel.deviceSlot, &panel);
+    }
     ImGui::SameLine(0,8*s);
     ImGui::SetCursorPosY(ImGui::GetCursorPosY()+6*s);
     if(ui::button("##PaneInfo",ui::Icon::Info,ui::Appearance::Quiet,ImVec2(32*s,32*s),panel.isAndroid||panel.isApps?"Device details":"Local file details")) {
@@ -278,10 +318,11 @@ void App::renderPaneHeader(FilePanel& panel, PanelSide side) {
 
 void App::renderPaneNavigation(FilePanel& panel) {
     const float s=ui::scale();
+    const float height=std::max(ui::controlHeight(28), ImGui::GetFrameHeight());
     bool requestEdit=m_lastFocusedPanel==&panel && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_L);
     if(requestEdit){panel.editingPath=true;panel.pathFocusRequested=true;strcpy_s(panel.pathInput,panel.currentPath.c_str());}
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
-    ImGui::BeginChild("##PaneNavigation",ImVec2(0,28*s),ImGuiChildFlags_None,ImGuiWindowFlags_NoScrollbar);
+    ImGui::BeginChild("##PaneNavigation",ImVec2(0,height),ImGuiChildFlags_None,ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleVar();
     auto history=[&](int step) {
         panel.navHistoryPos+=step;panel.currentPath=panel.navHistory[panel.navHistoryPos];
@@ -346,9 +387,10 @@ void App::renderPaneNavigation(FilePanel& panel) {
 float App::transferDockHeight() {
     const float s=ui::scale();
     std::lock_guard<std::mutex> lock(m_batchMutex);
-    if(m_batchQueue.empty()||!m_prefs.transferDockExpanded) return 38*s;
+    if(m_batchQueue.empty()||!m_prefs.transferDockExpanded) return ui::controlHeight()+10*s;
     bool conflict=std::any_of(m_batchQueue.begin(),m_batchQueue.end(),[](const auto& batch){return batch->waitingConflict.load();});
-    return ((m_showTransferChannels?216.0f:132.0f)+(conflict?20.0f:0.0f))*s;
+    return ((m_showTransferChannels?216.0f:132.0f)+(conflict?20.0f:0.0f))*s +
+        std::max(0.0f, ImGui::GetFontSize()-14*s)*(m_showTransferChannels?9:6);
 }
 
 void App::renderTransferDock(float height) {
@@ -501,6 +543,8 @@ void App::renderWorkspaceDrawer() {
             }
             bool connected=deviceSession(slot).connected&&deviceSession(slot).client.isServerRunning();
             ImGui::TextDisabled("%s",connected?"Connected":"Disconnected");
+            ImGui::Spacing();
+            renderDeviceRootButton(slot);
             ImGui::Spacing();ImGui::TextDisabled("Connection");
             ImGui::TextWrapped("%s",deviceSession(slot).client.isDirectConnection()?"Direct connection":"ADB connection");
             if(slot==0&&m_dualChannelAvailable)ImGui::TextDisabled("Additional connection: %s",m_secondaryChannelType.c_str());
@@ -517,7 +561,7 @@ void App::renderWorkspaceDrawer() {
             }
             ImGui::Spacing();ImGui::Separator();ImGui::Spacing();ImGui::TextDisabled("Windows integration");
             auto& mount=DeviceMountManager::instance(slot);
-            ImGui::BeginDisabled(!connected||m_asyncBusy);
+            ImGui::BeginDisabled(!connected||m_asyncBusy||deviceSession(slot).rootRequestPending);
             if(mount.isMounted()) {
                 if(ui::button("Open mounted drive",ui::Icon::Computer,ui::Appearance::Secondary)) {
                     auto path=workspaceWide(mount.mountPoint());ShellExecuteW(nullptr,L"explore",path.c_str(),nullptr,nullptr,SW_SHOWNORMAL);

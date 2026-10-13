@@ -7,7 +7,7 @@ inline ImVec4 rgb(int r, int g, int b) {
 }
 
 struct PanelStyle {
-    float s = ui::scale();
+    float s = ui::textScale();
     ImVec4 background, surface, raised, border, text, muted, blue, green, red, gold;
 
     explicit PanelStyle(bool light) {

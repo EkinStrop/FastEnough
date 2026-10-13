@@ -378,6 +378,7 @@ struct AppPreferences {
 // --- Theme (persisted to disk) ---
 struct AppTheme {
     float userScale = 1.0f;  // user scale multiplier on top of system DPI
+    float fontScale = 1.0f;
     int mode = 0; // 0=follow Windows, 1=dark, 2=light
     ImVec4 gradientPrimary = ImVec4(0.20f, 0.58f, 1.00f, 1.00f);
     ImVec4 gradientSecondary = ImVec4(0.48f, 0.26f, 0.92f, 1.00f);
@@ -404,6 +405,7 @@ public:
     float m_pendingScale = -1.0f;   // >0 means applyScale deferred to next frame
     bool m_themeNeedsReposition = false; // force re-center theme window after scale change
     float m_scalePreview = -1.0f;       // slider preview value (not yet applied)
+    float m_fontScalePreview = -1.0f;
 
     // External drag-and-drop (Explorer <-> App)
     void handleExternalFileDrop(const std::vector<std::string>& paths, int mouseX, int mouseY);
@@ -439,6 +441,13 @@ private:
         bool saveDeviceSessions = false;
         bool deviceSessionReady = false;
         int readyDeviceSlot = -1;
+        bool rootRequestFinished = false;
+        int rootSlot = -1;
+        std::string rootSerial;
+        bool rootEnabled = false;
+        bool rootModeChanged = false;
+        FilePanel* rootPanel = nullptr;
+        uint64_t rootPanelGeneration = 0;
         bool connectionRequestFinished = false;
         std::string connectionSerial;
         int connectionSlot = -1;
@@ -515,6 +524,9 @@ private:
     std::string deviceDisplayName(int slot) const;
     std::string panelDisplayName(const FilePanel& panel) const;
     bool panelAvailable(const FilePanel& panel) const;
+    bool canChangeDeviceRoot(int slot);
+    void requestDeviceRoot(int slot, bool enabled, FilePanel* panel = nullptr);
+    void renderDeviceRootButton(int slot, FilePanel* panel = nullptr);
     void startWorkspaceTransfer(bool move);
     bool modernButton(const char* label, const ImVec2& size = ImVec2(0, 0));
     bool modernSmallButton(const char* label);
@@ -628,6 +640,7 @@ private:
         std::string storageRoot;
         std::vector<std::string> volumes;
         std::atomic<bool> connected{false};
+        std::atomic<bool> rootRequestPending{false};
         std::chrono::steady_clock::time_point retryAfter{};
         std::chrono::steady_clock::time_point lastHealthCheck{};
         std::chrono::steady_clock::time_point missingSince{};

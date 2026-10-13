@@ -1286,6 +1286,7 @@ void AppTheme::save() {
     if (!f) return;
     f << "[Theme]\n";
     f << "userScale=" << userScale << "\n";
+    f << "fontScale=" << fontScale << "\n";
     f << "mode=" << mode << "\n";
     f << "gradientPrimary=" << gradientPrimary.x << "," << gradientPrimary.y << ","
       << gradientPrimary.z << "," << gradientPrimary.w << "\n";
@@ -1314,6 +1315,10 @@ void AppTheme::load() {
             userScale = std::stof(line.substr(10));
             if (userScale < 0.5f) userScale = 0.5f;
             if (userScale > 3.0f) userScale = 3.0f;
+        } else if (line.find("fontScale=") == 0) {
+            float value = 1.0f;
+            if (sscanf(line.c_str() + 10, "%f", &value) == 1 && std::isfinite(value))
+                fontScale = std::clamp(value, 0.75f, 2.0f);
         } else if (line.find("mode=") == 0) {
             mode = std::clamp(std::stoi(line.substr(5)), 0, 2);
             hasAdaptiveThemeSettings = true;
@@ -1585,6 +1590,31 @@ void App::drainUiMessages() {
             }
         }
         if (message.hasWifiPairing) applyWifiPairingResult(message);
+        if (message.rootRequestFinished) {
+            auto& session = deviceSession(message.rootSlot);
+            if (session.serial == message.rootSerial) {
+                m_prefs.setRootEnabledForSerial(deviceIdentity(message.rootSerial), message.rootEnabled);
+                m_prefs.save();
+                if (message.rootModeChanged) {
+                    for (auto& view : session.views) view.reset();
+                    for (FilePanel* panel : {&m_leftPanel, &m_rightPanel}) {
+                        if (!panel->isAndroid || panel->deviceSlot != message.rootSlot || !panel->pendingDeviceSerial.empty()) continue;
+                        bool openRoot = message.rootEnabled && panel == message.rootPanel &&
+                            panel->listingGeneration == message.rootPanelGeneration;
+                        ++panel->listingGeneration;
+                        panel->refreshInProgress = false;
+                        panel->selectedIndices.clear();
+                        panel->needsRefresh = true;
+                        if (openRoot || !message.rootEnabled) {
+                            panel->insideMcraw = false;
+                            panel->mcrawFilePath.clear();
+                            navigateToDirectory(*panel, openRoot ? "/" : session.storageRoot);
+                        }
+                    }
+                }
+            }
+            session.rootRequestPending = false;
+        }
         if (message.connectionRequestFinished) {
             if (m_connectionPendingSerial == message.connectionSerial) m_connectionPendingSerial.clear();
             m_connectionFeedback = message.status;
@@ -2003,6 +2033,7 @@ void App::render() {
     bool panelsRefreshed = false;
     auto refreshPanel = [&](FilePanel& panel) {
         if (!panel.needsRefresh) return;
+        if ((panel.isAndroid || panel.isApps) && deviceSession(panel.deviceSlot).rootRequestPending) return;
         if (!panel.pendingDeviceSerial.empty()) return;
         if (panel.isConnections) {
             panel.needsRefresh = false;
@@ -2119,10 +2150,11 @@ void App::render() {
     ImGui::Begin("##MainWindow", nullptr, mainFlags);
     ImGui::PopStyleVar(4);
     renderWorkspaceHeader();
-    ImGui::SetCursorPosY(48*s);
+    const float headerHeight = ui::controlHeight()+16*s;
+    ImGui::SetCursorPosY(headerHeight);
     if (!m_showBackupManager && !m_showAppsWorkspace && !m_showConnectionsWorkspace) {
         renderWorkspaceToolbar();
-        ImGui::SetCursorPosY(92*s);
+        ImGui::SetCursorPosY(headerHeight+ui::controlHeight()+12*s);
         if (m_compareEnabled) {
             ImGui::BeginChild("##CompareControls", ImVec2(0, 72*s));
             renderCompareToolbar();
@@ -2130,7 +2162,7 @@ void App::render() {
         }
     }
     float dockHeight = transferDockHeight();
-    float statusHeight = 28*s;
+    float statusHeight = std::max(28*s, ImGui::GetFontSize()+10*s);
     float bodyY = ImGui::GetCursorPosY()+8*s;
     float bodyHeight = std::max(120*s, vp->WorkSize.y-bodyY-dockHeight-statusHeight-8*s);
     ImGui::SetCursorPosY(bodyY);
@@ -2313,7 +2345,7 @@ void App::render() {
                             if (m_device.connectDirect(connectIp)) {
                                 m_statusMessage = "Direct TCP: " + connectIp;
                             } else {
-                                m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
+                                m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(deviceIdentity(ser)));
                                 m_statusMessage = "Failed to connect to " + connectIp;
                             }
                             m_statusTime = std::chrono::steady_clock::now();
@@ -2363,7 +2395,7 @@ void App::render() {
                 if (m_device.connectDirect(connectIp)) {
                     m_statusMessage = "Direct TCP: " + connectIp;
                 } else {
-                    if (!ser.empty()) m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
+                    if (!ser.empty()) m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(deviceIdentity(ser)));
                     m_statusMessage = "Failed to connect to " + connectIp;
                 }
                 m_statusTime = std::chrono::steady_clock::now();
@@ -2386,7 +2418,7 @@ void App::render() {
                     } else {
                         m_device.disconnectTcp();
                         m_statusMessage = "ADB Forward failed — reconnecting...";
-                        m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
+                        m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(deviceIdentity(ser)));
                     }
                     m_statusTime = std::chrono::steady_clock::now();
                 });
@@ -2600,7 +2632,7 @@ void App::renderMenuBar() {
                             } else {
                                 m_device.disconnectTcp();
                                 m_statusMessage = "ADB Forward failed";
-                                m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(ser));
+                                m_device.startServer(ser, m_preferAdbForward, m_prefs.rootEnabledForSerial(deviceIdentity(ser)));
                             }
                             m_statusTime = std::chrono::steady_clock::now();
                         });
@@ -2746,7 +2778,7 @@ void App::renderMenuBar() {
                     postAsync("Reconnecting server...", [this, ser, preferForward]() {
                         LOG_INFO("UI", std::string("Manual reconnect (prefer ") + (preferForward ? "ADB Forward" : "Direct TCP") + ")");
                         m_device.stopServer();
-                        bool useRoot = m_prefs.rootEnabledForSerial(ser);
+                        bool useRoot = m_prefs.rootEnabledForSerial(deviceIdentity(ser));
                         m_device.startServer(ser, preferForward, useRoot);
                         m_statusMessage = m_device.isServerRunning()
                             ? ("Reconnected via " + std::string(m_device.isDirectConnection() ? "Direct TCP" : "ADB Forward"))
@@ -3432,60 +3464,10 @@ void App::renderDeviceBar() {
                         ImGui::SetTooltip("Parallel direct TCP connections over WiFi. Higher values can help WiFi 6/7 devices.\nApplies on next device reconnect or transfer channel setup.");
                 }
 
-                // Root mode toggle — relaunches the on-device server via `su -c`
                 ImGui::Spacing();
                 {
-                    std::string ser = devSnap[selSnap].serial;
-                    bool rootOn = m_prefs.rootEnabledForSerial(ser);
-                    if (ImGui::Checkbox("Root##devbar", &rootOn)) {
-                        if (rootOn) {
-                            // Probe root availability before committing.
-                            postAsync("Checking root access...", [this, ser]() {
-                                bool hasRoot = m_device.isRootAvailable(ser);
-                                if (!hasRoot) {
-                                    std::string msg = "Root is not available for this device, or the root request was denied.\n\n"
-                                        "Check that the device is rooted and that ADB has been granted root access in Magisk, KernelSU, or your root manager. Then enable Root again for this device.";
-                                    showNotification("Root Access Unavailable", msg, true);
-                                    m_statusMessage = "Root not available or not granted";
-                                    m_statusTime = std::chrono::steady_clock::now();
-                                    return;
-                                }
-                                m_prefs.setRootEnabledForSerial(ser, true);
-                                m_prefs.save();
-                                m_device.disconnectTcp();
-                                if (m_device.startServer(ser, m_preferAdbForward, true)) {
-                                    m_statusMessage = "Root access enabled";
-                                    m_leftPanel.needsRefresh = true;
-                                    m_rightPanel.needsRefresh = true;
-                                } else {
-                                    std::string msg = "Root access was requested, but the device helper could not start as root.\n\n"
-                                        "Check that root access is granted to ADB for this device, then enable Root again.\n\n"
-                                        "Details: " + m_device.lastError();
-                                    showNotification("Root Startup Failed", msg, true);
-                                    m_statusMessage = "Root server start failed: " + m_device.lastError();
-                                    m_prefs.setRootEnabledForSerial(ser, false);
-                                    m_prefs.save();
-                                }
-                                m_statusTime = std::chrono::steady_clock::now();
-                            });
-                        } else {
-                            m_prefs.setRootEnabledForSerial(ser, false);
-                            m_prefs.save();
-                            postAsync("Disabling root...", [this, ser]() {
-                                m_device.disconnectTcp();
-                                if (m_device.startServer(ser, m_preferAdbForward, false)) {
-                                    m_statusMessage = "Root access disabled";
-                                    m_leftPanel.needsRefresh = true;
-                                    m_rightPanel.needsRefresh = true;
-                                } else {
-                                    m_statusMessage = "Restart failed: " + m_device.lastError();
-                                }
-                                m_statusTime = std::chrono::steady_clock::now();
-                            });
-                        }
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Run this device's helper as root via `su -c`.\nRequires a rooted device and granted ADB root permission.\nSaved separately for each device.");
+                    int slot = m_deviceSessions.find(deviceIdentity(devSnap[selSnap].serial));
+                    if (slot >= 0) renderDeviceRootButton(slot);
                 }
 
                 // WiFi auto-connect toggle
@@ -3898,6 +3880,14 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
     }
 
     renderPaneHeader(panel, side);
+    if (panel.isAndroid && deviceSession(panel.deviceSlot).rootRequestPending) {
+        ImGui::BeginDisabled();
+        renderPaneNavigation(panel);
+        ImGui::EndDisabled();
+        ImGui::Spacing();
+        ImGui::TextWrapped("Changing root access. If your phone asks for permission, approve the ADB root request.");
+        return;
+    }
     if (!panel.pendingDeviceSerial.empty()) {
         ImGui::BeginDisabled();
         renderPaneNavigation(panel);
@@ -3953,7 +3943,7 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
     ImGui::SameLine(0,4*ui::scale());
     if(ui::button("##RefreshFolder",ui::Icon::Refresh,ui::Appearance::Quiet,ImVec2(28*ui::scale(),28*ui::scale()),"Refresh folder"))panel.needsRefresh=true;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
-    ImGui::BeginChild("##FolderShortcuts",ImVec2(0,26*ui::scale()),ImGuiChildFlags_None,ImGuiWindowFlags_NoScrollbar);
+    ImGui::BeginChild("##FolderShortcuts",ImVec2(0,ui::controlHeight(26)),ImGuiChildFlags_None,ImGuiWindowFlags_NoScrollbar);
     renderFavoritesBar(panel, side);
     ImGui::EndChild();
     ImGui::PopStyleVar();
@@ -3969,12 +3959,12 @@ void App::renderPanel(FilePanel& panel, PanelSide side) {
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Sortable;
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * directoryContentAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(10*ui::scale(),(m_prefs.compactRows?3.0f:6.0f)*ui::scale()));
-    ImVec2 tableSize(0,std::max(40.0f,ImGui::GetContentRegionAvail().y-28*ui::scale()));
+    ImVec2 tableSize(0,std::max(40.0f,ImGui::GetContentRegionAvail().y-std::max(28*ui::scale(),ImGui::GetFontSize()+12*ui::scale())));
     if (ImGui::BeginTable(("##FilesV2" + std::string(label)).c_str(), 3, tf, tableSize)) {
         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_DefaultSort, 1.0f);
-        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 66*ui::scale());
-        ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_WidthFixed, 128*ui::scale());
-        ImGui::TableSetColumnEnabled(2,ImGui::GetWindowWidth()>420*ui::scale());
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 66*ui::textScale());
+        ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_WidthFixed, 128*ui::textScale());
+        ImGui::TableSetColumnEnabled(2,ImGui::GetWindowWidth()>420*ui::textScale());
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
 
@@ -5960,7 +5950,7 @@ void App::startBackupManagerBackup() {
                 }
             }
             if (requiresRoot) {
-                m_prefs.setRootEnabledForSerial(serial, true);
+                m_prefs.setRootEnabledForSerial(deviceIdentity(serial), true);
                 m_prefs.save();
             }
             if (!slotClient.isServerRunning()) {
@@ -6598,7 +6588,7 @@ void App::startBackupManagerRestorePaths(std::vector<std::string> backups) {
                 }
             }
             if (requiresRoot) {
-                m_prefs.setRootEnabledForSerial(serial, true);
+                m_prefs.setRootEnabledForSerial(deviceIdentity(serial), true);
                 m_prefs.save();
             }
             DeviceClient& restoreWorkClient = slotClient.isServerRunning() ? slotClient : restoreClient;
@@ -9327,7 +9317,8 @@ void App::applyScale(float newScale) {
     io.Fonts->Clear();
 
     float effectiveScale = m_systemDpiScale * newScale;
-    float fontSize = 14.0f * effectiveScale;
+    ui::layoutScale = effectiveScale;
+    float fontSize = 14.0f * effectiveScale * m_theme.fontScale;
 
     ImFontConfig fontCfg;
     fontCfg.OversampleH = 3;
@@ -9407,9 +9398,11 @@ void App::renderThemeWindow() {
     }
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImVec2 vpSize = ImGui::GetMainViewport()->Size;
-    float winH = std::min(600.0f, vpSize.y * 0.85f);
-    ImGui::SetNextWindowSize(ImVec2(500, winH), sizeCond);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(400, 300), ImVec2(vpSize.x * 0.9f, vpSize.y * 0.9f));
+    float winH = std::min(720.0f * ui::scale(), vpSize.y * 0.85f);
+    float winW = std::min(std::max(560.0f * ui::scale(), 380.0f * ui::textScale()), vpSize.x * 0.9f);
+    ImGui::SetNextWindowSize(ImVec2(winW, winH), sizeCond);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(std::min(400.0f * ui::scale(), vpSize.x * 0.9f),
+        std::min(300.0f * ui::scale(), vpSize.y * 0.9f)), ImVec2(vpSize.x * 0.9f, vpSize.y * 0.9f));
     ImGui::SetNextWindowPos(center, posCond, ImVec2(0.5f, 0.5f));
 
     if (!ImGui::Begin("Appearance", &m_showThemeWindow, ImGuiWindowFlags_NoCollapse)) {
@@ -9450,7 +9443,6 @@ void App::renderThemeWindow() {
         changed = true;
     }
     if (ImGui::IsItemDeactivatedAfterEdit()) m_pendingScale = m_theme.userScale;
-    ImGui::SameLine();
     if (modernButton("Reset Accents")) {
         m_theme.gradientPrimary = ImVec4(0.20f, 0.58f, 1.00f, 1.00f);
         m_theme.gradientSecondary = ImVec4(0.48f, 0.26f, 0.92f, 1.00f);
@@ -9459,7 +9451,7 @@ void App::renderThemeWindow() {
         changed = true;
     }
 
-    ImGui::BeginChild("##GradientPreview", ImVec2(0, 58.0f), ImGuiChildFlags_Borders);
+    ImGui::BeginChild("##GradientPreview", ImVec2(0, ImGui::GetTextLineHeight() + 36.0f), ImGuiChildFlags_Borders);
     ImVec2 previewMin = ImGui::GetWindowPos();
     ImVec2 previewMax(previewMin.x + ImGui::GetWindowSize().x, previewMin.y + ImGui::GetWindowSize().y);
     ImDrawList* previewDraw = ImGui::GetWindowDrawList();
@@ -9483,6 +9475,36 @@ void App::renderThemeWindow() {
     ImGui::Spacing();
     ImGui::Spacing();
 
+    ImGui::TextColored(m_theme.gradientPrimary, "Font Size");
+    ImGui::Separator();
+    ImGui::TextWrapped("Adjust text separately from app scaling. Rows and controls make room for larger text.");
+    if (m_fontScalePreview < 0) m_fontScalePreview = m_theme.fontScale;
+    int fontStep = std::clamp((int)std::round((m_fontScalePreview * 100.0f - 75.0f) / 5.0f), 0, 25);
+    char fontLabel[16];
+    snprintf(fontLabel, sizeof(fontLabel), "%d%%%%", fontStep * 5 + 75);
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::SliderInt("##FontSize", &fontStep, 0, 25, fontLabel, ImGuiSliderFlags_NoInput))
+        m_fontScalePreview = (fontStep * 5 + 75) / 100.0f;
+    bool fontChanged = std::abs(m_fontScalePreview - m_theme.fontScale) > 0.001f;
+    ImGui::BeginDisabled(!fontChanged);
+    if (modernButton("Apply font size")) {
+        m_theme.fontScale = m_fontScalePreview;
+        m_pendingScale = m_theme.userScale;
+        m_themeNeedsReposition = true;
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (modernButton("Reset##fontSize")) {
+        m_fontScalePreview = m_theme.fontScale = 1.0f;
+        m_pendingScale = m_theme.userScale;
+        m_themeNeedsReposition = true;
+        changed = true;
+    }
+    ImGui::TextDisabled("Current font size: %.0f%%", m_theme.fontScale * 100.0f);
+    ImGui::Spacing();
+    ImGui::Spacing();
+
     // --- UI Scale ---
     ImGui::TextColored(m_theme.gradientPrimary, "UI Scale");
     ImGui::Separator();
@@ -9495,9 +9517,10 @@ void App::renderThemeWindow() {
     // Discrete 5% steps: index 0=50%, 1=55%, ..., 50=300%
     int step = ((int)(m_scalePreview * 100.0f + 0.5f) - 50) / 5;
     if (step < 0) step = 0; if (step > 50) step = 50;
-    ImGui::SetNextItemWidth(250);
+    ImGui::TextUnformatted("App Scale");
+    ImGui::SetNextItemWidth(-1);
     char stepLabel[16]; snprintf(stepLabel, sizeof(stepLabel), "%d%%%%", step * 5 + 50);
-    if (ImGui::SliderInt("App Scale", &step, 0, 50, stepLabel)) {
+    if (ImGui::SliderInt("##AppScale", &step, 0, 50, stepLabel, ImGuiSliderFlags_NoInput)) {
         m_scalePreview = (step * 5 + 50) / 100.0f;
     }
 
@@ -9505,7 +9528,6 @@ void App::renderThemeWindow() {
     int currentPct = ((int)(m_theme.userScale * 100.0f + 0.5f) / 5) * 5;
     bool scaleChanged = (scalePct != currentPct);
 
-    ImGui::SameLine();
     if (scaleChanged) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.55f, 1));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.45f, 0.70f, 1));
@@ -9745,7 +9767,7 @@ void App::renderStatusBar() {
     float s=ui::scale();
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(18*s,5*s));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,0);
-    ImGui::BeginChild("##StatusBar",ImVec2(0,28*s),ImGuiChildFlags_None,ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_AlwaysUseWindowPadding);
+    ImGui::BeginChild("##StatusBar",ImVec2(0,std::max(28*s,ImGui::GetFontSize()+10*s)),ImGuiChildFlags_None,ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_AlwaysUseWindowPadding);
     auto elapsed=std::chrono::steady_clock::now()-m_statusTime;
     std::string message="F5 Refresh   |   F2 Rename   |   Ctrl+L Folder path   |   F12 Activity log";
     if(m_asyncBusy)message=m_asyncStatus;
@@ -11137,6 +11159,7 @@ void App::devicePollLoop() {
 }
 
 void App::onDeviceChanged() {
+    if (deviceSession(0).rootRequestPending) return;
     std::string serial;
     {
         std::lock_guard<std::mutex> lk(m_deviceMutex);
@@ -11150,13 +11173,13 @@ void App::onDeviceChanged() {
         ~ReconnectFlagReset() { flag = false; }
     } reconnectFlagReset{m_primaryReconnectActive};
 
-    bool useRootForDevice = m_prefs.rootEnabledForSerial(serial);
+    bool useRootForDevice = m_prefs.rootEnabledForSerial(deviceIdentity(serial));
     // Start the TCP server on the device (status updates come from m_device.statusText())
     if (!m_device.startServer(serial, m_preferAdbForward, useRootForDevice)) {
         LOG_ERROR("Poll", "startServer failed: " + m_device.lastError());
         if (useRootForDevice) {
             std::string rootError = m_device.lastError();
-            m_prefs.setRootEnabledForSerial(serial, false);
+            m_prefs.setRootEnabledForSerial(deviceIdentity(serial), false);
             m_prefs.save();
             LOG_WARN("Poll", "Root start failed, retrying without root: " + rootError);
             if (!m_device.startServer(serial, m_preferAdbForward, false)) {
@@ -14537,7 +14560,7 @@ void App::processBatchQueue() {
                             }
                         }
 
-                        if (batchDev.startServer(foundSerial, m_preferAdbForward, m_prefs.rootEnabledForSerial(foundSerial))) {
+                        if (batchDev.startServer(foundSerial, m_preferAdbForward, m_prefs.rootEnabledForSerial(deviceIdentity(foundSerial)))) {
                             std::string connMode = batchDev.isDirectConnection()
                                 ? "Direct TCP: " + batchDev.deviceIp() : "ADB Forward";
                             m_statusMessage = "Reconnected via " + connMode + " - resuming transfer";
@@ -14701,7 +14724,7 @@ void App::processBatchQueue() {
                         // Try to reconnect
                         batch->errorMessage = "CRC check failed - reconnecting...";
                         std::this_thread::sleep_for(std::chrono::seconds(2));
-                        batchDev.startServer(originalSerial, m_preferAdbForward, m_prefs.rootEnabledForSerial(originalSerial));
+                        batchDev.startServer(originalSerial, m_preferAdbForward, m_prefs.rootEnabledForSerial(deviceIdentity(originalSerial)));
                         if (!batchDev.isServerRunning()) break;
                         batch->errorMessage = "Retrying CRC verification: " + item.displayName;
                     }

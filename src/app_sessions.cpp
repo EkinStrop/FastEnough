@@ -54,6 +54,7 @@ void App::cacheDeviceRoot(int slot) {
 
 bool App::prepareDeviceSession(int slot, const std::string& serial) {
     auto& session = deviceSession(slot);
+    if (session.rootRequestPending) return false;
     if (session.connected && session.client.isServerRunning()) return true;
     if (m_shutdownPoll) return false;
     session.connected = false;
@@ -115,6 +116,7 @@ void App::maintainDeviceSessions(const std::vector<DeviceInfo>& devices) {
     for (int slot = 1; slot < deviceSessionCount() && !m_shutdownPoll; ++slot) {
         auto& session = deviceSession(slot);
         const auto now = std::chrono::steady_clock::now();
+        if (session.rootRequestPending) continue;
         if (busySessions.count(slot) || DeviceMountManager::instance(slot).ioActive) continue;
         if (session.connected && session.client.isServerRunning() &&
             now - session.lastHealthCheck >= std::chrono::seconds(15)) {
@@ -173,4 +175,92 @@ void App::openDeviceSession(FilePanel& panel, int slot) {
     panel.needsRefresh = true;
     strcpy_s(panel.pathInput, panel.currentPath.c_str());
     m_compareDirty = true;
+}
+
+bool App::canChangeDeviceRoot(int slot) {
+    if (slot < 0 || slot >= deviceSessionCount()) return false;
+    auto& session = deviceSession(slot);
+    if (!session.connected || !session.client.isServerRunning() || session.serial.empty() ||
+        session.rootRequestPending || session.client.isConnecting() || m_asyncBusy ||
+        m_pollBusy || m_wifiTransitionActive || m_tetheringInProgress ||
+        m_androidDragInflight > 0 || DeviceMountManager::instance(slot).isMounted()) return false;
+    std::lock_guard<std::mutex> lock(m_batchMutex);
+    for (const auto& batch : m_batchQueue) {
+        auto state = batch->state.load();
+        if (batch->isLocalCopy || state == BatchState::Completed || state == BatchState::Failed ||
+            state == BatchState::Stopped) continue;
+        if ((batch->isPull || batch->isCrossDevice) && batch->srcDeviceSlot == slot) return false;
+        if ((!batch->isPull || batch->isCrossDevice) && batch->dstDeviceSlot == slot) return false;
+    }
+    return true;
+}
+
+void App::requestDeviceRoot(int slot, bool enabled, FilePanel* panel) {
+    if (!canChangeDeviceRoot(slot)) return;
+    auto& session = deviceSession(slot);
+    const std::string serial = session.serial;
+    const uint64_t generation = panel ? panel->listingGeneration : 0;
+    session.rootRequestPending = true;
+    postAsync(enabled ? "Requesting root access. Approve the request on your phone..." : "Disabling root access...",
+        [this, slot, serial, enabled, panel, generation]() {
+            auto& session = deviceSession(slot);
+            auto& client = session.client;
+            UiMessage message;
+            message.rootRequestFinished = true;
+            message.rootSlot = slot;
+            message.rootSerial = serial;
+            message.rootPanel = enabled ? panel : nullptr;
+            message.rootPanelGeneration = generation;
+            message.hasStatus = true;
+            try {
+                if (session.serial != serial) {
+                    message.status = "The selected device changed. Request root access again.";
+                } else if (enabled && !client.isRootAvailable(serial)) {
+                    message.status = "Root access was unavailable or denied. Normal browsing is still available.";
+                    message.hasNotification = true;
+                    message.notificationTitle = "Root Access Unavailable";
+                    message.notificationMessage = "This device must already be rooted. Unlock the phone and approve the ADB root request in Magisk, KernelSU, or your root manager, then try ROOT again.";
+                    message.notificationIsError = true;
+                } else {
+                    session.connected = false;
+                    if (slot == 0) {
+                        m_secondaryChannel.disconnectTcp();
+                        m_extraChannels.clear();
+                        m_nicChannels.clear();
+                        m_dualChannelAvailable = false;
+                        m_multiNicAvailable = false;
+                        m_secondaryChannelType.clear();
+                        m_activeChannelCount = 1;
+                    }
+                    bool started = client.startServer(serial, true, enabled);
+                    if (started && client.useRoot() == enabled) {
+                        message.status = enabled ? "Root access enabled. You can browse protected folders." : "Root access disabled.";
+                        message.rootModeChanged = true;
+                    } else {
+                        std::string error = client.lastError();
+                        client.disconnectTcp();
+                        bool recovered = client.startServer(serial, true, false);
+                        message.rootModeChanged = true;
+                        message.status = recovered && !client.useRoot() ? "Connected without root after the root access change failed." : "Unable to change root access. Reconnect the device and try again.";
+                        message.hasNotification = true;
+                        message.notificationTitle = "Root Access Failed";
+                        message.notificationMessage = message.status + "\n\n" + error;
+                        message.notificationIsError = true;
+                    }
+                    if (client.isServerRunning()) cacheDeviceRoot(slot);
+                }
+            } catch (const std::exception& error) {
+                message.status = "Could not change root access.";
+                message.hasNotification = true;
+                message.notificationTitle = "Root Access Failed";
+                message.notificationMessage = error.what();
+                message.notificationIsError = true;
+            } catch (...) {
+                message.status = "Could not change root access. Try again.";
+            }
+            session.connected = client.isServerRunning();
+            session.lastHealthCheck = std::chrono::steady_clock::now();
+            message.rootEnabled = session.connected && client.useRoot();
+            postUiMessage(std::move(message));
+        });
 }
